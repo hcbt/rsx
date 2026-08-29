@@ -1,0 +1,11 @@
+[package]
+name = "rsx-machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rsx_machine"
+
+[dev-dependencies]
+tempfile = "3"
