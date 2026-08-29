@@ -49,7 +49,7 @@ The rectangle of VRAM the GPU currently outputs as the visible picture.
 _Avoid_: screen, framebuffer when you mean this rectangle
 
 **SPU**:
-The PlayStation sound processor, with its own 512 KiB RAM. Silent in the first proof; the Intro jingle is the next proof.
+The PlayStation sound processor, with its own 512 KiB RAM. In the first proof it answers the BIOS but produces no host audio; the Intro jingle is the next proof.
 _Avoid_: audio, mixer
 
 **CD-ROM**:
