@@ -454,6 +454,7 @@ impl Gpu {
                     self.tex_page = uv >> 16;
                     self.tex_x = (self.tex_page & 0xF) as u8;
                     self.tex_y = ((self.tex_page >> 4) & 1) as u8;
+                    self.dither = self.tex_page & (1 << 9) != 0;
                 }
             }
             verts[i] = (x, y, color, u, v);
@@ -498,9 +499,10 @@ impl Gpu {
         }
         let blend = textured && cmd & (1 << 24) == 0;
         let semi = cmd & (1 << 25) != 0;
-        self.tri(verts[0], verts[1], verts[2], textured, blend, semi);
+        let dither = self.dither && (gouraud || blend);
+        self.tri(verts[0], verts[1], verts[2], textured, blend, semi, dither);
         if quad {
-            self.tri(verts[1], verts[2], verts[3], textured, blend, semi);
+            self.tri(verts[1], verts[2], verts[3], textured, blend, semi, dither);
         }
     }
 
@@ -512,6 +514,7 @@ impl Gpu {
         textured: bool,
         blend: bool,
         semi: bool,
+        dither: bool,
     ) {
         let minx = a.0.min(b.0).min(c.0).max(self.draw_x1);
         let maxx = a.0.max(b.0).max(c.0).min(self.draw_x2);
@@ -579,12 +582,12 @@ impl Gpu {
                         / i64::from(sum);
                     let tex = self.sample_tex(u as u8, v as u8);
                     if blend {
-                        blend_texel(tex, vr, vg, vb)
+                        blend_texel_dither(tex, vr, vg, vb, x, y, dither)
                     } else {
                         tex
                     }
                 } else {
-                    rgb888_to_555(vr, vg, vb)
+                    rgb888_to_555_dither(vr, vg, vb, x, y, dither)
                 };
                 self.plot(x, y, color, textured, semi);
             }
@@ -932,7 +935,28 @@ fn interp(w0: i32, w1: i32, w2: i32, a: u32, b: u32, c: u32, sum: i32) -> i32 {
 }
 
 fn rgb888_to_555(r: u32, g: u32, b: u32) -> u16 {
-    ((r >> 3) as u16) | (((g >> 3) as u16) << 5) | (((b >> 3) as u16) << 10)
+    rgb888_to_555_dither(r, g, b, 0, 0, false)
+}
+
+/// SPX dither matrix, applied to 8-bit RGB before the >>3 to 5-bit when the
+/// texpage dither bit is on and the poly is Gouraud or texture-blended.
+const DITHER: [[i32; 4]; 4] = [
+    [-4, 0, -3, 1],
+    [2, -2, 3, -1],
+    [-3, 1, -4, 0],
+    [3, -1, 2, -2],
+];
+
+fn rgb888_to_555_dither(r: u32, g: u32, b: u32, x: i32, y: i32, dither: bool) -> u16 {
+    let d = if dither {
+        DITHER[(y & 3) as usize][(x & 3) as usize]
+    } else {
+        0
+    };
+    let ch = |v: u32| -> u16 {
+        ((v as i32 + d).clamp(0, 255) as u32 >> 3) as u16
+    };
+    ch(r) | (ch(g) << 5) | (ch(b) << 10)
 }
 
 /// SPX semi-transparency modes from texpage bits 5–6, per 5-bit channel.
@@ -960,6 +984,21 @@ fn blend_texel(tex: u16, r: u32, g: u32, b: u32) -> u16 {
         (tr * r).min(0x7F80) >> 7,
         (tg * g).min(0x7F80) >> 7,
         (tb * b).min(0x7F80) >> 7,
+    );
+    out | (tex & 0x8000)
+}
+
+fn blend_texel_dither(tex: u16, r: u32, g: u32, b: u32, x: i32, y: i32, dither: bool) -> u16 {
+    let tr = u32::from((tex & 0x1F) << 3);
+    let tg = u32::from(((tex >> 5) & 0x1F) << 3);
+    let tb = u32::from(((tex >> 10) & 0x1F) << 3);
+    let out = rgb888_to_555_dither(
+        (tr * r).min(0x7F80) >> 7,
+        (tg * g).min(0x7F80) >> 7,
+        (tb * b).min(0x7F80) >> 7,
+        x,
+        y,
+        dither,
     );
     out | (tex & 0x8000)
 }
@@ -1367,6 +1406,34 @@ mod tests {
         gpu.gp0(0x0008_00);
         let p = gpu.vram_rect(4, 4, 1, 1).pixels[0] & 0x7FFF;
         assert_eq!(p, 0x001F, "STP=0 texel must stay opaque red, not mix ({p:#06X})");
+    }
+
+    #[test]
+    fn gouraud_dither_changes_a_pixel() {
+        // SPX: dither (texpage bit 9) applies to Gouraud polys.
+        let mut without = Gpu::new();
+        clip(&mut without, 0, 0, 1023, 511);
+        offset(&mut without, 0, 0);
+        without.gp0(0xE1 << 24);
+        without.gp0(0x30 << 24 | 0x0000F8);
+        without.gp0(xy(0, 0));
+        without.gp0(0x0000F8);
+        without.gp0(xy(8, 0));
+        without.gp0(0xF80000);
+        without.gp0(xy(0, 8));
+        let mut with = Gpu::new();
+        clip(&mut with, 0, 0, 1023, 511);
+        offset(&mut with, 0, 0);
+        with.gp0(0xE1 << 24 | (1 << 9));
+        with.gp0(0x30 << 24 | 0x0000F8);
+        with.gp0(xy(0, 0));
+        with.gp0(0x0000F8);
+        with.gp0(xy(8, 0));
+        with.gp0(0xF80000);
+        with.gp0(xy(0, 8));
+        let a = without.vram_rect(1, 3, 4, 4).pixels;
+        let b = with.vram_rect(1, 3, 4, 4).pixels;
+        assert_ne!(a, b, "dither bit must change Gouraud pixels");
     }
 }
 
