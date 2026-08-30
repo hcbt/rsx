@@ -176,6 +176,27 @@ impl Machine {
         self.cpu.gte_control(reg)
     }
 
+    pub fn last_y_bins(&self) -> [u32; 16] {
+        self.bus.gpu().last_y_bins
+    }
+
+    pub fn last_hi_y_word(&self) -> u32 {
+        self.bus.gpu().last_hi_y_word
+    }
+
+    pub fn dma_list_stats(&self) -> (u32, u32, u32, u32, u32, u32, u32) {
+        let d = self.bus.dma();
+        (
+            d.last_list_empty,
+            d.last_list_pkts,
+            d.last_list_min,
+            d.last_list_max,
+            d.last_list_start,
+            d.last_list_start_n,
+            d.last_empty_before,
+        )
+    }
+
     pub fn io_writes(&self) -> u64 {
         self.bus.io_writes
     }

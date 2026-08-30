@@ -50,6 +50,9 @@ pub struct Gpu {
     pub last_y1: i32,
     pub last_n30_out: u32,
     frame_n30_out: u32,
+    pub last_y_bins: [u32; 16],
+    frame_y_bins: [u32; 16],
+    pub last_hi_y_word: u32,
 }
 
 #[allow(dead_code)]
@@ -113,6 +116,9 @@ impl Gpu {
             last_y1: 0,
             last_n30_out: 0,
             frame_n30_out: 0,
+            last_y_bins: [0; 16],
+            frame_y_bins: [0; 16],
+            last_hi_y_word: 0,
         };
         g.update_stat();
         g
@@ -400,6 +406,7 @@ impl Gpu {
         let textured = cmd & (1 << 26) != 0;
         let nvert = if quad { 4 } else { 3 };
         let mut verts = [(0i32, 0i32, 0u32, 0u8, 0u8); 4];
+        let mut raw_xy = [0u32; 4];
         let mut idx = 0;
         let color0 = self.gp0_buf[0] & 0xFF_FFFF;
         for i in 0..nvert {
@@ -411,6 +418,7 @@ impl Gpu {
             };
             idx += 1;
             let xy = self.gp0_buf[idx];
+            raw_xy[i] = xy;
             let (x, y) = self.vertex_xy(xy);
             let mut u = 0u8;
             let mut v = 0u8;
@@ -442,6 +450,11 @@ impl Gpu {
                 self.frame_y1 = self.frame_y1.max(y);
                 if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
                     self.frame_n30_out += 1;
+                }
+                let bin = (y.clamp(0, 511) as usize) / 32;
+                self.frame_y_bins[bin] += 1;
+                if y > 300 {
+                    self.last_hi_y_word = raw_xy[i];
                 }
             }
         }
@@ -793,8 +806,10 @@ impl Gpu {
             self.last_y0 = self.frame_y0;
             self.last_y1 = self.frame_y1;
             self.last_n30_out = self.frame_n30_out;
+            self.last_y_bins = self.frame_y_bins;
             self.frame_n30 = 0;
             self.frame_n30_out = 0;
+            self.frame_y_bins = [0; 16];
             self.frame_x0 = i32::MAX;
             self.frame_x1 = i32::MIN;
             self.frame_y0 = i32::MAX;

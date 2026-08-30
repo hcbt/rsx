@@ -179,26 +179,37 @@ impl Gte {
 
     fn rtp_vector(&mut self, vec: usize, sf: u32, lm: bool) {
         let (vx, vy, vz) = self.vx(vec);
-        let trx = self.ctrl[5] as i32 as i64;
-        let try_ = self.ctrl[6] as i32 as i64;
-        let trz = self.ctrl[7] as i32 as i64;
-        let mut mac = [0i64; 3];
+        let tr = [
+            i64::from(self.ctrl[5] as i32),
+            i64::from(self.ctrl[6] as i32),
+            i64::from(self.ctrl[7] as i32),
+        ];
+        let mut xyz = [0i64; 3];
         for r in 0..3 {
-            let tr = [trx, try_, trz][r] << 12;
-            let m = tr
-                + i64::from(self.rt_el(r, 0)) * i64::from(vx)
-                + i64::from(self.rt_el(r, 1)) * i64::from(vy)
-                + i64::from(self.rt_el(r, 2)) * i64::from(vz);
-            mac[r] = m;
+            // SPX/hardware: each partial sum is 44-bit (sign-extended) before
+            // the next multiply-add. DuckStation's RTPS matches this chaining.
+            let mut acc = mac44((tr[r] << 12) + i64::from(self.rt_el(r, 0)) * i64::from(vx));
+            acc = mac44(acc + i64::from(self.rt_el(r, 1)) * i64::from(vy));
+            xyz[r] = acc + i64::from(self.rt_el(r, 2)) * i64::from(vz);
         }
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
+        let shift = sf * 12;
+        for i in 0..2 {
+            let shifted = xyz[i] >> shift;
             self.data[25 + i] = shifted as u32;
             self.set_ir(i, shifted, lm);
         }
-        // SPX: MAC3 is already SAR(sf*12); SZ3 = MAC3 SAR ((1-sf)*12).
-        // Together that is always the 12-bit-shifted Z, not the unshifted product.
-        let sz_raw = mac[2] >> 12;
+        let mac3 = xyz[2] >> shift;
+        self.data[27] = mac3 as u32;
+        // FLAG.22 uses MAC3 SAR 12 as if lm=0; stored IR3 uses MAC3 and the
+        // actual lm bit (SPX RTPS note).
+        self.set_ir(2, xyz[2] >> 12, false);
+        let ir3 = if lm {
+            mac3.clamp(0, 0x7FFF)
+        } else {
+            mac3.clamp(-0x8000, 0x7FFF)
+        };
+        self.data[11] = ir3 as u32;
+        let sz_raw = xyz[2] >> 12;
         if !(0..=0xFFFF).contains(&sz_raw) {
             self.flag(18);
         }
@@ -598,6 +609,30 @@ mod tests {
     }
 
     #[test]
+    fn rtps_screen_y_is_n_times_ir2_plus_ofy() {
+        // Identity RT, VY=80, TRZ=H=500, OFY=0, sf=1 → SY ≈ 80 (1:1 at the
+        // projection plane). A 2× scale here would put title Crash at Y=422.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(7, 500);
+        g.write_control(24, 0);
+        g.write_control(25, 0);
+        g.write_control(26, 500);
+        g.write_data(0, 80u32 << 16); // VY=80
+        g.write_data(1, 0);
+        g.command(0x01 | (1 << 19));
+        let sy = (g.read_data(14) >> 16) as i16;
+        assert_eq!(g.read_data(19) & 0xFFFF, 500, "SZ3");
+        assert!(
+            (sy - 80).abs() <= 1,
+            "RTPS SY must be ~VY when H=SZ (got SY={sy}, FLAG={:08X})",
+            g.read_control(31)
+        );
+    }
+
+    #[test]
     fn perspective_divide_uses_unr_not_integer_reciprocal() {
         let mut flag = 0;
         // SPX: FE3Fh/7F20h UNR-saturates to 1FFFFh without FLAG.17.
@@ -663,6 +698,10 @@ const UNR_TABLE: [u8; 257] = [
     0x07, 0x07, 0x06, 0x06, 0x05, 0x05, 0x04, 0x04, 0x03, 0x03, 0x02, 0x02, 0x01, 0x01, 0x00, 0x00,
     0x00,
 ];
+
+fn mac44(v: i64) -> i64 {
+    (v << 20) >> 20
+}
 
 fn unr_divide(h: u16, sz: u16, flag: &mut u32) -> u32 {
     if u32::from(h) >= u32::from(sz) * 2 {

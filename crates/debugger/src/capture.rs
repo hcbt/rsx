@@ -50,6 +50,21 @@ pub fn capture_at_vblanks(
             machine.gte_control(25),
             machine.gte_control(29) & 0xFFFF,
         );
+        let (empty, pkts, amin, amax, astart, sn, ebefore) = machine.dma_list_stats();
+        eprintln!(
+            "  dma2-list empty={empty} pkts={pkts} start={astart:#X} n={sn} empty_before_pkt={ebefore} addr={amin:#X}..{amax:#X}"
+        );
+        eprintln!(
+            "  y-bins/32 {} hi_y_word={:#010X}",
+            machine
+                .last_y_bins()
+                .iter()
+                .enumerate()
+                .map(|(i, n)| format!("{i}:{n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            machine.last_hi_y_word()
+        );
         written.push(path);
     }
     Ok(written)

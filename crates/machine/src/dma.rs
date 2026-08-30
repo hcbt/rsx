@@ -14,6 +14,13 @@ pub struct Dma {
     dpcr: u32,
     dicr: u32,
     irq_delay: u32,
+    pub last_list_empty: u32,
+    pub last_list_pkts: u32,
+    pub last_list_min: u32,
+    pub last_list_max: u32,
+    pub last_list_start: u32,
+    pub last_list_start_n: u32,
+    pub last_empty_before: u32,
 }
 
 impl Dma {
@@ -25,6 +32,13 @@ impl Dma {
             dpcr: 0x0765_4321,
             dicr: 0,
             irq_delay: 0,
+            last_list_empty: 0,
+            last_list_pkts: 0,
+            last_list_min: 0,
+            last_list_max: 0,
+            last_list_start: 0,
+            last_list_start_n: 0,
+            last_empty_before: 0,
         }
     }
 
@@ -149,13 +163,32 @@ impl Dma {
         let dir = self.chcr[2] & 1;
         if mode == 2 && dir == 1 {
             let mut addr = self.madr[2] & 0x1F_FFFF;
+            let start = addr;
+            let start_n = read32(ram, addr) >> 24;
+            let mut empty = 0u32;
+            let mut pkts = 0u32;
+            let mut min_a = u32::MAX;
+            let mut max_a = 0u32;
+            let mut empty_before = 0u32;
+            let mut seen_pkt = false;
             for _ in 0..1_000_000 {
                 if addr == 0x00FF_FFFF || addr > 0x1F_FFFF {
                     break;
                 }
+                min_a = min_a.min(addr);
+                max_a = max_a.max(addr);
                 let header = read32(ram, addr);
                 let words = header >> 24;
                 let next = header & 0x00FF_FFFF;
+                if words == 0 {
+                    empty += 1;
+                    if !seen_pkt {
+                        empty_before += 1;
+                    }
+                } else {
+                    pkts += 1;
+                    seen_pkt = true;
+                }
                 for i in 0..words {
                     let w = read32(ram, addr.wrapping_add(4 + i * 4) & 0x1F_FFFF);
                     gpu.dma_write(w);
@@ -164,6 +197,15 @@ impl Dma {
                     break;
                 }
                 addr = next & 0x1F_FFFF;
+            }
+            if pkts > self.last_list_pkts {
+                self.last_list_empty = empty;
+                self.last_list_pkts = pkts;
+                self.last_list_min = min_a;
+                self.last_list_max = max_a;
+                self.last_list_start = start;
+                self.last_list_start_n = start_n;
+                self.last_empty_before = empty_before;
             }
         } else if mode == 1 && dir == 1 {
             let bs = self.bcr[2] & 0xFFFF;

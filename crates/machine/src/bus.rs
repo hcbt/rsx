@@ -96,6 +96,10 @@ impl Bus {
         &self.gpu
     }
 
+    pub fn dma(&self) -> &crate::dma::Dma {
+        &self.dma
+    }
+
     pub fn insert_disc(&mut self, disc: crate::disc::Disc) {
         self.cdrom.insert(disc);
     }
