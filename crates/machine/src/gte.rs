@@ -915,6 +915,17 @@ mod tests {
     }
 
     #[test]
+    fn nclip_ccw_area_is_positive_mac0() {
+        // SPX: MAC0 = SX0*SY1 + SX1*SY2 + SX2*SY0 - SX0*SY2 - SX1*SY0 - SX2*SY1
+        let mut g = Gte::new();
+        g.write_data(12, 0); // SXY0 = (0,0)
+        g.write_data(13, 10); // SXY1 = (10,0)
+        g.write_data(14, 10u32 << 16); // SXY2 = (0,10)
+        g.command(0x06);
+        assert_eq!(g.read_data(24) as i32, 100, "CCW NCLIP MAC0");
+    }
+
+    #[test]
     fn rtps_sz3_is_mac3_after_the_12bit_shift() {
         // SPX: IR3 = MAC3 = (TRZ*1000h + …) SAR (sf*12);
         //      SZ3 = MAC3 SAR ((1-sf)*12). With V=0 that is TRZ, not TRZ<<12.

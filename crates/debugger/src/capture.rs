@@ -77,6 +77,21 @@ pub fn capture_at_vblanks(
             "  frame-rtps={frtps} obj n={on} SY={osy0}..{osy1} VY={ovy0}..{ovy1} VX={ovx0}..{ovx1} VZ={ovz0}..{ovz1} TRY={otry} TRZ={otrz} explode={fexp}"
         );
         dump_title_ram(machine);
+        if let Some((pc, ra, ty)) = machine.trans_y_write() {
+            eprint!("  ram trans_y_write pc={pc:#X} ra={ra:#X} y={ty} insns");
+            for i in 0..8u32 {
+                eprint!(" {:08X}", machine.ram_word(pc.wrapping_add(i * 4)));
+            }
+            eprintln!();
+        } else {
+            eprintln!("  ram trans_y_write none");
+        }
+        for (pc, status_b, gpc, y) in machine.trans_y_writes() {
+            let insn = machine.ram_word(gpc.wrapping_sub(4));
+            eprintln!(
+                "  ram trans_y_log pc={pc:#X} status_b={status_b:#X} gool_pc={gpc:#X} insn={insn:#010X} y={y}"
+            );
+        }
         let scatter = machine.last_gouraud_scatter();
         let scatter_path = dir.join(format!("scatter-v{n:04}.png"));
         write_png(&scatter, &scatter_path)?;
@@ -212,6 +227,50 @@ fn dump_title_ram(machine: &Machine) {
             "  ram crash.trans=({tx},{ty},{tz}) rot=({rx},{ry},{rz}) scale=({sx},{sy},{sz}) state={state} entity={entity:#X} anim_frame={anim_frame} vel=({vx},{vy},{vz}) status_a={status_a:#X} tpf={tpf}"
         );
         dump_entity(machine, entity);
+        let global = machine.ram_word(crash.wrapping_add(0x20));
+        if global & 0xFF00_0000 == 0x8000_0000 {
+            let data = machine.ram_word(global.wrapping_add(24));
+            if data & 0xFF00_0000 == 0x8000_0000 {
+                eprint!("  ram gool_data[0xA0..]");
+                for i in 0xA0u32..0xAC {
+                    let v = machine.ram_word(data.wrapping_add(i * 4)) as i32;
+                    eprint!(" {i:#X}={v}");
+                }
+                eprintln!(" @{data:#X}");
+                let tgeo = machine.ram_word(0x8006_2818);
+                eprint!("  ram tgeo_at_62818");
+                for i in 0..8u32 {
+                    eprint!(" {:08X}", machine.ram_word(0x8006_2818 + i * 4));
+                }
+                eprintln!(" word0={tgeo:#X}");
+                let mut th = 0x8006_2818u32;
+                if tgeo != 0x100FFFF && tgeo & 0xFF00_0000 == 0x8000_0000 {
+                    if machine.ram_word(tgeo) == 0x100FFFF {
+                        th = tgeo;
+                    }
+                }
+                if machine.ram_word(th) == 0x100FFFF {
+                    let hdr = machine.ram_word(th.wrapping_add(16));
+                    let hdr = if hdr & 0xFF00_0000 == 0x8000_0000 {
+                        hdr
+                    } else {
+                        th.wrapping_add(hdr)
+                    };
+                    let npoly = machine.ram_word(hdr);
+                    let sx = machine.ram_word(hdr.wrapping_add(4)) as i32;
+                    let sy = machine.ram_word(hdr.wrapping_add(8)) as i32;
+                    let sz = machine.ram_word(hdr.wrapping_add(12)) as i32;
+                    eprintln!(
+                        "  ram tgeo_header@{hdr:#X} npoly={npoly} scale=({sx},{sy},{sz})"
+                    );
+                }
+            }
+            eprint!("  ram Physics+0x5C4");
+            for i in 0..8u32 {
+                eprint!(" {:08X}", machine.ram_word(0x8001_F8D0 + i * 4));
+            }
+            eprintln!();
+        }
         let (bx1, by1, bz1) = vec3(machine, crash.wrapping_add(8));
         let (bx2, by2, bz2) = vec3(machine, crash.wrapping_add(0x14));
         let anim_seq = machine.ram_word(crash.wrapping_add(0x108));

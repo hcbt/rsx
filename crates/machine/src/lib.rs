@@ -299,6 +299,14 @@ impl Machine {
         self.cpu.last_exception()
     }
 
+    pub fn trans_y_write(&self) -> Option<(u32, u32, i32)> {
+        self.cpu.trans_y_write()
+    }
+
+    pub fn trans_y_writes(&self) -> Vec<(u32, u32, u32, i32)> {
+        self.cpu.trans_y_writes().to_vec()
+    }
+
     pub fn sr(&self) -> u32 {
         self.cpu.sr()
     }

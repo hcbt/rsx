@@ -27,6 +27,10 @@ pub struct Cpu {
     icache: Vec<ICacheLine>,
     last_exception: Option<(u8, u32, u32)>,
     pub exception_log: Vec<(u8, u32, u32)>,
+    /// First CPU store of Crash title trans.y (NTSC-U 0x800566B4+0x84) that is not 0.
+    pub trans_y_write: Option<(u32, u32, i32)>,
+    /// Up to 16 (mips_pc, ra, gool_pc, y) stores of Crash trans.y.
+    pub trans_y_writes: Vec<(u32, u32, u32, i32)>,
 }
 
 impl Cpu {
@@ -47,6 +51,8 @@ impl Cpu {
             in_delay: false,
             last_exception: None,
             exception_log: Vec::new(),
+            trans_y_write: None,
+            trans_y_writes: Vec::new(),
             icache: (0..ICACHE_LINES)
                 .map(|_| ICacheLine {
                     tag: 0,
@@ -71,6 +77,14 @@ impl Cpu {
 
     pub fn last_exception(&self) -> Option<(u8, u32, u32)> {
         self.last_exception
+    }
+
+    pub fn trans_y_write(&self) -> Option<(u32, u32, i32)> {
+        self.trans_y_write
+    }
+
+    pub fn trans_y_writes(&self) -> &[(u32, u32, u32, i32)] {
+        &self.trans_y_writes
     }
 
     pub fn sr(&self) -> u32 {
@@ -583,6 +597,33 @@ impl Cpu {
                     return;
                 }
                 bus.write32(addr, value);
+                self.note_crash_trans_y(bus, addr, value);
+            }
+        }
+    }
+
+    fn note_crash_trans_y(&mut self, bus: &Bus, addr: u32, value: u32) {
+        let crash = bus.ram_word(0x8005_66B4);
+        if crash & 0xFF00_0000 != 0x8000_0000 {
+            return;
+        }
+        if addr != crash.wrapping_add(0x84) {
+            return;
+        }
+        let y = value as i32;
+        if y == 0 {
+            return;
+        }
+        let gool_pc = bus.ram_word(crash.wrapping_add(0xE0));
+        let status_b = bus.ram_word(crash.wrapping_add(0xCC));
+        if self.trans_y_write.is_none() {
+            self.trans_y_write = Some((self.current_pc, self.gpr(31), y));
+        }
+        if self.trans_y_writes.len() < 64 {
+            let last = self.trans_y_writes.last().map(|w| w.3);
+            if last != Some(y) {
+                self.trans_y_writes
+                    .push((self.current_pc, status_b, gool_pc, y));
             }
         }
     }
