@@ -592,4 +592,36 @@ mod tests {
             m.gp0_count()
         );
     }
+
+    #[test]
+    fn licensed_logo_holds_while_the_exe_loads_when_present() {
+        let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../roms/Crash Bandicoot (USA)/Crash Bandicoot (USA).cue");
+        if !bios.exists() || !disc.exists() {
+            eprintln!("skipping: no local BIOS or Disc");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&bios).unwrap();
+        m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(620);
+        let (dx, dy, dw, dh, _) = m.display_origin();
+        assert_eq!(
+            (dw, dh),
+            (640, 480),
+            "CD 2× must still be on the licensed logo at vblank 620, not Crash 512×240 (pc={:08X} origin=({dx},{dy}) {dw}×{dh})",
+            m.pc()
+        );
+        let black = m
+            .display_area()
+            .pixels
+            .iter()
+            .filter(|p| **p & 0x7FFF == 0)
+            .count();
+        assert!(
+            black > 200_000,
+            "licensed screen is still black (black={black} pc={:08X})",
+            m.pc()
+        );
+    }
 }

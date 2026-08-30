@@ -1,6 +1,9 @@
 use crate::disc::Disc;
 use crate::irq::{self, Irq};
 
+/// 33.8688 MHz / 75 sectors/s (1×). Mode bit 7 selects 2×.
+const CYCLES_PER_SECTOR_1X: u32 = 451_584;
+
 /// CD-ROM controller: status, GetID, and sector reads.
 pub struct Cdrom {
     index: u8,
@@ -90,14 +93,6 @@ impl Cdrom {
         }
         if self.irq_flag & self.irq_enable != 0 {
             irq.raise(irq::IRQ_CDROM);
-        }
-        if irqn == 1 && self.reading {
-            self.pending = Some(Pending {
-                cycles: 15_000,
-                irq: 1,
-                result: vec![self.controller_stat()],
-                second: None,
-            });
         }
     }
 
@@ -276,8 +271,16 @@ impl Cdrom {
         let stat = self.controller_stat();
         (
             Some((2000, 3, vec![stat])),
-            Some((12_000, 1, vec![stat])),
+            Some((self.sector_cycles(), 1, vec![stat])),
         )
+    }
+
+    fn sector_cycles(&self) -> u32 {
+        if self.mode & 0x80 != 0 {
+            CYCLES_PER_SECTOR_1X / 2
+        } else {
+            CYCLES_PER_SECTOR_1X
+        }
     }
 
     fn fill_fifo(&mut self) {
@@ -312,6 +315,14 @@ impl Cdrom {
             self.fifo_i += 1;
             if self.fifo_i >= self.fifo.len() {
                 self.status &= !(1 << 6);
+                if self.reading && self.pending.is_none() {
+                    self.pending = Some(Pending {
+                        cycles: self.sector_cycles(),
+                        irq: 1,
+                        result: vec![self.controller_stat()],
+                        second: None,
+                    });
+                }
             }
             b
         } else {
@@ -401,12 +412,15 @@ mod tests {
         cd.motor = true;
         let mut irq = Irq::new();
         cd.irq_enable = 0x1F;
+        cd.param = vec![0x80];
+        cd.command(0x0E, &mut irq);
+        pump(&mut cd, &mut irq, 1000);
         cd.param = vec![0x00, 0x02, 0x04];
         cd.command(0x02, &mut irq);
         pump(&mut cd, &mut irq, 1000);
         cd.command(0x06, &mut irq);
         pump(&mut cd, &mut irq, 2000);
-        pump(&mut cd, &mut irq, 12_000);
+        pump(&mut cd, &mut irq, 230_000);
         assert_eq!(cd.irq_flag & 7, 1, "INT1");
         let mut bytes = Vec::new();
         for _ in 0..64 {
@@ -416,6 +430,37 @@ mod tests {
         assert!(
             s.contains("Licensed"),
             "ReadN 00:02:04 must yield the license sector ({s:?})"
+        );
+    }
+
+    #[test]
+    fn readn_does_not_replace_fifo_until_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_with_america(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        cd.motor = true;
+        let mut irq = Irq::new();
+        cd.irq_enable = 0x1F;
+        cd.param = vec![0x80];
+        cd.command(0x0E, &mut irq);
+        pump(&mut cd, &mut irq, 1000);
+        cd.param = vec![0x00, 0x02, 0x04];
+        cd.command(0x02, &mut irq);
+        pump(&mut cd, &mut irq, 1000);
+        cd.command(0x06, &mut irq);
+        pump(&mut cd, &mut irq, 2_000);
+        pump(&mut cd, &mut irq, 230_000);
+        assert_eq!(cd.irq_flag & 7, 1);
+        pump(&mut cd, &mut irq, 300_000);
+        let mut first = Vec::new();
+        for _ in 0..16 {
+            first.push(cd.pop_fifo());
+        }
+        let s = String::from_utf8_lossy(&first);
+        assert!(
+            s.contains("Licens"),
+            "unread sector must stay in the FIFO ({s:?})"
         );
     }
 }
