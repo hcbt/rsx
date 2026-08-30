@@ -124,7 +124,23 @@ impl Cpu {
         self.gte.on_vblank();
     }
 
-    pub fn gte_frame_obj(&self) -> (u32, u32, i32, i32, i32, i32, i32, i32, i32, i32) {
+    pub fn gte_frame_obj(
+        &self,
+    ) -> (
+        u32,
+        u32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        u32,
+    ) {
         let g = &self.gte;
         (
             g.frame_rtps,
@@ -137,6 +153,9 @@ impl Cpu {
             g.frame_obj_trz,
             g.frame_obj_vx_min,
             g.frame_obj_vx_max,
+            g.frame_obj_vz_min,
+            g.frame_obj_vz_max,
+            g.frame_explode,
         )
     }
 

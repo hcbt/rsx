@@ -193,7 +193,23 @@ impl Machine {
         self.cpu.gte_title_rt()
     }
 
-    pub fn gte_frame_obj(&self) -> (u32, u32, i32, i32, i32, i32, i32, i32, i32, i32) {
+    pub fn gte_frame_obj(
+        &self,
+    ) -> (
+        u32,
+        u32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        u32,
+    ) {
         self.cpu.gte_frame_obj()
     }
 

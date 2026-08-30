@@ -71,10 +71,12 @@ pub fn capture_at_vblanks(
             "  title-rt [[{},{},{}],[{},{},{}],[{},{},{}]]",
             rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], rt[7], rt[8]
         );
-        let (frtps, on, osy0, osy1, ovy0, ovy1, otry, otrz, ovx0, ovx1) = machine.gte_frame_obj();
+        let (frtps, on, osy0, osy1, ovy0, ovy1, otry, otrz, ovx0, ovx1, ovz0, ovz1, fexp) =
+            machine.gte_frame_obj();
         eprintln!(
-            "  frame-rtps={frtps} obj n={on} SY={osy0}..{osy1} VY={ovy0}..{ovy1} VX={ovx0}..{ovx1} TRY={otry} TRZ={otrz}"
+            "  frame-rtps={frtps} obj n={on} SY={osy0}..{osy1} VY={ovy0}..{ovy1} VX={ovx0}..{ovx1} VZ={ovz0}..{ovz1} TRY={otry} TRZ={otrz} explode={fexp}"
         );
+        dump_title_ram(machine);
         let ops = machine.gte_op_counts();
         let names = [
             (0x01u8, "RTPS"),
@@ -127,6 +129,106 @@ pub fn capture_at_vblanks(
         written.push(path);
     }
     Ok(written)
+}
+
+fn i16s(w: u32) -> (i32, i32) {
+    (w as i16 as i32, (w >> 16) as i16 as i32)
+}
+
+fn mat9(machine: &Machine, addr: u32) -> [i32; 9] {
+    // PSY-Q MATRIX: packed i16 pairs, RT33 in the 5th halfword.
+    let w0 = machine.ram_word(addr);
+    let w1 = machine.ram_word(addr.wrapping_add(4));
+    let w2 = machine.ram_word(addr.wrapping_add(8));
+    let w3 = machine.ram_word(addr.wrapping_add(12));
+    let w4 = machine.ram_word(addr.wrapping_add(16));
+    let (a, b) = i16s(w0);
+    let (c, d) = i16s(w1);
+    let (e, f) = i16s(w2);
+    let (g, h) = i16s(w3);
+    let (i, _) = i16s(w4);
+    [a, b, c, d, e, f, g, h, i]
+}
+
+fn vec3(machine: &Machine, addr: u32) -> (i32, i32, i32) {
+    (
+        machine.ram_word(addr) as i32,
+        machine.ram_word(addr.wrapping_add(4)) as i32,
+        machine.ram_word(addr.wrapping_add(8)) as i32,
+    )
+}
+
+/// NTSC-U (SCUS-94900) BSS from the reconstructed c1 port. Diagnostic only.
+fn dump_title_ram(machine: &Machine) {
+    let crash = machine.ram_word(0x8005_66B4);
+    let (ctx, cty, ctz) = vec3(machine, 0x8005_7864);
+    let (crx, cry, crz) = vec3(machine, 0x8005_7870);
+    let (cpx, cpy, cpz) = vec3(machine, 0x8005_7888);
+    let screen_proj = machine.ram_word(0x8005_78D0);
+    let frames = machine.ram_word(0x8006_0E04);
+    let ms = mat9(machine, 0x8005_7844);
+    let mn = mat9(machine, 0x8005_7824);
+    let msc = mat9(machine, 0x8005_77E4);
+    eprintln!(
+        "  ram crash={crash:#X} cam_trans=({ctx},{cty},{ctz}) cam_rot=({crx},{cry},{crz}) cam_prev=({cpx},{cpy},{cpz}) proj={screen_proj} fe={frames}"
+    );
+    eprintln!(
+        "  ram ms_rot [[{},{},{}],[{},{},{}],[{},{},{}]]",
+        ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8]
+    );
+    eprintln!(
+        "  ram mn_rot [[{},{},{}],[{},{},{}],[{},{},{}]]",
+        mn[0], mn[1], mn[2], mn[3], mn[4], mn[5], mn[6], mn[7], mn[8]
+    );
+    eprintln!(
+        "  ram ms_cam [[{},{},{}],[{},{},{}],[{},{},{}]]",
+        msc[0], msc[1], msc[2], msc[3], msc[4], msc[5], msc[6], msc[7], msc[8]
+    );
+    if crash & 0xFF00_0000 == 0x8000_0000 {
+        let (tx, ty, tz) = vec3(machine, crash.wrapping_add(0x80));
+        let (rx, ry, rz) = vec3(machine, crash.wrapping_add(0x8C));
+        let (sx, sy, sz) = vec3(machine, crash.wrapping_add(0x98));
+        let state = machine.ram_word(crash.wrapping_add(0x2C));
+        eprintln!(
+            "  ram crash.trans=({tx},{ty},{tz}) rot=({rx},{ry},{rz}) scale=({sx},{sy},{sz}) state={state}"
+        );
+    }
+    dump_objects(machine);
+}
+
+fn dump_objects(machine: &Machine) {
+    // NTSC-U handles[8] at 0x80060DB8; children at +4 for a handle header.
+    let mut left = 24u32;
+    for h in 0..8u32 {
+        let handle = 0x8006_0DB8u32.wrapping_add(h * 8);
+        let child = machine.ram_word(handle.wrapping_add(4));
+        walk_obj(machine, child, &mut left);
+        if left == 0 {
+            break;
+        }
+    }
+}
+
+fn walk_obj(machine: &Machine, mut obj: u32, left: &mut u32) {
+    let mut n = 0u32;
+    while obj & 0xFF00_0000 == 0x8000_0000 && n < 96 && *left > 0 {
+        n += 1;
+        *left -= 1;
+        let kind = machine.ram_word(obj);
+        if kind == 2 {
+            walk_obj(machine, machine.ram_word(obj.wrapping_add(4)), left);
+        } else {
+            let (tx, ty, tz) = vec3(machine, obj.wrapping_add(0x80));
+            let (sx, sy, sz) = vec3(machine, obj.wrapping_add(0x98));
+            let state = machine.ram_word(obj.wrapping_add(0x2C));
+            let status_b = machine.ram_word(obj.wrapping_add(0xCC));
+            eprintln!(
+                "  ram obj={obj:#X} trans=({tx},{ty},{tz}) scale=({sx},{sy},{sz}) state={state} status_b={status_b:#X}"
+            );
+            walk_obj(machine, machine.ram_word(obj.wrapping_add(0x6C)), left);
+        }
+        obj = machine.ram_word(obj.wrapping_add(0x68));
+    }
 }
 
 #[cfg(test)]

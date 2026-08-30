@@ -32,6 +32,9 @@ pub struct Gte {
     pub frame_obj_trz: i32,
     pub frame_obj_vx_min: i32,
     pub frame_obj_vx_max: i32,
+    pub frame_obj_vz_min: i32,
+    pub frame_obj_vz_max: i32,
+    pub frame_explode: u32,
     acc_rtps: u32,
     acc_obj_n: u32,
     acc_obj_sy_min: i32,
@@ -42,6 +45,9 @@ pub struct Gte {
     acc_obj_trz: i32,
     acc_obj_vx_min: i32,
     acc_obj_vx_max: i32,
+    acc_obj_vz_min: i32,
+    acc_obj_vz_max: i32,
+    acc_explode: u32,
 }
 
 impl Gte {
@@ -76,6 +82,9 @@ impl Gte {
             frame_obj_trz: 0,
             frame_obj_vx_min: i32::MAX,
             frame_obj_vx_max: i32::MIN,
+            frame_obj_vz_min: i32::MAX,
+            frame_obj_vz_max: i32::MIN,
+            frame_explode: 0,
             acc_rtps: 0,
             acc_obj_n: 0,
             acc_obj_sy_min: i32::MAX,
@@ -86,6 +95,9 @@ impl Gte {
             acc_obj_trz: 0,
             acc_obj_vx_min: i32::MAX,
             acc_obj_vx_max: i32::MIN,
+            acc_obj_vz_min: i32::MAX,
+            acc_obj_vz_max: i32::MIN,
+            acc_explode: 0,
         }
     }
 
@@ -100,6 +112,9 @@ impl Gte {
         self.frame_obj_trz = self.acc_obj_trz;
         self.frame_obj_vx_min = self.acc_obj_vx_min;
         self.frame_obj_vx_max = self.acc_obj_vx_max;
+        self.frame_obj_vz_min = self.acc_obj_vz_min;
+        self.frame_obj_vz_max = self.acc_obj_vz_max;
+        self.frame_explode = self.acc_explode;
         self.acc_rtps = 0;
         self.acc_obj_n = 0;
         self.acc_obj_sy_min = i32::MAX;
@@ -110,6 +125,9 @@ impl Gte {
         self.acc_obj_trz = 0;
         self.acc_obj_vx_min = i32::MAX;
         self.acc_obj_vx_max = i32::MIN;
+        self.acc_obj_vz_min = i32::MAX;
+        self.acc_obj_vz_max = i32::MIN;
+        self.acc_explode = 0;
     }
 
     pub fn read_data(&self, reg: u8) -> u32 {
@@ -281,6 +299,20 @@ impl Gte {
         self.data[9 + i] = v as u32;
     }
 
+    /// IR0 saturates 0..1000h and sets FLAG.12 (SPX). Independent of lm.
+    fn set_ir0(&mut self, mac: i64) {
+        let mut v = mac;
+        if v > 0x1000 {
+            v = 0x1000;
+            self.flag(12);
+        }
+        if v < 0 {
+            v = 0;
+            self.flag(12);
+        }
+        self.data[8] = v as u32;
+    }
+
     fn flag(&mut self, bit: u32) {
         self.ctrl[31] |= 1 << bit;
     }
@@ -352,17 +384,21 @@ impl Gte {
         self.data[18] = self.data[19];
         self.data[19] = sz;
         let n = unr_divide(self.ctrl[26] as u16, sz as u16, &mut self.ctrl[31]);
-        if self.ctrl[26] as u16 == 0x1F4 && n == 0x1FFFF {
+        if n == 0x1FFFF {
             self.title_explode += 1;
+            self.acc_explode = self.acc_explode.saturating_add(1);
         }
         let ofx = self.ctrl[24] as i32 as i64;
         let ofy = self.ctrl[25] as i32 as i64;
         let ir1 = self.data[9] as i16 as i64;
         let ir2 = self.data[10] as i16 as i64;
-        let sx = ((i64::from(n) * ir1) + ofx) >> 16;
-        let sy = ((i64::from(n) * ir2) + ofy) >> 16;
-        let sx = saturate_sx(sx, &mut self.ctrl[31]);
-        let sy = saturate_sy(sy, &mut self.ctrl[31]);
+        // SPX: MAC0 = n*IR + OF, then SX/SY = MAC0 SAR 16. FLAG.16/15 on MAC0.
+        let sx_mac = i64::from(n) * ir1 + ofx;
+        let sy_mac = i64::from(n) * ir2 + ofy;
+        self.mac(0, sx_mac);
+        self.mac(0, sy_mac);
+        let sx = saturate_sx(sx_mac >> 16, &mut self.ctrl[31]);
+        let sy = saturate_sy(sy_mac >> 16, &mut self.ctrl[31]);
         if self.ctrl[26] as u16 == 0x1F4 {
             self.acc_rtps = self.acc_rtps.saturating_add(1);
             self.title_ir2_min = self.title_ir2_min.min(ir2 as i32);
@@ -387,6 +423,8 @@ impl Gte {
                 self.acc_obj_vy_max = self.acc_obj_vy_max.max(vy);
                 self.acc_obj_vx_min = self.acc_obj_vx_min.min(vx);
                 self.acc_obj_vx_max = self.acc_obj_vx_max.max(vx);
+                self.acc_obj_vz_min = self.acc_obj_vz_min.min(vz);
+                self.acc_obj_vz_max = self.acc_obj_vz_max.max(vz);
                 if sy >= self.acc_obj_sy_max {
                     self.acc_obj_sy_max = sy;
                     self.acc_obj_try = tr[1] as i32;
@@ -423,10 +461,9 @@ impl Gte {
         self.data[14] = ((sy as u32) << 16) | (sx as u16 as u32);
         let dqa = self.ctrl[27] as i16 as i64;
         let dqb = self.ctrl[28] as i32 as i64;
-        let mac0 = i64::from(n) * dqa + dqb;
+        let mac0 = self.mac(0, i64::from(n) * dqa + dqb);
         self.data[24] = mac0 as u32;
-        let ir0 = (mac0 >> 12).clamp(0, 0x1000);
-        self.data[8] = ir0 as u32;
+        self.set_ir0(mac0 >> 12);
     }
 
     fn rtps(&mut self, sf: u32, lm: bool) {
@@ -584,26 +621,36 @@ impl Gte {
 
     fn nc_vector(&mut self, vec: usize, sf: u32, lm: bool) {
         let v = self.vx(vec);
-        for r in 0..3 {
-            let m = i64::from(self.mx_el(1, r, 0)) * i64::from(v.0)
-                + i64::from(self.mx_el(1, r, 1)) * i64::from(v.1)
-                + i64::from(self.mx_el(1, r, 2)) * i64::from(v.2);
-            let shifted = m >> (sf * 12);
-            self.data[25 + r] = shifted as u32;
-            self.set_ir(r, shifted, lm);
-        }
+        self.mul_mat_vec(1, None, v, sf, lm);
         let ir = self.ir_vec();
+        self.mul_mat_vec(2, Some((13, 14, 15)), ir, sf, lm);
+        self.push_color(lm);
+    }
+
+    /// 44-bit MAC chaining for LLM/LCM rows (DuckStation MulMatVec / SPX).
+    fn mul_mat_vec(
+        &mut self,
+        mx: usize,
+        trans: Option<(u8, u8, u8)>,
+        vec: (i32, i32, i32),
+        sf: u32,
+        lm: bool,
+    ) {
+        let shift = sf * 12;
         for r in 0..3 {
-            let bk = self.ctrl[13 + r] as i32 as i64;
-            let m = (bk << 12)
-                + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0)
-                + i64::from(self.mx_el(2, r, 1)) * i64::from(ir.1)
-                + i64::from(self.mx_el(2, r, 2)) * i64::from(ir.2);
-            let shifted = m >> (sf * 12);
+            let t = match trans {
+                Some((a, b, c)) => self.ctrl[[a, b, c][r] as usize] as i32 as i64,
+                None => 0,
+            };
+            let axis = (r as u32) + 1;
+            let mut acc = self.mac(axis, (t << 12) + i64::from(self.mx_el(mx, r, 0)) * i64::from(vec.0));
+            acc = self.mac(axis, acc + i64::from(self.mx_el(mx, r, 1)) * i64::from(vec.1));
+            acc += i64::from(self.mx_el(mx, r, 2)) * i64::from(vec.2);
+            self.mac(axis, acc);
+            let shifted = acc >> shift;
             self.data[25 + r] = shifted as u32;
             self.set_ir(r, shifted, lm);
         }
-        self.push_color(lm);
     }
 
     fn ncds(&mut self, sf: u32, lm: bool) {
@@ -801,13 +848,28 @@ impl Gte {
     }
 
     fn push_color(&mut self, _lm: bool) {
-        let sat8 = |mac: i32| {
-            let v = mac / 16;
-            v.clamp(0, 0xFF) as u32
-        };
-        let r = sat8(self.data[25] as i32);
-        let g = sat8(self.data[26] as i32);
-        let b = sat8(self.data[27] as i32);
+        // SPX/DuckStation: Color FIFO = MAC SAR 4, not MAC/16 (toward-zero).
+        let macs = [
+            self.data[25] as i32,
+            self.data[26] as i32,
+            self.data[27] as i32,
+        ];
+        let mut rgb_ch = [0u32; 3];
+        for i in 0..3 {
+            let v = macs[i] >> 4;
+            rgb_ch[i] = if v < 0 {
+                self.flag(21 - i as u32);
+                0
+            } else if v > 0xFF {
+                self.flag(21 - i as u32);
+                0xFF
+            } else {
+                v as u32
+            };
+        }
+        let r = rgb_ch[0];
+        let g = rgb_ch[1];
+        let b = rgb_ch[2];
         let code = (self.data[6] >> 24) & 0xFF;
         let rgb = r | (g << 8) | (b << 16) | (code << 24);
         self.data[20] = self.data[21];
@@ -1051,6 +1113,56 @@ mod tests {
         assert_eq!(g.read_data(9) as i16, 100, "IR1");
         assert_eq!(g.read_data(10) as i16, -50, "IR2");
         assert_eq!(g.read_data(11) as i16, 25, "IR3");
+    }
+
+    #[test]
+    fn rtps_ir0_saturate_sets_flag_12() {
+        // DQA large, H=SZ so n saturates: IR0 = (n*DQA+DQB)>>12 exceeds 1000h.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(7, 500);
+        g.write_control(26, 500);
+        g.write_control(27, 0x7FFF); // DQA
+        g.write_control(28, 0);
+        g.command(0x01 | (1 << 19));
+        let f = g.read_control(31);
+        assert_eq!(g.read_data(8) as i16, 0x1000, "IR0 sat to 1000h");
+        assert_ne!(f & (1 << 12), 0, "FLAG.12 IR0 sat");
+    }
+
+    #[test]
+    fn rtps_screen_mac0_overflow_sets_flag_16() {
+        // OFX at i32::MAX plus n*IR1 exceeds 31-bit MAC0 → FLAG.16.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(7, 1);
+        g.write_control(24, i32::MAX as u32);
+        g.write_control(26, 0x7FFF);
+        g.write_data(0, 0x7FFF);
+        g.command(0x01 | (1 << 19));
+        let f = g.read_control(31);
+        assert_ne!(f & (1 << 16), 0, "FLAG.16 MAC0+ {f:#010X}");
+        assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
+    fn push_color_uses_arithmetic_shift_4() {
+        // Negative MAC2 = -17. Toward-zero /16 is 0; SAR 4 is -2 → sat to 0 and FLAG.20.
+        let mut g = Gte::new();
+        g.write_data(25, 0x80 * 16); // R → 0x80
+        g.write_data(26, (-17i32) as u32);
+        g.write_data(27, 0x80 * 16);
+        g.write_data(6, 0x30 << 24);
+        g.push_color(false);
+        let rgb = g.read_data(22);
+        assert_eq!(rgb & 0xFF, 0x80, "R");
+        assert_eq!((rgb >> 8) & 0xFF, 0, "G sat from negative SAR 4");
+        assert_eq!((rgb >> 16) & 0xFF, 0x80, "B");
+        assert_ne!(g.read_control(31) & (1 << 20), 0, "FLAG.20 G sat");
     }
 }
 
