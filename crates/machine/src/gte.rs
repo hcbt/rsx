@@ -15,6 +15,18 @@ pub struct Gte {
     pub last_hi_r22: i32,
     pub last_hi_r23: i32,
     pub last_hi_rt: [i32; 9],
+    pub frame_hi_sy: i32,
+    pub frame_hi_ir2: i32,
+    pub frame_hi_n: u32,
+    pub frame_hi_sz: u32,
+    pub frame_hi_vy: i32,
+    pub frame_hi_try: i32,
+    pub frame_hi_trz: i32,
+    pub frame_hi_rt: [i32; 9],
+    pub frame_ir2_min: i32,
+    pub frame_ir2_max: i32,
+    pub frame_vy_min: i32,
+    pub frame_vy_max: i32,
     pub title_explode: u32,
     pub title_ir2_min: i32,
     pub title_ir2_max: i32,
@@ -66,6 +78,18 @@ impl Gte {
             last_hi_r22: 0,
             last_hi_r23: 0,
             last_hi_rt: [0; 9],
+            frame_hi_sy: 0,
+            frame_hi_ir2: 0,
+            frame_hi_n: 0,
+            frame_hi_sz: 0,
+            frame_hi_vy: 0,
+            frame_hi_try: 0,
+            frame_hi_trz: 0,
+            frame_hi_rt: [0; 9],
+            frame_ir2_min: i32::MAX,
+            frame_ir2_max: i32::MIN,
+            frame_vy_min: i32::MAX,
+            frame_vy_max: i32::MIN,
             title_explode: 0,
             title_ir2_min: i32::MAX,
             title_ir2_max: i32::MIN,
@@ -128,6 +152,34 @@ impl Gte {
         self.acc_obj_vz_min = i32::MAX;
         self.acc_obj_vz_max = i32::MIN;
         self.acc_explode = 0;
+        self.frame_hi_sy = self.last_hi_sy;
+        self.frame_hi_ir2 = self.last_hi_ir2;
+        self.frame_hi_n = self.last_hi_n;
+        self.frame_hi_sz = self.last_hi_sz;
+        self.frame_hi_vy = self.last_hi_vy;
+        self.frame_hi_try = self.last_hi_try;
+        self.frame_hi_trz = self.last_hi_trz;
+        self.frame_hi_rt = self.last_hi_rt;
+        self.frame_ir2_min = self.title_ir2_min;
+        self.frame_ir2_max = self.title_ir2_max;
+        self.frame_vy_min = self.title_vy_min;
+        self.frame_vy_max = self.title_vy_max;
+        self.last_hi_sy = 0;
+        self.last_hi_ir2 = 0;
+        self.last_hi_n = 0;
+        self.last_hi_sz = 0;
+        self.last_hi_vy = 0;
+        self.last_hi_try = 0;
+        self.last_hi_trz = 0;
+        self.last_hi_r21 = 0;
+        self.last_hi_r22 = 0;
+        self.last_hi_r23 = 0;
+        self.last_hi_rt = [0; 9];
+        self.title_ir2_min = i32::MAX;
+        self.title_ir2_max = i32::MIN;
+        self.title_vy_min = i32::MAX;
+        self.title_vy_max = i32::MIN;
+        self.title_explode = 0;
     }
 
     pub fn read_data(&self, reg: u8) -> u32 {
@@ -206,7 +258,9 @@ impl Gte {
             0x20 => {
                 self.ncs(sf, lm);
                 self.nc_vector(1, sf, lm);
+                self.push_color(lm);
                 self.nc_vector(2, sf, lm);
+                self.push_color(lm);
             }
             0x28 => self.sqr(sf),
             0x29 => self.dcpl(sf, lm),
@@ -391,11 +445,9 @@ impl Gte {
         let ofy = self.ctrl[25] as i32 as i64;
         let ir1 = self.data[9] as i16 as i64;
         let ir2 = self.data[10] as i16 as i64;
-        // SPX: MAC0 = n*IR + OF, then SX/SY = MAC0 SAR 16. FLAG.16/15 on MAC0.
-        let sx_mac = i64::from(n) * ir1 + ofx;
-        let sy_mac = i64::from(n) * ir2 + ofy;
-        self.mac(0, sx_mac);
-        self.mac(0, sy_mac);
+        // SPX: MAC0 = n*IR + OF (32-bit wrap), then SX/SY = MAC0 SAR 16.
+        let sx_mac = self.mac(0, i64::from(n) * ir1 + ofx);
+        let sy_mac = self.mac(0, i64::from(n) * ir2 + ofy);
         let sx = saturate_sx(sx_mac >> 16, &mut self.ctrl[31]);
         let sy = saturate_sy(sy_mac >> 16, &mut self.ctrl[31]);
         if self.ctrl[26] as u16 == 0x1F4 {
@@ -409,12 +461,15 @@ impl Gte {
             let r22 = self.rt_el(1, 1);
             let r23 = self.rt_el(1, 2);
             let r32 = self.rt_el(2, 1);
-            // Crash object R is yaw + 5/8 Y + Z negate: off-axis Y terms ≈ 0.
+            // Crash object R is yaw + 5/8 Y at tgeo 4800 (R00≈4511), not world
+            // identity 5/8 (R00=4096). Idle vblanks only transform the board.
+            let r00 = self.rt_el(0, 0);
             let object = r12.abs() < 200
                 && r21.abs() < 200
                 && r23.abs() < 200
                 && r32.abs() < 200
-                && r22 < -1000;
+                && r22 < -1000
+                && r00.abs() > 4200;
             if object {
                 self.acc_obj_n = self.acc_obj_n.saturating_add(1);
                 self.acc_obj_sy_min = self.acc_obj_sy_min.min(sy);
@@ -622,6 +677,7 @@ impl Gte {
 
     fn ncs(&mut self, sf: u32, lm: bool) {
         self.nc_vector(0, sf, lm);
+        self.push_color(lm);
     }
 
     fn nc_vector(&mut self, vec: usize, sf: u32, lm: bool) {
@@ -629,7 +685,6 @@ impl Gte {
         self.mul_mat_vec(1, None, v, sf, lm);
         let ir = self.ir_vec();
         self.mul_mat_vec(2, Some((13, 14, 15)), ir, sf, lm);
-        self.push_color(lm);
     }
 
     /// 44-bit MAC chaining for LLM/LCM rows (DuckStation MulMatVec / SPX).
@@ -704,8 +759,11 @@ impl Gte {
         let b = ((rgb >> 16) & 0xFF) as i64;
         let ir = self.ir_vec();
         for i in 0..3 {
-            let mac = ([r, g, b][i] * i64::from([ir.0, ir.1, ir.2][i])) << 4;
-            let shifted = mac >> (sf * 12);
+            let acc = self.mac(
+                (i as u32) + 1,
+                ([r, g, b][i] * i64::from([ir.0, ir.1, ir.2][i])) << 4,
+            );
+            let shifted = acc >> (sf * 12);
             self.data[25 + i] = shifted as u32;
             self.set_ir(i, shifted, lm);
         }
@@ -734,8 +792,8 @@ impl Gte {
         let ir = self.ir_vec();
         for i in 0..3 {
             let c = [r, g, b][i];
-            let mac = (c * i64::from([ir.0, ir.1, ir.2][i])) << 4;
-            let shifted = mac >> (sf * 12);
+            let acc = self.mac((i as u32) + 1, (c * i64::from([ir.0, ir.1, ir.2][i])) << 4);
+            let shifted = acc >> (sf * 12);
             self.data[25 + i] = shifted as u32;
             self.set_ir(i, shifted, lm);
         }
@@ -1251,6 +1309,62 @@ mod tests {
         let f = g.read_control(31);
         assert_ne!(f & (1 << 30), 0, "A1 FLAG.30 {f:#010X}");
         assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
+    fn nccs_does_not_push_unmodulated_color() {
+        // SPX NCCS: LLM*V, BK+LCM*IR, then RGB*IR, one FIFO push.
+        // Pushing after the LCM step as well leaves RGB2 as V0's colour after a
+        // following NCCT V1/V2, so Crash Gouraud reads mixed unmodulated slots.
+        let mut g = Gte::new();
+        g.write_control(8, 0x1000); // L11
+        g.write_control(10, 0x1000); // L22
+        g.write_control(12, 0x1000); // L33
+        g.write_control(16, 0x1000); // LR1
+        g.write_control(18, 0x1000); // LG2
+        g.write_control(20, 0x1000); // LB3
+        g.write_data(6, 0x20_40_80 | (0x30 << 24));
+        g.write_data(0, 0x1000); // V0 X
+        g.write_data(1, 0);
+        g.write_data(2, 0x1000 << 16); // V1 Y
+        g.write_data(3, 0);
+        g.write_data(4, 0);
+        g.write_data(5, 0x1000); // V2 Z
+        g.command(0x3F | (1 << 19) | (1 << 10)); // NCCT sf=1 lm=1
+        let rgb0 = g.read_data(20);
+        let rgb1 = g.read_data(21);
+        let rgb2 = g.read_data(22);
+        assert_ne!(rgb0 & 0xFF_FFFF, rgb1 & 0xFF_FFFF, "V0 vs V1 colours");
+        assert_ne!(rgb1 & 0xFF_FFFF, rgb2 & 0xFF_FFFF, "V1 vs V2 colours");
+        assert_ne!(rgb0 & 0xFF_FFFF, rgb2 & 0xFF_FFFF, "V0 vs V2 colours");
+        assert_eq!((rgb0 >> 24) & 0xFF, 0x30, "code in RGB0");
+        // V0 is X-axis: only R should be lit. An extra LCM push would shift that
+        // into RGB1 and leave RGB0 as V1 (G-axis).
+        assert!(
+            rgb0 & 0xFF > 0 && (rgb0 >> 8) & 0xFF == 0 && (rgb0 >> 16) & 0xFF == 0,
+            "NCCT RGB0 must be V0 (R) not a shifted FIFO slot (RGB0={rgb0:#010X} RGB1={rgb1:#010X} RGB2={rgb2:#010X})"
+        );
+    }
+
+    #[test]
+    fn rtps_screen_xy_uses_wrapped_mac0() {
+        // SPX: SX = (n*IR1+OFX) as 32-bit MAC0 SAR 16. H>=SZ*2 saturates n to
+        // 1FFFFh; 1FFFFh*7FFFh exceeds 32 bits, so the wrap is observable.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(7, 0x100); // TRZ = SZ
+        g.write_control(26, 0x200); // H = 2*SZ → n = 1FFFFh
+        g.write_data(0, 0x7FFF); // VX
+        g.write_data(1, 0);
+        g.command(0x01 | (1 << 19));
+        let sx = g.read_data(14) as i16;
+        assert!(
+            sx < 0,
+            "wrapped MAC0 SAR 16 must be negative (got SX={sx}, FLAG={:08X})",
+            g.read_control(31)
+        );
     }
 
     #[test]

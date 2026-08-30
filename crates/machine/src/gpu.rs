@@ -24,6 +24,10 @@ pub struct Gpu {
     draw_to_display: bool,
     mask_set: bool,
     mask_check: bool,
+    tex_win_mask_x: u32,
+    tex_win_mask_y: u32,
+    tex_win_off_x: u32,
+    tex_win_off_y: u32,
     display_x: u32,
     display_y: u32,
     display_hres: u32,
@@ -100,6 +104,10 @@ impl Gpu {
             draw_to_display: false,
             mask_set: false,
             mask_check: false,
+            tex_win_mask_x: 0,
+            tex_win_mask_y: 0,
+            tex_win_off_x: 0,
+            tex_win_off_y: 0,
             display_x: 0,
             display_y: 0,
             display_hres: 320,
@@ -315,6 +323,14 @@ impl Gpu {
                 self.dither = p & (1 << 9) != 0;
                 self.draw_to_display = p & (1 << 10) != 0;
                 self.update_stat();
+            }
+            0xE2 => {
+                // SPX: UV = (UV AND NOT (mask*8)) OR ((offset AND mask)*8).
+                let p = self.gp0_buf[0];
+                self.tex_win_mask_x = p & 0x1F;
+                self.tex_win_mask_y = (p >> 5) & 0x1F;
+                self.tex_win_off_x = (p >> 10) & 0x1F;
+                self.tex_win_off_y = (p >> 15) & 0x1F;
             }
             0xE3 => {
                 let p = self.gp0_buf[0];
@@ -728,8 +744,13 @@ impl Gpu {
         let tx_base = (page & 0xF) * 64;
         let ty_base = ((page >> 4) & 1) * 256;
         let mode = (page >> 7) & 3;
-        let uu = u32::from(u);
-        let vv = u32::from(v);
+        // SPX: UV = (UV AND NOT (mask*8)) OR ((offset AND mask)*8)
+        let mx = !(self.tex_win_mask_x << 3) & 0xFF;
+        let my = !(self.tex_win_mask_y << 3) & 0xFF;
+        let ox = ((self.tex_win_off_x & self.tex_win_mask_x) << 3) & 0xFF;
+        let oy = ((self.tex_win_off_y & self.tex_win_mask_y) << 3) & 0xFF;
+        let uu = (u32::from(u) & mx) | ox;
+        let vv = (u32::from(v) & my) | oy;
         match mode {
             0 => {
                 let texel = self.read_half(tx_base + uu / 4, ty_base + vv);
@@ -1434,6 +1455,33 @@ mod tests {
         let a = without.vram_rect(1, 3, 4, 4).pixels;
         let b = with.vram_rect(1, 3, 4, 4).pixels;
         assert_ne!(a, b, "dither bit must change Gouraud pixels");
+    }
+
+    #[test]
+    fn texture_window_offset_is_anded_with_mask() {
+        // SPX: UV = (UV AND NOT (mask*8)) OR ((offset AND mask)*8).
+        // Mask 0 and offset 1 must leave UV unchanged (not OR offset*8).
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        gpu.gp0(0xE2 << 24 | 1u32 << 10); // mask=0, offset_x=1
+        gpu.gp0(0xE1 << 24);
+        gpu.gp0(0x65 << 24 | 0x808080); // raw textured rect
+        gpu.gp0(xy(8, 8));
+        gpu.gp0((480u32 << 6) << 16); // uv 0,0 clut y=480
+        gpu.gp0(8 | (8 << 16));
+        let p = gpu.vram_rect(8, 8, 1, 1).pixels[0] & 0x7FFF;
+        assert_eq!(
+            p, 0x001F,
+            "E2 offset without mask must not remap UV 0 (got {p:#06X})"
+        );
     }
 }
 

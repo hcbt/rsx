@@ -102,27 +102,27 @@ impl Cpu {
     pub fn gte_hi_sy_trace(&self) -> (i32, i32, u32, u32, i32, i32, u32) {
         let g = &self.gte;
         (
-            g.last_hi_sy,
-            g.last_hi_ir2,
-            g.last_hi_n,
-            g.last_hi_sz,
-            g.last_hi_vy,
-            g.last_hi_try,
-            g.title_explode,
+            g.frame_hi_sy,
+            g.frame_hi_ir2,
+            g.frame_hi_n,
+            g.frame_hi_sz,
+            g.frame_hi_vy,
+            g.frame_hi_try,
+            g.frame_explode,
         )
     }
 
     pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
         let g = &self.gte;
         (
-            g.title_ir2_min,
-            g.title_ir2_max,
-            g.title_vy_min,
-            g.title_vy_max,
-            g.last_hi_trz,
-            g.last_hi_r21,
-            g.last_hi_r22,
-            g.last_hi_r23,
+            g.frame_ir2_min,
+            g.frame_ir2_max,
+            g.frame_vy_min,
+            g.frame_vy_max,
+            g.frame_hi_trz,
+            g.frame_hi_rt[3],
+            g.frame_hi_rt[4],
+            g.frame_hi_rt[5],
         )
     }
 
@@ -131,7 +131,7 @@ impl Cpu {
     }
 
     pub fn gte_title_rt(&self) -> [i32; 9] {
-        self.gte.last_hi_rt
+        self.gte.frame_hi_rt
     }
 
     pub fn gte_on_vblank(&mut self) {

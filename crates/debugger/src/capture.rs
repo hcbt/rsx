@@ -77,6 +77,7 @@ pub fn capture_at_vblanks(
             "  frame-rtps={frtps} obj n={on} SY={osy0}..{osy1} VY={ovy0}..{ovy1} VX={ovx0}..{ovx1} VZ={ovz0}..{ovz1} TRY={otry} TRZ={otrz} explode={fexp}"
         );
         dump_title_ram(machine);
+        dump_crash_proj(machine, dir, n);
         if let Some((pc, ra, ty)) = machine.trans_y_write() {
             eprint!("  ram trans_y_write pc={pc:#X} ra={ra:#X} y={ty} insns");
             for i in 0..8u32 {
@@ -312,6 +313,138 @@ fn dump_title_ram(machine: &Machine) {
     dump_zone_rect(machine, zone);
     dump_path(machine, path);
     dump_objects(machine);
+}
+
+/// Independent RTPS of the NTSC-U title Crash svtx, using the captured object R
+/// and (obj−cam)>>8 through ms_rot. Written as crash-proj-vNNNN.png so a GTE
+/// miss during TransformSvtx is visible against scatter-vNNNN.png.
+fn dump_crash_proj(machine: &Machine, dir: &Path, n: u64) {
+    let crash = machine.ram_word(0x8005_66B4);
+    if crash & 0xFF00_0000 != 0x8000_0000 {
+        return;
+    }
+    let (tx, ty, tz) = vec3(machine, crash.wrapping_add(0x80));
+    let (cpx, cpy, cpz) = vec3(machine, 0x8005_7888);
+    let ms = mat9(machine, 0x8005_7844);
+    let ux = (tx - cpx) >> 8;
+    let uy = (ty - cpy) >> 8;
+    let uz = (tz - cpz) >> 8;
+    // RotTrans u through ms_rot (3.12).
+    let trx = (i64::from(ms[0]) * i64::from(ux)
+        + i64::from(ms[1]) * i64::from(uy)
+        + i64::from(ms[2]) * i64::from(uz))
+        >> 12;
+    let try_ = (i64::from(ms[3]) * i64::from(ux)
+        + i64::from(ms[4]) * i64::from(uy)
+        + i64::from(ms[5]) * i64::from(uz))
+        >> 12;
+    let trz = (i64::from(ms[6]) * i64::from(ux)
+        + i64::from(ms[7]) * i64::from(uy)
+        + i64::from(ms[8]) * i64::from(uz))
+        >> 12;
+    let rt = machine.gte_title_rt();
+    if rt.iter().all(|&v| v == 0) {
+        eprintln!("  crash-proj skipped (no object R this frame) TR=({trx},{try_},{trz})");
+        return;
+    }
+    let anim_seq = machine.ram_word(crash.wrapping_add(0x108));
+    let anim_frame = machine.ram_word(crash.wrapping_add(0x10C));
+    if anim_seq & 0xFF00_0000 != 0x8000_0000 {
+        return;
+    }
+    let eid = machine.ram_word(anim_seq.wrapping_add(4));
+    let mut entry = eid;
+    let mut magic = machine.ram_word(entry);
+    if magic != 0x100FFFF && magic & 0xFF00_0000 == 0x8000_0000 {
+        let inner = magic;
+        if machine.ram_word(inner) == 0x100FFFF {
+            entry = inner;
+            magic = 0x100FFFF;
+        }
+    }
+    if magic != 0x100FFFF {
+        return;
+    }
+    let nitem = machine.ram_word(entry.wrapping_add(12));
+    let frame_idx = anim_frame >> 8;
+    if frame_idx >= nitem {
+        return;
+    }
+    let item = machine.ram_word(entry.wrapping_add(16 + frame_idx * 4));
+    let frame = if item & 0xFF00_0000 == 0x8000_0000 {
+        item
+    } else {
+        entry.wrapping_add(item)
+    };
+    let fx = machine.ram_word(frame.wrapping_add(8)) as i32;
+    let fy = machine.ram_word(frame.wrapping_add(12)) as i32;
+    let fz = machine.ram_word(frame.wrapping_add(16)) as i32;
+    let length = machine.ram_word(frame);
+    // Header is 14 words; remaining words are packed 6-byte vertices.
+    let nbytes = length.saturating_mul(4).saturating_sub(56);
+    let nverts = (nbytes / 6).min(512);
+    let h = 500i64;
+    let mut pixels = vec![0u16; 512 * 240];
+    let mut sx_min = i32::MAX;
+    let mut sx_max = i32::MIN;
+    let mut sy_min = i32::MAX;
+    let mut sy_max = i32::MIN;
+    let mut drawn = 0u32;
+    for i in 0..nverts {
+        let off = 56 + i * 6;
+        let w0 = machine.ram_word(frame.wrapping_add(off & !3));
+        let w1 = machine.ram_word(frame.wrapping_add((off + 4) & !3));
+        let shift = (off & 3) * 8;
+        let packed = (u64::from(w0) | (u64::from(w1) << 32)) >> shift;
+        let vx8 = (packed & 0xFF) as i32;
+        let vy8 = ((packed >> 8) & 0xFF) as i32;
+        let vz8 = ((packed >> 16) & 0xFF) as i32;
+        let vx = (fx - 128 + vx8) * 4;
+        let vy = (fy - 128 + vy8) * 4;
+        let vz = (fz - 128 + vz8) * 4;
+        let ir1 = (trx * 4096
+            + i64::from(rt[0]) * i64::from(vx)
+            + i64::from(rt[1]) * i64::from(vy)
+            + i64::from(rt[2]) * i64::from(vz))
+            >> 12;
+        let ir2 = (try_ * 4096
+            + i64::from(rt[3]) * i64::from(vx)
+            + i64::from(rt[4]) * i64::from(vy)
+            + i64::from(rt[5]) * i64::from(vz))
+            >> 12;
+        let ir3 = (trz * 4096
+            + i64::from(rt[6]) * i64::from(vx)
+            + i64::from(rt[7]) * i64::from(vy)
+            + i64::from(rt[8]) * i64::from(vz))
+            >> 12;
+        let sz = ir3.clamp(1, 0xFFFF);
+        let n = (h * 0x10000) / sz;
+        let sx = ((n * ir1) >> 16) as i32;
+        let sy = ((n * ir2) >> 16) as i32;
+        sx_min = sx_min.min(sx);
+        sx_max = sx_max.max(sx);
+        sy_min = sy_min.min(sy);
+        sy_max = sy_max.max(sy);
+        let px = ((sx + 256).rem_euclid(512)) as usize;
+        let py = (sy + 120).clamp(0, 239) as usize;
+        let pi = py * 512 + px;
+        pixels[pi] = if pixels[pi] == 0 { 0x7FFF } else { 0x001F };
+        drawn += 1;
+    }
+    let area = DisplayArea {
+        width: 512,
+        height: 240,
+        pixels,
+    };
+    let path = dir.join(format!("crash-proj-v{n:04}.png"));
+    if let Err(e) = write_png(&area, &path) {
+        eprintln!("  crash-proj write: {e}");
+        return;
+    }
+    eprintln!(
+        "  crash-proj {} n={drawn} SXY=({sx_min},{sy_min})-({sx_max},{sy_max}) TR=({trx},{try_},{trz}) origin=({fx},{fy},{fz})",
+        path.display()
+    );
 }
 
 fn dump_entry(machine: &Machine, addr: u32, name: &str) {
