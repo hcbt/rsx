@@ -7,10 +7,9 @@ use crate::irq::Irq;
 use crate::joy::Joy;
 use crate::spu::Spu;
 use crate::timers::Timers;
+use crate::{CYCLES_PER_LINE, LINES_PER_FRAME};
 
 const RAM_SIZE: usize = 2 * 1024 * 1024;
-const CYCLES_PER_LINE: u64 = 2160;
-const LINES_PER_FRAME: u32 = 263;
 const VBLANK_START: u32 = 243;
 
 pub struct Bus {

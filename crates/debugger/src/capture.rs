@@ -1,8 +1,11 @@
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::Path;
+use std::time::Instant;
 
 use rsx_machine::{DisplayArea, Machine};
+
+use crate::clock;
 
 pub fn write_wav(pcm: &[i16], path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -30,7 +33,8 @@ pub fn write_wav(pcm: &[i16], path: &Path) -> Result<(), String> {
     hdr.extend_from_slice(b"data");
     hdr.extend_from_slice(&data_bytes.to_le_bytes());
     use std::io::Write;
-    file.write_all(&hdr).map_err(|e| format!("wav header: {e}"))?;
+    file.write_all(&hdr)
+        .map_err(|e| format!("wav header: {e}"))?;
     for s in pcm {
         file.write_all(&s.to_le_bytes())
             .map_err(|e| format!("wav data: {e}"))?;
@@ -63,6 +67,9 @@ pub fn capture_at_vblanks(
     fs::create_dir_all(dir).map_err(|e| format!("capture dir: {e}"))?;
     let mut written = Vec::new();
     let mut audio = Vec::new();
+    let wall0 = Instant::now();
+    let cycles0 = machine.cycles();
+    let vblank0 = machine.vblank_count();
     for &n in vblanks {
         machine.run_until_vblank_count(n);
         let area = machine.display_area();
@@ -81,6 +88,13 @@ pub fn capture_at_vblanks(
             pcm.len() / 2,
             audio.len() / 2
         );
+        if let Some(p) = clock::measure(
+            machine.cycles().saturating_sub(cycles0),
+            machine.vblank_count().saturating_sub(vblank0),
+            wall0.elapsed(),
+        ) {
+            eprintln!("  {}", p.line());
+        }
         let (dx, dy, dw, dh, on) = machine.display_origin();
         let (ox, oy, x1, y1, x2, y2) = machine.draw_env();
         let (n30, px0, px1, py0, py1, nout) = machine.last_gouraud_tri_stats();
@@ -315,9 +329,7 @@ fn dump_title_ram(machine: &Machine) {
                     let sx = machine.ram_word(hdr.wrapping_add(4)) as i32;
                     let sy = machine.ram_word(hdr.wrapping_add(8)) as i32;
                     let sz = machine.ram_word(hdr.wrapping_add(12)) as i32;
-                    eprintln!(
-                        "  ram tgeo_header@{hdr:#X} npoly={npoly} scale=({sx},{sy},{sz})"
-                    );
+                    eprintln!("  ram tgeo_header@{hdr:#X} npoly={npoly} scale=({sx},{sy},{sz})");
                 }
             }
             eprint!("  ram Physics+0x5C4");

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use rsx_machine::{cycles_in_nanos, CPU_HZ};
+use rsx_machine::{cycles_in_nanos, ntsc_vblank_hz, CPU_HZ};
 
 /// Wall time of one SPU sample (768 master cycles). In-sync wake, not a guessed floor.
 pub fn sample_period() -> Duration {
@@ -35,6 +35,51 @@ pub fn wait_for_wall(guest_cycles: u64, origin_cycles: u64, elapsed: Duration) -
     } else {
         None
     }
+}
+
+/// Guest cycles and vblanks per wall second, versus the crystal and NTSC.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostPace {
+    pub hz: f64,
+    pub fps: f64,
+    /// 1.0 means the guest advanced at [`CPU_HZ`].
+    pub of_crystal: f64,
+    /// 1.0 means vblanks arrived at [`ntsc_vblank_hz`].
+    pub of_ntsc: f64,
+}
+
+impl HostPace {
+    pub fn behind(self) -> bool {
+        self.of_crystal < 0.95
+    }
+
+    pub fn line(self) -> String {
+        format!(
+            "pace clock={:.2}/{:.2}MHz ({:.0}%) fps={:.1}/{:.2} ({:.0}%)",
+            self.hz / 1_000_000.0,
+            CPU_HZ as f64 / 1_000_000.0,
+            self.of_crystal * 100.0,
+            self.fps,
+            ntsc_vblank_hz(),
+            self.of_ntsc * 100.0,
+        )
+    }
+}
+
+/// `delta_cycles` and `delta_vblanks` over `elapsed` of wall time.
+pub fn measure(delta_cycles: u64, delta_vblanks: u64, elapsed: Duration) -> Option<HostPace> {
+    let secs = elapsed.as_secs_f64();
+    if !(secs > 0.0) {
+        return None;
+    }
+    let hz = delta_cycles as f64 / secs;
+    let fps = delta_vblanks as f64 / secs;
+    Some(HostPace {
+        hz,
+        fps,
+        of_crystal: hz / CPU_HZ as f64,
+        of_ntsc: fps / ntsc_vblank_hz(),
+    })
 }
 
 pub fn pace(guest_cycles: u64, origin_cycles: u64, elapsed: Duration) -> Pace {
@@ -88,5 +133,28 @@ mod tests {
     fn wait_for_wall_is_none_when_behind_or_equal() {
         assert!(wait_for_wall(0, 0, Duration::from_secs(1)).is_none());
         assert!(wait_for_wall(33_868_800, 0, Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn measure_at_the_crystal_is_unity() {
+        let p = measure(CPU_HZ, 0, Duration::from_secs(1)).unwrap();
+        assert!((p.hz - CPU_HZ as f64).abs() < 1.0);
+        assert!((p.of_crystal - 1.0).abs() < 1e-9);
+        assert!(!p.behind());
+        assert!(p.line().contains("33.87"));
+    }
+
+    #[test]
+    fn measure_half_speed_is_behind() {
+        let p = measure(CPU_HZ / 2, 30, Duration::from_secs(1)).unwrap();
+        assert!((p.of_crystal - 0.5).abs() < 1e-9);
+        assert!(p.behind());
+        assert!((p.fps - 30.0).abs() < 1e-9);
+        assert!(p.of_ntsc < 0.6);
+    }
+
+    #[test]
+    fn measure_rejects_zero_elapsed() {
+        assert!(measure(CPU_HZ, 60, Duration::ZERO).is_none());
     }
 }

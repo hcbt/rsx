@@ -48,6 +48,17 @@ impl DisplayArea {
 /// SCPH-1001 NTSC master crystal. Vblank (263×2160) and SPU 44100 (÷768) derive from this.
 pub const CPU_HZ: u64 = 33_868_800;
 
+/// NTSC cycles per scanline (SPX).
+pub const CYCLES_PER_LINE: u64 = 2160;
+
+/// NTSC scanlines per frame, including vblank (SPX).
+pub const LINES_PER_FRAME: u32 = 263;
+
+/// NTSC vblank rate from the crystal: [`CPU_HZ`] / ([`CYCLES_PER_LINE`] × [`LINES_PER_FRAME`]).
+pub fn ntsc_vblank_hz() -> f64 {
+    CPU_HZ as f64 / (CYCLES_PER_LINE as f64 * f64::from(LINES_PER_FRAME))
+}
+
 /// Guest cycles that elapse in `nanos` of wall time at [`CPU_HZ`].
 pub fn cycles_in_nanos(nanos: u128) -> u64 {
     let n = nanos.saturating_mul(CPU_HZ as u128) / 1_000_000_000;
@@ -661,6 +672,16 @@ mod tests {
         assert_eq!(cycles_in_nanos(1_000_000_000), 33_868_800);
         assert_eq!(cycles_in_nanos(500_000_000), 16_934_400);
         assert_eq!(cycles_in_nanos(0), 0);
+    }
+
+    #[test]
+    fn ntsc_vblank_is_derived_from_the_crystal() {
+        let hz = ntsc_vblank_hz();
+        assert!(
+            (hz - 59.62).abs() < 0.01,
+            "NTSC vblank is CPU_HZ/(2160×263) ≈ 59.62 Hz, got {hz}"
+        );
+        assert_eq!(CYCLES_PER_LINE * u64::from(LINES_PER_FRAME), 2160 * 263);
     }
 
     #[test]

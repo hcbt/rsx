@@ -4,10 +4,10 @@ mod clock;
 mod config;
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
-use rsx_machine::{DisplayArea, Machine};
+use rsx_machine::{ntsc_vblank_hz, DisplayArea, Machine, CPU_HZ};
 
 struct Debugger {
     machine: Option<Machine>,
@@ -20,6 +20,11 @@ struct Debugger {
     /// Wall time and guest cycle count at last Run. Target is
     /// origin_cycles + elapsed_ns × CPU_HZ / 1e9.
     clock: Option<(Instant, u64)>,
+    /// Last window used to measure host pace (wall, cycles, vblanks).
+    pace_mark: Option<(Instant, u64, u64)>,
+    pace: Option<clock::HostPace>,
+    pace_log_at: Instant,
+    pace_was_behind: bool,
 }
 
 impl Debugger {
@@ -37,6 +42,10 @@ impl Debugger {
             capture_dir,
             audio: None,
             clock: None,
+            pace_mark: None,
+            pace: None,
+            pace_log_at: Instant::now(),
+            pace_was_behind: false,
         };
         match audio::Output::start() {
             Ok(o) => d.audio = Some(o),
@@ -71,6 +80,42 @@ impl Debugger {
             }
         }
     }
+
+    fn reset_pace(&mut self) {
+        self.clock = None;
+        self.pace_mark = None;
+        self.pace_was_behind = false;
+    }
+
+    fn note_pace(&mut self) {
+        let Some(m) = self.machine.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let cycles = m.cycles();
+        let vblanks = m.vblank_count();
+        let Some((t0, c0, v0)) = self.pace_mark else {
+            self.pace_mark = Some((now, cycles, vblanks));
+            return;
+        };
+        let dt = now.duration_since(t0);
+        if dt < Duration::from_millis(500) {
+            return;
+        }
+        if let Some(p) = clock::measure(cycles.saturating_sub(c0), vblanks.saturating_sub(v0), dt) {
+            let behind = p.behind();
+            let stale = now.duration_since(self.pace_log_at) >= Duration::from_secs(2);
+            if behind != self.pace_was_behind || (behind && stale) {
+                let line = p.line();
+                self.log.push(line.clone());
+                eprintln!("{line}");
+                self.pace_log_at = now;
+                self.pace_was_behind = behind;
+            }
+            self.pace = Some(p);
+        }
+        self.pace_mark = Some((now, cycles, vblanks));
+    }
 }
 
 impl eframe::App for Debugger {
@@ -94,27 +139,28 @@ impl eframe::App for Debugger {
                     clock::Pace::Wait(wait) => ctx.request_repaint_after(wait),
                 }
             }
+            self.note_pace();
         }
 
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             if ui.button("Run").clicked() {
                 self.running = true;
-                self.clock = None;
+                self.reset_pace();
             }
             if ui.button("Pause").clicked() {
                 self.running = false;
-                self.clock = None;
+                self.reset_pace();
             }
             if ui.button("Step instruction").clicked() {
                 self.running = false;
-                self.clock = None;
+                self.reset_pace();
                 if let Some(m) = self.machine.as_mut() {
                     m.step();
                 }
             }
             if ui.button("Step frame").clicked() {
                 self.running = false;
-                self.clock = None;
+                self.reset_pace();
                 if let Some(m) = self.machine.as_mut() {
                     let n = m.vblank_count() + 1;
                     m.run_until_vblank_count(n);
@@ -139,6 +185,37 @@ impl eframe::App for Debugger {
                     ui.monospace(format!("PC {:08X}", m.pc()));
                     ui.monospace(format!("GPUSTAT {:08X}", m.gpustat()));
                     ui.monospace(format!("vblank {}", m.vblank_count()));
+                    match self.pace {
+                        Some(p) => {
+                            let color = if p.behind() {
+                                egui::Color32::RED
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            ui.colored_label(
+                                color,
+                                format!(
+                                    "clock {:.2} / {:.2} MHz  {:.0}%",
+                                    p.hz / 1_000_000.0,
+                                    CPU_HZ as f64 / 1_000_000.0,
+                                    p.of_crystal * 100.0
+                                ),
+                            );
+                            ui.colored_label(
+                                color,
+                                format!(
+                                    "fps   {:.1} / {:.2}     {:.0}%",
+                                    p.fps,
+                                    ntsc_vblank_hz(),
+                                    p.of_ntsc * 100.0
+                                ),
+                            );
+                        }
+                        None => {
+                            ui.monospace("clock —");
+                            ui.monospace("fps   —");
+                        }
+                    }
                     for i in 0..32u8 {
                         ui.monospace(format!("r{i:02} {:08X}", m.gpr(i)));
                     }
