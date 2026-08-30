@@ -25,6 +25,8 @@ pub struct Cpu {
     branch_delay: bool,
     in_delay: bool,
     icache: Vec<ICacheLine>,
+    last_exception: Option<(u8, u32, u32)>,
+    pub exception_log: Vec<(u8, u32, u32)>,
 }
 
 impl Cpu {
@@ -43,6 +45,8 @@ impl Cpu {
             incoming_load: None,
             branch_delay: false,
             in_delay: false,
+            last_exception: None,
+            exception_log: Vec::new(),
             icache: (0..ICACHE_LINES)
                 .map(|_| ICacheLine {
                     tag: 0,
@@ -65,6 +69,18 @@ impl Cpu {
         self.gpr[i as usize]
     }
 
+    pub fn last_exception(&self) -> Option<(u8, u32, u32)> {
+        self.last_exception
+    }
+
+    pub fn sr(&self) -> u32 {
+        self.cop0.sr
+    }
+
+    pub fn badvaddr(&self) -> u32 {
+        self.cop0.badvaddr
+    }
+
     fn set_gpr(&mut self, i: u8, v: u32) {
         if i != 0 {
             self.gpr[i as usize] = v;
@@ -80,6 +96,13 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) {
+        // Sample IRQ after committing delay-slot state. A pending INT on the
+        // instruction *after* a taken branch must not fire with BD=0 on the
+        // delay slot: that returns into the fall-through and misses the target.
+        self.in_delay = self.branch_delay;
+        self.branch_delay = false;
+        self.current_pc = self.pc;
+
         self.cop0
             .set_ip_hw(bus.irq().pending_for_cop0());
         let irq = self.cop0.iec()
@@ -88,10 +111,6 @@ impl Cpu {
             self.exception(bus, cop0::EXC_INT, 0);
             return;
         }
-
-        self.current_pc = self.pc;
-        self.in_delay = self.branch_delay;
-        self.branch_delay = false;
 
         if self.current_pc & 3 != 0 {
             self.cop0.badvaddr = self.current_pc;
@@ -125,7 +144,8 @@ impl Cpu {
     fn fetch(&mut self, bus: &mut Bus) -> Option<u32> {
         let addr = self.current_pc;
         let cached = (addr >> 29) != 5; // not KSEG1
-        if !cached || self.cop0.isolate_cache() {
+        let icache_on = bus.cache_ctrl() & (1 << 11) != 0;
+        if !cached || self.cop0.isolate_cache() || !icache_on {
             return bus.read32(addr);
         }
         let phys = addr & 0x1FFF_FFFF;
@@ -150,6 +170,14 @@ impl Cpu {
     }
 
     fn exception(&mut self, _bus: &mut Bus, code: u8, ce: u8) {
+        self.last_exception = Some((code, self.current_pc, self.cop0.cause));
+        if code != cop0::EXC_INT
+            && code != cop0::EXC_SYS
+            && self.exception_log.len() < 24
+        {
+            self.exception_log
+                .push((code, self.current_pc, self.gpr[31]));
+        }
         let mut epc = self.current_pc;
         let bd = self.in_delay;
         if bd {
@@ -426,7 +454,7 @@ impl Cpu {
 
     fn store(&mut self, bus: &mut Bus, value: u32, addr: u32, width: Width) {
         if self.cop0.isolate_cache() {
-            self.store_icache(addr, value);
+            self.store_icache(bus.cache_ctrl(), addr, value);
             return;
         }
         match width {
@@ -450,14 +478,18 @@ impl Cpu {
         }
     }
 
-    fn store_icache(&mut self, addr: u32, value: u32) {
+    fn store_icache(&mut self, bcc: u32, addr: u32, value: u32) {
         let phys = addr & 0x1FFF_FFFF;
         let line = ((phys >> 4) & 0xFF) as usize;
         let word = ((phys >> 2) & 3) as usize;
         let c = &mut self.icache[line];
-        c.tag = phys >> 12;
+        if bcc & (1 << 2) != 0 {
+            // TAG test mode: low 4 bits of data are per-word valid; code unchanged.
+            c.tag = phys >> 12;
+            c.valid = (value & 0xF) as u8;
+            return;
+        }
         c.data[word] = value;
-        c.valid |= 1 << word;
     }
 
     fn lwl(&mut self, bus: &mut Bus, rt: u8, addr: u32) {

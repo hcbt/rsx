@@ -117,8 +117,11 @@ impl Dma {
         } else if mode == 1 && dir == 1 {
             let bs = self.bcr[2] & 0xFFFF;
             let ba = self.bcr[2] >> 16;
+            let bs = if bs == 0 { 0x1_0000 } else { bs };
+            let ba = if ba == 0 { 0x1_0000 } else { ba };
+            let n = bs.saturating_mul(ba).min(1_000_000);
             let mut addr = self.madr[2] & 0x1F_FFFF;
-            for _ in 0..(bs * ba) {
+            for _ in 0..n {
                 gpu.dma_write(read32(ram, addr));
                 addr = addr.wrapping_add(4) & 0x1F_FFFF;
             }

@@ -28,6 +28,11 @@ pub struct Bus {
     vblanks: u64,
     in_vblank: bool,
     pub io_writes: u64,
+    pub last_io: u32,
+    pub io_cd: u64,
+    pub io_spu: u64,
+    pub io_irq: u64,
+    pub io_gpu: u64,
 }
 
 impl Bus {
@@ -60,6 +65,11 @@ impl Bus {
             vblanks: 0,
             in_vblank: false,
             io_writes: 0,
+            last_io: 0,
+            io_cd: 0,
+            io_spu: 0,
+            io_irq: 0,
+            io_gpu: 0,
         }
     }
 
@@ -94,10 +104,60 @@ impl Bus {
         self.memctrl[4]
     }
 
+    pub fn cache_ctrl(&self) -> u32 {
+        self.cache_ctrl
+    }
+
+    fn note_io(&mut self, p: u32) {
+        match p {
+            0x1F80_1800..=0x1F80_1803 => {
+                self.io_cd += 1;
+                self.io_writes += 1;
+                self.last_io = p;
+            }
+            0x1F80_1C00..=0x1F80_1FFF => {
+                self.io_spu += 1;
+                self.io_writes += 1;
+                self.last_io = p;
+            }
+            0x1F80_1070..=0x1F80_1076 => {
+                self.io_irq += 1;
+                self.io_writes += 1;
+                self.last_io = p;
+            }
+            0x1F80_1810..=0x1F80_1814 => {
+                self.io_gpu += 1;
+                self.io_writes += 1;
+                self.last_io = p;
+            }
+            0x1F80_1000..=0x1F80_1FFF | 0xFFFE_0130 => {
+                self.io_writes += 1;
+                self.last_io = p;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn ram_word(&self, addr: u32) -> u32 {
+        let p = addr & 0x1FFF_FFFF;
+        if p >= 0x1FC0_0000 {
+            let off = (p - 0x1FC0_0000) as usize;
+            return u32::from_le_bytes(
+                self.bios
+                    .get(off..off + 4)
+                    .and_then(|s| s.try_into().ok())
+                    .unwrap_or([0; 4]),
+            );
+        }
+        let a = (p as usize) & (RAM_SIZE - 1) & !3;
+        u32::from_le_bytes(self.ram[a..a + 4].try_into().unwrap())
+    }
+
     pub fn tick(&mut self, cycles: u32) {
         self.cycles += u64::from(cycles);
         self.timers.tick(cycles, &mut self.irq);
         self.cdrom.tick(cycles, &mut self.irq);
+        self.spu.tick(cycles);
         let line = ((self.cycles / CYCLES_PER_LINE) as u32) % LINES_PER_FRAME;
         if line != self.scanline {
             self.scanline = line;
@@ -108,6 +168,7 @@ impl Bus {
             }
             self.in_vblank = vblank;
         }
+        self.gpu.tick(self.in_vblank);
     }
 
     pub fn read8(&mut self, addr: u32) -> Option<u8> {
@@ -183,7 +244,10 @@ impl Bus {
             0x1F80_0000..=0x1F80_03FF => {
                 self.scratch[(p - 0x1F80_0000) as usize] = value;
             }
-            0x1F80_1800..=0x1F80_1803 => self.cdrom.write8(p, value, &mut self.irq),
+            0x1F80_1800..=0x1F80_1803 => {
+                self.note_io(p);
+                self.cdrom.write8(p, value, &mut self.irq);
+            }
             0x1F80_2041 => {} // POST
             _ => {
                 let shift = (p & 3) * 8;
@@ -196,6 +260,7 @@ impl Bus {
 
     pub fn write16(&mut self, addr: u32, value: u16) {
         let p = phys(addr);
+        self.note_io(p);
         match p {
             0x1F80_1C00..=0x1F80_1FFF => self.spu.write16(p, value),
             0x1F80_1070..=0x1F80_1076 => self.irq.write16(p, value),
@@ -214,9 +279,7 @@ impl Bus {
 
     pub fn write32(&mut self, addr: u32, value: u32) {
         let p = phys(addr) & !3;
-        if (0x1F80_1000..0x1F80_2000).contains(&p) {
-            self.io_writes += 1;
-        }
+        self.note_io(p);
         match p {
             0x0000_0000..=0x007F_FFFF => {
                 let a = (p as usize) & (RAM_SIZE - 1);

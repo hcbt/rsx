@@ -36,6 +36,7 @@ impl Debugger {
                     .push(format!("loaded BIOS {}", path.display()));
                 self.machine = Some(m);
                 self.error = None;
+                self.running = true;
             }
             Err(e) => {
                 self.machine = None;
@@ -109,7 +110,15 @@ impl eframe::App for Debugger {
                     ctx.load_texture("display", image.clone(), Default::default())
                 });
                 tex.set(image, Default::default());
-                ui.image((tex.id(), egui::vec2(area.width as f32, area.height as f32)));
+                let avail = ui.available_size();
+                let aspect = area.width as f32 / area.height.max(1) as f32;
+                let mut w = avail.x;
+                let mut h = w / aspect;
+                if h > avail.y {
+                    h = avail.y;
+                    w = h * aspect;
+                }
+                ui.image((tex.id(), egui::vec2(w.max(1.0), h.max(1.0))));
             }
         });
     }

@@ -78,15 +78,16 @@ impl Cop0 {
         match rd {
             3 => self.bpc = value,
             5 => self.bda = value,
+            6 | 8 | 14 | 15 => {} // TAR, BadVaddr, EPC, PRID: ignore writes
             7 => self.dcic = value,
             9 => self.bdam = value,
             11 => self.bpcm = value,
             12 => self.sr = value & 0xF4FF_FFFF,
             13 => {
-                // software IRQ bits 8-9 are writable
                 self.cause = (self.cause & !0x300) | (value & 0x300);
             }
             16..=31 => {}
+            0 | 1 | 2 | 4 | 10 => return Err(Cop0Error::Reserved),
             _ => return Err(Cop0Error::Reserved),
         }
         Ok(())

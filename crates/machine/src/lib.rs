@@ -97,6 +97,10 @@ impl Machine {
         self.bus.gpu().lit_texels()
     }
 
+    pub fn lit_bbox(&self) -> Option<(u32, u32, u32, u32)> {
+        self.bus.gpu().lit_bbox()
+    }
+
     pub fn gp0_count(&self) -> u64 {
         self.bus.gpu().gp0_count
     }
@@ -105,12 +109,64 @@ impl Machine {
         self.bus.gpu().gp1_count
     }
 
+    pub fn gp0_cmds(&self) -> &[u8] {
+        &self.bus.gpu().gp0_cmds
+    }
+
+    pub fn gp0_words(&self) -> &[u32] {
+        &self.bus.gpu().gp0_words
+    }
+
+    pub fn gp1_cmds(&self) -> &[u32] {
+        &self.bus.gpu().gp1_cmds
+    }
+
     pub fn io_writes(&self) -> u64 {
         self.bus.io_writes
     }
 
+    pub fn last_io(&self) -> u32 {
+        self.bus.last_io
+    }
+
+    pub fn io_cd(&self) -> u64 {
+        self.bus.io_cd
+    }
+
+    pub fn io_spu(&self) -> u64 {
+        self.bus.io_spu
+    }
+
+    pub fn io_irq(&self) -> u64 {
+        self.bus.io_irq
+    }
+
+    pub fn io_gpu(&self) -> u64 {
+        self.bus.io_gpu
+    }
+
     pub fn bios_delay(&self) -> u32 {
         self.bus.memctrl_bios_delay()
+    }
+
+    pub fn ram_word(&self, addr: u32) -> u32 {
+        self.bus.ram_word(addr)
+    }
+
+    pub fn last_exception(&self) -> Option<(u8, u32, u32)> {
+        self.cpu.last_exception()
+    }
+
+    pub fn sr(&self) -> u32 {
+        self.cpu.sr()
+    }
+
+    pub fn badvaddr(&self) -> u32 {
+        self.cpu.badvaddr()
+    }
+
+    pub fn exception_log(&self) -> &[(u8, u32, u32)] {
+        &self.cpu.exception_log
     }
 }
 
@@ -186,6 +242,22 @@ mod tests {
     }
 
     #[test]
+    fn bne_skips_fallthrough_after_delay_slot() {
+        let bios = bios_with_program(&[
+            0x2409_0001, // addiu t1, zero, 1
+            0x1520_0002, // bne t1, zero, +2
+            0x0000_0000, // nop
+            0x240A_00FF, // addiu t2, zero, 0xFF (skipped)
+            0x240A_0012, // addiu t2, zero, 0x12 (target)
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..8 {
+            m.step();
+        }
+        assert_eq!(m.gpr(10), 0x12, "BNE must jump over the fall-through");
+    }
+
+    #[test]
     fn ori_combines_with_lui() {
         let bios = bios_with_program(&[
             0x3C08_0013, // lui $t0, 0x0013
@@ -205,31 +277,32 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        for n in 1..=60 {
-            m.run_until_vblank_count(n);
-            if n == 1 || n == 10 || n == 30 || n == 60 {
-                let lit = m
-                    .display_area()
-                    .pixels
-                    .iter()
-                    .filter(|p| **p & 0x7FFF != 0)
-                    .count();
-                eprintln!(
-                    "vblank {n}: pc={:08X} gpustat={:08X} display_lit={lit} vram_lit={} gp0={} gp1={}",
-                    m.pc(),
-                    m.gpustat(),
-                    m.vram_lit(),
-                    m.gp0_count(),
-                    m.gp1_count(),
-                );
-                eprintln!("  io_writes={} bios_delay={:08X}", m.io_writes(), m.bios_delay());
-            }
-        }
+        m.run_until_vblank_count(150);
         assert_ne!(m.pc(), 0xBFC0_0000, "CPU did not leave the reset vector");
         assert_eq!(
             m.bios_delay(),
             0x0013_243F,
             "BIOS did not write the BIOS delay register"
+        );
+        let display_lit = m
+            .display_area()
+            .pixels
+            .iter()
+            .filter(|p| **p & 0x7FFF != 0)
+            .count();
+        assert!(
+            display_lit > 50_000,
+            "Intro did not draw into the display area (pc={:08X} display_lit={display_lit} vram_lit={} gp0={} bbox={:?} exc={:?})",
+            m.pc(),
+            m.vram_lit(),
+            m.gp0_count(),
+            m.lit_bbox(),
+            m.last_exception(),
+        );
+        assert!(
+            m.exception_log().iter().all(|e| e.0 != 9),
+            "Intro hit BREAK (exc={:?})",
+            m.exception_log()
         );
     }
 }

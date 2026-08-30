@@ -18,6 +18,8 @@ pub struct Gpu {
     tex_x: u8,
     tex_y: u8,
     tex_page: u32,
+    clut_x: u32,
+    clut_y: u32,
     dither: bool,
     draw_to_display: bool,
     mask_set: bool,
@@ -31,6 +33,11 @@ pub struct Gpu {
     transfer: Option<Transfer>,
     pub gp0_count: u64,
     pub gp1_count: u64,
+    pub gp0_cmds: Vec<u8>,
+    pub gp0_words: Vec<u32>,
+    pub gp1_cmds: Vec<u32>,
+    odd_frame: bool,
+    in_vblank: bool,
 }
 
 #[allow(dead_code)]
@@ -62,6 +69,8 @@ impl Gpu {
             tex_x: 0,
             tex_y: 0,
             tex_page: 0,
+            clut_x: 0,
+            clut_y: 0,
             dither: false,
             draw_to_display: false,
             mask_set: false,
@@ -75,6 +84,11 @@ impl Gpu {
             transfer: None,
             gp0_count: 0,
             gp1_count: 0,
+            gp0_cmds: Vec::new(),
+            gp0_words: Vec::new(),
+            gp1_cmds: Vec::new(),
+            odd_frame: false,
+            in_vblank: false,
         };
         g.update_stat();
         g
@@ -90,6 +104,15 @@ impl Gpu {
 
     fn update_stat(&mut self) {
         let mut s = 0x1C00_0000; // ready bits 26,27,28
+        if let Some(t) = self.transfer.as_ref() {
+            // Bit26: not ready for a new command (GPU wants image data).
+            // Bit28: write FIFO empty — stay set so DMA/CPU can feed GP0(A0h).
+            s &= !(1 << 26);
+            if !t.to_vram {
+                s &= !(1 << 28);
+                s |= 1 << 27;
+            }
+        }
         s |= u32::from(self.tex_x) & 0xF;
         s |= (u32::from(self.tex_y) & 1) << 4;
         s |= (self.tex_page & 0x1E0) << 0;
@@ -106,6 +129,9 @@ impl Gpu {
             s |= 1 << 12;
         }
         s |= 1 << 13;
+        if self.display_vres >= 480 && self.odd_frame && !self.in_vblank {
+            s |= 1 << 31;
+        }
         s |= match self.display_hres {
             256 => 0,
             320 => 1 << 17,
@@ -126,6 +152,9 @@ impl Gpu {
 
     pub fn gp0(&mut self, word: u32) {
         self.gp0_count += 1;
+        if self.gp0_words.len() < 96 {
+            self.gp0_words.push(word);
+        }
         if self.transfer.as_ref().is_some_and(|t| t.to_vram) {
             let (mut x, mut y, w, base_x) = {
                 let t = self.transfer.as_ref().unwrap();
@@ -149,12 +178,16 @@ impl Gpu {
                 t.remaining = t.remaining.saturating_sub(1);
                 if t.remaining == 0 {
                     self.transfer = None;
+                    self.update_stat();
                 }
             }
             return;
         }
         if self.gp0_cmd.is_none() {
             let cmd = (word >> 24) as u8;
+            if self.gp0_cmds.len() < 64 {
+                self.gp0_cmds.push(cmd);
+            }
             if cmd == 0 || (0x04..=0x1E).contains(&cmd) {
                 return;
             }
@@ -175,6 +208,7 @@ impl Gpu {
         match cmd {
             0x02 => 3,
             0x1F => 1,
+            0x01 => 1, // clear texture cache
             0x20..=0x3F => polygon_len(cmd),
             0x40..=0x5F => line_len(cmd),
             0x60..=0x7F => rect_len(cmd),
@@ -223,6 +257,7 @@ impl Gpu {
                     cur_x: x,
                     cur_y: y,
                 });
+                self.update_stat();
             }
             0xE1 => {
                 let p = self.gp0_buf[0];
@@ -260,6 +295,9 @@ impl Gpu {
 
     pub fn gp1(&mut self, word: u32) {
         self.gp1_count += 1;
+        if self.gp1_cmds.len() < 64 {
+            self.gp1_cmds.push(word);
+        }
         let cmd = (word >> 24) & 0x3F;
         let p = word & 0xFF_FFFF;
         match cmd {
@@ -358,8 +396,15 @@ impl Gpu {
                 let uv = self.gp0_buf[idx];
                 u = uv as u8;
                 v = (uv >> 8) as u8;
+                if i == 0 {
+                    let clut = uv >> 16;
+                    self.clut_x = (clut & 0x3F) << 4;
+                    self.clut_y = (clut >> 6) & 0x1FF;
+                }
                 if i == 1 {
                     self.tex_page = uv >> 16;
+                    self.tex_x = (self.tex_page & 0xF) as u8;
+                    self.tex_y = ((self.tex_page >> 4) & 1) as u8;
                 }
             }
             verts[i] = (x, y, color, u, v);
@@ -501,6 +546,9 @@ impl Gpu {
         let (u0, v0) = if textured {
             let uv = self.gp0_buf[idx];
             idx += 1;
+            let clut = uv >> 16;
+            self.clut_x = (clut & 0x3F) << 4;
+            self.clut_y = (clut >> 6) & 0x1FF;
             (uv as u8, (uv >> 8) as u8)
         } else {
             (0, 0)
@@ -546,24 +594,32 @@ impl Gpu {
     }
 
     fn sample_tex(&self, u: u8, v: u8) -> u16 {
-        let tx = (u32::from(self.tex_x) * 64 + u32::from(u)) & 0x3FF;
-        let ty = (u32::from(self.tex_y) * 256 + u32::from(v)) & 0x1FF;
-        let p = self.read_half(tx, ty);
-        if p == 0 {
-            0x8000 // skip later? 0 is transparent
-        } else {
-            p
+        let page = self.tex_page;
+        let tx_base = (page & 0xF) * 64;
+        let ty_base = ((page >> 4) & 1) * 256;
+        let mode = (page >> 7) & 3;
+        let uu = u32::from(u);
+        let vv = u32::from(v);
+        match mode {
+            0 => {
+                let texel = self.read_half(tx_base + uu / 4, ty_base + vv);
+                let index = (texel >> ((uu & 3) * 4)) & 0xF;
+                self.read_half(self.clut_x + u32::from(index), self.clut_y)
+            }
+            1 => {
+                let texel = self.read_half(tx_base + uu / 2, ty_base + vv);
+                let index = (texel >> ((uu & 1) * 8)) & 0xFF;
+                self.read_half(self.clut_x + u32::from(index), self.clut_y)
+            }
+            _ => self.read_half(tx_base + uu, ty_base + vv),
         }
     }
 
     fn plot(&mut self, x: i32, y: i32, color: u16) {
-        if color == 0 && (color & 0x8000) == 0 {
-            // fully transparent texture
-        }
         if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
             return;
         }
-        if color == 0 {
+        if color & 0x7FFF == 0 {
             return;
         }
         let mut c = color & 0x7FFF;
@@ -592,9 +648,29 @@ impl Gpu {
         self.vram.iter().filter(|p| **p & 0x7FFF != 0).count()
     }
 
+    pub fn lit_bbox(&self) -> Option<(u32, u32, u32, u32)> {
+        let mut minx = 1024u32;
+        let mut miny = 512u32;
+        let mut maxx = 0u32;
+        let mut maxy = 0u32;
+        let mut any = false;
+        for y in 0..VRAM_H {
+            for x in 0..VRAM_W {
+                if self.vram[y * VRAM_W + x] & 0x7FFF != 0 {
+                    any = true;
+                    minx = minx.min(x as u32);
+                    miny = miny.min(y as u32);
+                    maxx = maxx.max(x as u32);
+                    maxy = maxy.max(y as u32);
+                }
+            }
+        }
+        any.then_some((minx, miny, maxx, maxy))
+    }
+
     pub fn display_area(&self) -> DisplayArea {
-        let w = self.display_hres.max(1);
-        let h = self.display_vres.min(240).max(1);
+        let w = self.display_hres.max(1).min(640);
+        let h = self.display_vres.max(1).min(480);
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for y in 0..h {
             for x in 0..w {
@@ -610,6 +686,14 @@ impl Gpu {
 
     pub fn dma_write(&mut self, word: u32) {
         self.gp0(word);
+    }
+
+    pub fn tick(&mut self, vblank: bool) {
+        if vblank && !self.in_vblank {
+            self.odd_frame = !self.odd_frame;
+        }
+        self.in_vblank = vblank;
+        self.update_stat();
     }
 }
 
