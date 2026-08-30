@@ -70,15 +70,24 @@ impl Debugger {
 impl eframe::App for Debugger {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.running {
-            if let Some(m) = self.machine.as_mut() {
-                let target = m.vblank_count() + 1;
-                m.run_until_vblank_count(target);
-                let pcm = m.take_audio();
-                if let Some(a) = self.audio.as_ref() {
-                    a.push(&pcm);
+            let queued = self.audio.as_ref().map(|a| a.queued_frames());
+            // Clock the guest to the host DAC. Running every egui repaint
+            // produced samples faster than 44100 Hz, then dropped them and
+            // desynced L/R — that was the glitchy noise.
+            let run = queued.map(|q| q < audio::WATERMARK).unwrap_or(true);
+            if run {
+                if let Some(m) = self.machine.as_mut() {
+                    let target = m.vblank_count() + 1;
+                    m.run_until_vblank_count(target);
+                    let pcm = m.take_audio();
+                    if let Some(a) = self.audio.as_ref() {
+                        a.push(&pcm);
+                    }
                 }
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(4));
             }
-            ctx.request_repaint();
         }
 
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {

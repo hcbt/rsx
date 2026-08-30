@@ -1,4 +1,7 @@
 //! Host playback of Machine PCM. The Machine does not know about this.
+//!
+//! Emulation is clocked to this buffer: if the queue is full, the Debugger
+//! waits instead of dropping samples (which desynced L/R and sounded like noise).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -6,8 +9,41 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample};
 
+/// Keep ~100 ms queued so the callback rarely underruns without adding lag.
+pub const WATERMARK: usize = 4410;
+const MAX_FRAMES: usize = 44_100;
+
+struct PcmBuf {
+    q: VecDeque<(i16, i16)>,
+}
+
+impl PcmBuf {
+    fn new() -> Self {
+        Self {
+            q: VecDeque::with_capacity(WATERMARK * 2),
+        }
+    }
+
+    fn push_interleaved(&mut self, pcm: &[i16]) {
+        for c in pcm.chunks_exact(2) {
+            if self.q.len() >= MAX_FRAMES {
+                break;
+            }
+            self.q.push_back((c[0], c[1]));
+        }
+    }
+
+    fn pop(&mut self) -> (i16, i16) {
+        self.q.pop_front().unwrap_or((0, 0))
+    }
+
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+}
+
 pub struct Output {
-    buf: Arc<Mutex<VecDeque<i16>>>,
+    buf: Arc<Mutex<PcmBuf>>,
     _stream: cpal::Stream,
 }
 
@@ -17,19 +53,26 @@ impl Output {
         let device = host
             .default_output_device()
             .ok_or_else(|| "no host audio output device".to_string())?;
-        let cfg = device
+        let supported = device
             .default_output_config()
             .map_err(|e| format!("audio config: {e}"))?;
-        let sample_rate = cfg.sample_rate().0;
-        let channels = cfg.channels() as usize;
-        let buf = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-        let shared = buf.clone();
+        let mut config = supported.config();
+        config.sample_rate = cpal::SampleRate(44100);
+        config.channels = 2;
+        let buf = Arc::new(Mutex::new(PcmBuf::new()));
         let err_fn = |e| eprintln!("audio stream: {e}");
-        let stream = match cfg.sample_format() {
-            cpal::SampleFormat::F32 => build::<f32>(&device, &cfg.config(), shared, sample_rate, channels, err_fn)?,
-            cpal::SampleFormat::I16 => build::<i16>(&device, &cfg.config(), shared, sample_rate, channels, err_fn)?,
-            cpal::SampleFormat::U16 => build::<u16>(&device, &cfg.config(), shared, sample_rate, channels, err_fn)?,
-            other => return Err(format!("unsupported sample format {other}")),
+        let stream = match open(&device, &config, supported.sample_format(), buf.clone(), err_fn) {
+            Ok(s) => s,
+            Err(_) => {
+                let fallback = supported.config();
+                open(
+                    &device,
+                    &fallback,
+                    supported.sample_format(),
+                    buf.clone(),
+                    err_fn,
+                )?
+            }
         };
         stream.play().map_err(|e| format!("audio play: {e}"))?;
         Ok(Self {
@@ -39,19 +82,35 @@ impl Output {
     }
 
     pub fn push(&self, pcm: &[i16]) {
-        let mut b = self.buf.lock().expect("audio mutex");
-        b.extend(pcm.iter().copied());
-        const CAP: usize = 44_100;
-        while b.len() > CAP {
-            b.pop_front();
-        }
+        self.buf.lock().expect("audio mutex").push_interleaved(pcm);
+    }
+
+    pub fn queued_frames(&self) -> usize {
+        self.buf.lock().expect("audio mutex").len()
+    }
+}
+
+fn open(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    buf: Arc<Mutex<PcmBuf>>,
+    err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, String> {
+    let host_rate = config.sample_rate.0;
+    let channels = config.channels as usize;
+    match format {
+        cpal::SampleFormat::F32 => build::<f32>(device, config, buf, host_rate, channels, err_fn),
+        cpal::SampleFormat::I16 => build::<i16>(device, config, buf, host_rate, channels, err_fn),
+        cpal::SampleFormat::U16 => build::<u16>(device, config, buf, host_rate, channels, err_fn),
+        other => Err(format!("unsupported sample format {other}")),
     }
 }
 
 fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    buf: Arc<Mutex<VecDeque<i16>>>,
+    buf: Arc<Mutex<PcmBuf>>,
     host_rate: u32,
     channels: usize,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
@@ -60,8 +119,7 @@ where
     T: Sample + FromSample<f32> + cpal::SizedSample,
 {
     let mut acc = 0u32;
-    let mut cur_l = 0i16;
-    let mut cur_r = 0i16;
+    let mut cur = (0i16, 0i16);
     device
         .build_output_stream(
             config,
@@ -71,11 +129,10 @@ where
                     acc += 44100;
                     while acc >= host_rate {
                         acc -= host_rate;
-                        cur_l = b.pop_front().unwrap_or(cur_l);
-                        cur_r = b.pop_front().unwrap_or(cur_r);
+                        cur = b.pop();
                     }
-                    let l = f32::from(cur_l) / 32768.0;
-                    let r = f32::from(cur_r) / 32768.0;
+                    let l = f32::from(cur.0) / 32768.0;
+                    let r = f32::from(cur.1) / 32768.0;
                     if !frame.is_empty() {
                         frame[0] = T::from_sample(l);
                     }
@@ -91,4 +148,30 @@ where
             None,
         )
         .map_err(|e| format!("audio stream: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_keeps_stereo_pairs_and_drops_newest() {
+        let mut b = PcmBuf::new();
+        b.push_interleaved(&[1, 2, 3, 4, 5]);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.pop(), (1, 2));
+        assert_eq!(b.pop(), (3, 4));
+        assert_eq!(b.pop(), (0, 0));
+    }
+
+    #[test]
+    fn full_buffer_does_not_drop_already_queued_frames() {
+        let mut b = PcmBuf::new();
+        let frame = [7i16, 8];
+        let many = vec![7, 8].repeat(MAX_FRAMES + 10);
+        b.push_interleaved(&many);
+        assert_eq!(b.len(), MAX_FRAMES);
+        assert_eq!(b.pop(), (7, 8));
+        let _ = frame;
+    }
 }
