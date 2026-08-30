@@ -1,12 +1,13 @@
 mod audio;
 mod capture;
+mod clock;
 mod config;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
-use rsx_machine::{DisplayArea, Machine, CPU_HZ};
+use rsx_machine::{DisplayArea, Machine};
 
 struct Debugger {
     machine: Option<Machine>,
@@ -16,8 +17,8 @@ struct Debugger {
     texture: Option<egui::TextureHandle>,
     capture_dir: PathBuf,
     audio: Option<audio::Output>,
-    /// Wall time and guest cycle count at last Run. Guest realtime is
-    /// (cycles - origin_cycles) / CPU_HZ versus this Instant.
+    /// Wall time and guest cycle count at last Run. Target is
+    /// origin_cycles + elapsed_ns × CPU_HZ / 1e9.
     clock: Option<(Instant, u64)>,
 }
 
@@ -80,19 +81,17 @@ impl eframe::App for Debugger {
                     self.clock = Some((Instant::now(), m.cycles()));
                 }
                 let (t0, c0) = self.clock.unwrap();
-                let guest = (m.cycles() - c0) as f64 / CPU_HZ as f64;
-                let wall = t0.elapsed().as_secs_f64();
-                if guest <= wall {
-                    let target = m.vblank_count() + 1;
-                    m.run_until_vblank_count(target);
-                    let pcm = m.take_audio();
-                    if let Some(a) = self.audio.as_ref() {
-                        a.push(&pcm);
+                let elapsed = t0.elapsed();
+                match clock::pace(m.cycles(), c0, elapsed) {
+                    clock::Pace::Run => {
+                        m.run_until_cycle(clock::target_cycles(c0, elapsed));
+                        let pcm = m.take_audio();
+                        if let Some(a) = self.audio.as_ref() {
+                            a.push(&pcm);
+                        }
+                        ctx.request_repaint();
                     }
-                    ctx.request_repaint();
-                } else {
-                    let wait = Duration::from_secs_f64(guest - wall);
-                    ctx.request_repaint_after(wait);
+                    clock::Pace::Wait(wait) => ctx.request_repaint_after(wait),
                 }
             }
         }

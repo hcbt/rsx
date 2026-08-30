@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample};
 
-/// Emergency cap (1 s). The Debugger must not use this as a speed control.
+/// Emergency cap (1 s). Drop oldest so a burst never cuts the current sound.
+/// Not a speed control — guest realtime is CPU_HZ versus wall.
 const MAX_FRAMES: usize = 44_100;
 
 struct PcmBuf {
@@ -23,7 +24,7 @@ impl PcmBuf {
     fn push_interleaved(&mut self, pcm: &[i16]) {
         for c in pcm.chunks_exact(2) {
             if self.q.len() >= MAX_FRAMES {
-                break;
+                self.q.pop_front();
             }
             self.q.push_back((c[0], c[1]));
         }
@@ -57,7 +58,13 @@ impl Output {
         config.channels = 2;
         let buf = Arc::new(Mutex::new(PcmBuf::new()));
         let err_fn = |e| eprintln!("audio stream: {e}");
-        let stream = match open(&device, &config, supported.sample_format(), buf.clone(), err_fn) {
+        let stream = match open(
+            &device,
+            &config,
+            supported.sample_format(),
+            buf.clone(),
+            err_fn,
+        ) {
             Ok(s) => s,
             Err(_) => {
                 let fallback = supported.config();
@@ -157,11 +164,14 @@ mod tests {
     }
 
     #[test]
-    fn full_buffer_keeps_the_oldest_queued_frame() {
+    fn overflow_keeps_the_newest_frame() {
         let mut b = PcmBuf::new();
-        let many = vec![7, 8].repeat(MAX_FRAMES + 10);
-        b.push_interleaved(&many);
+        b.push_interleaved(&vec![7, 8].repeat(MAX_FRAMES));
+        b.push_interleaved(&[9, 10]);
         assert_eq!(b.len(), MAX_FRAMES);
-        assert_eq!(b.pop(), (7, 8));
+        for _ in 0..MAX_FRAMES - 1 {
+            b.pop();
+        }
+        assert_eq!(b.pop(), (9, 10), "the current sound must not be cut off");
     }
 }

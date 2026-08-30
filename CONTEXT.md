@@ -53,8 +53,8 @@ A host PNG of the Display area, taken by the Debugger (`--capture-at`, or the Ca
 _Avoid_: screenshot, dump, framebuffer grab as the canonical name
 
 **Clock**:
-The SCPH-1001 master crystal at 33.8688 MHz. CPU steps, GPU vblank (263 lines × 2160 cycles), and SPU samples (768 cycles) all count this. Host realtime compares wall time to this counter. The audio device is a speaker, not the clock.
-_Avoid_: audio buffer as master clock, vsync as the guest clock
+The SCPH-1001 master crystal at 33.8688 MHz. CPU steps, GPU vblank (263 lines × 2160 cycles), and SPU samples (768 cycles) all count this. Host realtime is `origin_cycles + elapsed_ns × CPU_HZ / 1e9`. The Debugger runs the Machine until that cycle and presents the current Display area and PCM. The audio device is a speaker, not the clock.
+_Avoid_: audio buffer as master clock, vsync as the guest clock, one-vblank-then-wait as the realtime driver
 
 **SPU**:
 The PlayStation sound processor, with its own 512 KiB RAM. It mixes 24 ADPCM voices to 44100 Hz stereo PCM (one pair per 768 master cycles). The Debugger plays that and `--capture-at` writes `audio.wav`. CD-XA and reverb are not implemented.

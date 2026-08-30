@@ -48,6 +48,12 @@ impl DisplayArea {
 /// SCPH-1001 NTSC master crystal. Vblank (263×2160) and SPU 44100 (÷768) derive from this.
 pub const CPU_HZ: u64 = 33_868_800;
 
+/// Guest cycles that elapse in `nanos` of wall time at [`CPU_HZ`].
+pub fn cycles_in_nanos(nanos: u128) -> u64 {
+    let n = nanos.saturating_mul(CPU_HZ as u128) / 1_000_000_000;
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
 pub struct Machine {
     cpu: Cpu,
     bus: Bus,
@@ -90,6 +96,15 @@ impl Machine {
 
     pub fn run_until_vblank_count(&mut self, n: u64) {
         while self.bus.vblank_count() < n {
+            self.step();
+        }
+        self.vblank_count = self.bus.vblank_count();
+    }
+
+    /// Run until the master crystal is at least `target`. Host realtime converts
+    /// wall time through [`cycles_in_nanos`]; this is that deadline.
+    pub fn run_until_cycle(&mut self, target: u64) {
+        while self.bus.cycles() < target {
             self.step();
         }
         self.vblank_count = self.bus.vblank_count();
@@ -582,10 +597,62 @@ mod tests {
         let mut m = Machine::from_bios_path(bios.path()).unwrap();
         let c0 = m.cycles();
         m.step();
-        assert_eq!(m.cycles() - c0, 2, "CPU currently accounts 2 clocks per insn");
+        assert_eq!(
+            m.cycles() - c0,
+            2,
+            "CPU currently accounts 2 clocks per insn"
+        );
         m.step();
         assert_eq!(m.cycles() - c0, 4);
         assert_eq!(CPU_HZ % 768, 0, "SPU 44100 must divide the master crystal");
+    }
+
+    #[test]
+    fn one_wall_second_is_the_master_crystal() {
+        assert_eq!(cycles_in_nanos(1_000_000_000), 33_868_800);
+        assert_eq!(cycles_in_nanos(500_000_000), 16_934_400);
+        assert_eq!(cycles_in_nanos(0), 0);
+    }
+
+    #[test]
+    fn run_until_cycle_reaches_the_target() {
+        let bios = bios_with_program(&[
+            0x3C08_0013, // lui $t0, 0x0013
+            0x0000_0000, // nop
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        let c0 = m.cycles();
+        m.run_until_cycle(c0 + 100);
+        assert!(m.cycles() >= c0 + 100, "must not stop short of the target");
+        assert!(
+            m.cycles() < c0 + 100 + 2,
+            "must not overshoot more than one instruction (got {})",
+            m.cycles() - c0
+        );
+        let pc = m.pc();
+        let cycles = m.cycles();
+        m.run_until_cycle(cycles);
+        assert_eq!(m.cycles(), cycles, "already-there is a no-op");
+        assert_eq!(m.pc(), pc);
+        m.run_until_cycle(0);
+        assert_eq!(m.cycles(), cycles, "must not rewind the crystal");
+    }
+
+    #[test]
+    fn run_until_cycle_mixes_one_spu_frame_per_768_clocks() {
+        let bios = bios_with_program(&[0x0000_0000]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        let _ = m.take_audio();
+        let c0 = m.cycles();
+        m.run_until_cycle(c0 + 768 * 16);
+        let pcm = m.take_audio();
+        assert_eq!(
+            pcm.len(),
+            32,
+            "16 SPU frames are 16 stereo pairs (got {} samples after {} cycles)",
+            pcm.len(),
+            m.cycles() - c0
+        );
     }
 
     #[test]
