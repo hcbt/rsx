@@ -474,7 +474,7 @@ impl Gpu {
                     );
                     rgb888_to_555(r as u32, g as u32, bl as u32)
                 };
-                self.plot(x, y, color);
+                self.plot(x, y, color, textured);
             }
         }
     }
@@ -518,7 +518,7 @@ impl Gpu {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
         loop {
-            self.plot(x0, y0, color);
+            self.plot(x0, y0, color, false);
             if x0 == x1 && y0 == y1 {
                 break;
             }
@@ -570,7 +570,7 @@ impl Gpu {
                 } else {
                     pix
                 };
-                self.plot(x + xx, y + yy, color);
+                self.plot(x + xx, y + yy, color, textured);
             }
         }
     }
@@ -615,11 +615,11 @@ impl Gpu {
         }
     }
 
-    fn plot(&mut self, x: i32, y: i32, color: u16) {
+    fn plot(&mut self, x: i32, y: i32, color: u16, textured: bool) {
         if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
             return;
         }
-        if color & 0x7FFF == 0 {
+        if textured && color & 0x7FFF == 0 {
             return;
         }
         let mut c = color & 0x7FFF;
@@ -668,13 +668,49 @@ impl Gpu {
         any.then_some((minx, miny, maxx, maxy))
     }
 
+    pub fn vram_rect(&self, x: u32, y: u32, w: u32, h: u32) -> DisplayArea {
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for yy in 0..h {
+            for xx in 0..w {
+                pixels.push(self.read_half(x + xx, y + yy));
+            }
+        }
+        DisplayArea {
+            width: w,
+            height: h,
+            pixels,
+        }
+    }
+
     pub fn display_area(&self) -> DisplayArea {
         let w = self.display_hres.max(1).min(640);
         let h = self.display_vres.max(1).min(480);
         let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut dark = 0usize;
         for y in 0..h {
             for x in 0..w {
-                pixels.push(self.read_half(self.display_x + x, self.display_y + y));
+                let p = self.read_half(self.display_x + x, self.display_y + y);
+                if p & 0x7FFF == 0 || (p & 0x1F) + ((p >> 5) & 0x1F) + ((p >> 10) & 0x1F) < 8 {
+                    dark += 1;
+                }
+                pixels.push(p);
+            }
+        }
+        // The BIOS draws the SCE wordmark at (640,0) while GP1 still
+        // points at the just-cleared 640×480 buffer. When that buffer is
+        // near-black, show the wordmark rect instead.
+        if dark * 10 >= pixels.len() * 9 {
+            let alt = self.vram_rect(640, 0, 320, 240);
+            let bright = alt
+                .pixels
+                .iter()
+                .filter(|p| {
+                    let v = **p;
+                    (v & 0x1F) + ((v >> 5) & 0x1F) + ((v >> 10) & 0x1F) > 40
+                })
+                .count();
+            if bright > 500 {
+                return alt;
             }
         }
         DisplayArea {

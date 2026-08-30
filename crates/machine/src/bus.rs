@@ -100,6 +100,10 @@ impl Bus {
         &self.irq
     }
 
+    pub fn timers(&self) -> &Timers {
+        &self.timers
+    }
+
     pub fn vblank_count(&self) -> u64 {
         self.vblanks
     }
@@ -166,6 +170,7 @@ impl Bus {
         let line = ((self.cycles / CYCLES_PER_LINE) as u32) % LINES_PER_FRAME;
         if line != self.scanline {
             self.scanline = line;
+            self.timers.hblank(&mut self.irq);
             let vblank = line >= VBLANK_START;
             if vblank && !self.in_vblank {
                 self.vblanks += 1;

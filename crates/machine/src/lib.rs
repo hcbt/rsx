@@ -86,6 +86,10 @@ impl Machine {
         self.bus.gpu().display_area()
     }
 
+    pub fn vram_rect(&self, x: u32, y: u32, w: u32, h: u32) -> DisplayArea {
+        self.bus.gpu().vram_rect(x, y, w, h)
+    }
+
     pub fn display_area_hash(&self) -> u64 {
         hash_pixels(&self.display_area())
     }
@@ -176,6 +180,14 @@ impl Machine {
 
     pub fn irq_mask(&self) -> u16 {
         self.bus.irq().read16(0x1F80_1074)
+    }
+
+    pub fn timer_value(&self, i: usize) -> u16 {
+        self.bus.timers().value(i)
+    }
+
+    pub fn timer_mode(&self, i: usize) -> u16 {
+        self.bus.timers().mode(i)
     }
 }
 
@@ -290,6 +302,30 @@ mod tests {
     }
 
     #[test]
+    fn timer2_sysclk8_counts_across_short_ticks() {
+        let bios = bios_with_program(&[
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_1124, // ori t0, t0, 0x1124  T2_MODE
+            0x2409_0200, // addiu t1, zero, 0x200  clock = sysclk/8
+            0xA509_0000, // sh t1, 0(t0)
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..8 {
+            m.step();
+        }
+        let before = m.timer_value(2);
+        for _ in 0..40 {
+            m.step();
+        }
+        let after = m.timer_value(2);
+        assert!(
+            after > before,
+            "Timer 2 in sysclk/8 must count (before={before} after={after} mode={:04X})",
+            m.timer_mode(2),
+        );
+    }
+
+    #[test]
     fn dma_irq_does_not_fire_on_the_start_write() {
         let bios = bios_with_program(&[
             0x3C08_1F80, // lui t0, 0x1F80
@@ -387,7 +423,24 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        m.run_until_vblank_count(600);
+        m.run_until_vblank_count(451);
+        let wordmark = m.display_area();
+        let bright = wordmark
+            .pixels
+            .iter()
+            .filter(|p| {
+                let v = **p;
+                (v & 0x1F) + ((v >> 5) & 0x1F) + ((v >> 10) & 0x1F) > 40
+            })
+            .count();
+        assert_eq!(wordmark.width, 320, "wordmark is 320×240 at VRAM (640,0)");
+        assert_eq!(wordmark.height, 240);
+        assert!(
+            bright > 500,
+            "SCE wordmark not visible (bright={bright} gp0={})",
+            m.gp0_count()
+        );
+        m.run_until_vblank_count(500);
         assert_ne!(
             m.pc() & 0xFFFF,
             0x45D0,

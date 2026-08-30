@@ -110,7 +110,12 @@ impl Cdrom {
                     self.param.push(value);
                 }
             }
-            (2, 1) => self.irq_enable = value & 0x1F,
+            (2, 1) => {
+                self.irq_enable = value & 0x1F;
+                if self.irq_flag & self.irq_enable != 0 {
+                    irq.raise(irq::IRQ_CDROM);
+                }
+            }
             (3, 1) => {
                 self.irq_flag &= !(value & 0x1F);
                 if value & 0x40 != 0 {

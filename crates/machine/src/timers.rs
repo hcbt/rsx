@@ -4,6 +4,7 @@ pub struct Timers {
     value: [u16; 3],
     mode: [u16; 3],
     target: [u16; 3],
+    sysclk8_frac: u32,
 }
 
 impl Timers {
@@ -12,6 +13,7 @@ impl Timers {
             value: [0; 3],
             mode: [0; 3],
             target: [0; 3],
+            sysclk8_frac: 0,
         }
     }
 
@@ -19,22 +21,39 @@ impl Timers {
         *self = Self::new();
     }
 
+    pub fn value(&self, i: usize) -> u16 {
+        self.value[i]
+    }
+
+    pub fn mode(&self, i: usize) -> u16 {
+        self.mode[i]
+    }
+
     pub fn tick(&mut self, cycles: u32, irq: &mut Irq) {
         for i in 0..3 {
             let src = (self.mode[i] >> 8) & 3;
-            let sysclk = match i {
-                2 => src == 0 || src == 1,
-                _ => src == 0 || src == 2,
+            let step = match i {
+                2 if src == 2 || src == 3 => {
+                    self.sysclk8_frac += cycles;
+                    let s = self.sysclk8_frac / 8;
+                    self.sysclk8_frac %= 8;
+                    s
+                }
+                2 if src == 0 || src == 1 => cycles,
+                _ if src == 0 || src == 2 => cycles,
+                _ => 0,
             };
-            if !sysclk {
-                continue;
+            if step > 0 {
+                self.advance(i, step, irq);
             }
-            let step = if i == 2 && (src == 2 || src == 3) {
-                cycles / 8
-            } else {
-                cycles
-            };
-            self.advance(i, step as u32, irq);
+        }
+    }
+
+    /// One horizontal blanking pulse. Timer 1 can clock from this.
+    pub fn hblank(&mut self, irq: &mut Irq) {
+        let src = (self.mode[1] >> 8) & 3;
+        if src == 1 || src == 3 {
+            self.advance(1, 1, irq);
         }
     }
 
