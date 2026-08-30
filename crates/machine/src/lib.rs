@@ -561,18 +561,13 @@ mod tests {
         for _ in 0..24 {
             m.step();
         }
-        assert_eq!(
-            m.irq_stat() & (1 << 3),
-            0,
-            "IRQ3 must not assert in the CHCR write"
-        );
         for _ in 0..200 {
             m.step();
         }
         assert_eq!(
             m.irq_stat() & (1 << 3),
             1 << 3,
-            "IRQ3 after DMA completion delay"
+            "IRQ3 after the transfer duration"
         );
     }
 

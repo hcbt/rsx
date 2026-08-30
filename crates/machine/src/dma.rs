@@ -3,9 +3,7 @@ use crate::gpu::Gpu;
 use crate::irq::{self, Irq};
 use crate::spu::Spu;
 
-/// Cycles after a transfer before DICR/IRQ3 assert. The BIOS often arms the
-/// wait *after* writing CHCR; raising in that same write misses it.
-const IRQ_DELAY: u32 = 256;
+/// Extra clocks per 16 words (DRAM hyper-page row load). SPX: ~17 clks / 16 words.
 
 pub struct Dma {
     madr: [u32; 7],
@@ -133,19 +131,28 @@ impl Dma {
             self.chcr[ch] &= !(1 << 24);
             return;
         }
-        match ch {
+        let words = match ch {
             2 => self.gpu(ram, gpu),
             3 => self.cd(ram, cdrom),
             4 => self.spu(ram, spu),
             6 => self.otc(ram),
-            _ => {}
-        }
+            _ => 0,
+        };
         self.chcr[ch] &= !(1 << 24);
-        self.complete(ch);
+        self.complete(ch, words);
         self.update_master(irq);
     }
 
-    fn cd(&mut self, ram: &mut [u8], cdrom: &mut Cdrom) {
+    fn clocks_per_word(ch: usize) -> u32 {
+        match ch {
+            3 => 24,
+            4 => 4,
+            5 => 20,
+            _ => 1,
+        }
+    }
+
+    fn cd(&mut self, ram: &mut [u8], cdrom: &mut Cdrom) -> u32 {
         let bs = self.bcr[3] & 0xFFFF;
         let ba = self.bcr[3] >> 16;
         let bs = if bs == 0 { 0x1_0000 } else { bs };
@@ -156,9 +163,10 @@ impl Dma {
             write32(ram, addr, cdrom.dma_read32());
             addr = addr.wrapping_add(4) & 0x1F_FFFF;
         }
+        n
     }
 
-    fn gpu(&mut self, ram: &mut [u8], gpu: &mut Gpu) {
+    fn gpu(&mut self, ram: &mut [u8], gpu: &mut Gpu) -> u32 {
         let mode = (self.chcr[2] >> 9) & 3;
         let dir = self.chcr[2] & 1;
         if mode == 2 && dir == 1 {
@@ -171,6 +179,7 @@ impl Dma {
             let mut max_a = 0u32;
             let mut empty_before = 0u32;
             let mut seen_pkt = false;
+            let mut nwords = 0u32;
             for _ in 0..1_000_000 {
                 if addr == 0x00FF_FFFF || addr > 0x1F_FFFF {
                     break;
@@ -189,6 +198,7 @@ impl Dma {
                     pkts += 1;
                     seen_pkt = true;
                 }
+                nwords += 1 + words;
                 for i in 0..words {
                     let w = read32(ram, addr.wrapping_add(4 + i * 4) & 0x1F_FFFF);
                     gpu.dma_write(w);
@@ -207,6 +217,7 @@ impl Dma {
                 self.last_list_start_n = start_n;
                 self.last_empty_before = empty_before;
             }
+            return nwords;
         } else if mode == 1 && dir == 1 {
             let bs = self.bcr[2] & 0xFFFF;
             let ba = self.bcr[2] >> 16;
@@ -218,10 +229,12 @@ impl Dma {
                 gpu.dma_write(read32(ram, addr));
                 addr = addr.wrapping_add(4) & 0x1F_FFFF;
             }
+            return n;
         }
+        0
     }
 
-    fn spu(&mut self, ram: &mut [u8], spu: &mut Spu) {
+    fn spu(&mut self, ram: &mut [u8], spu: &mut Spu) -> u32 {
         let bs = self.bcr[4] & 0xFFFF;
         let ba = self.bcr[4] >> 16;
         let dir = self.chcr[4] & 1;
@@ -234,9 +247,10 @@ impl Dma {
             }
             addr = addr.wrapping_add(4) & 0x1F_FFFF;
         }
+        n
     }
 
-    fn otc(&mut self, ram: &mut [u8]) {
+    fn otc(&mut self, ram: &mut [u8]) -> u32 {
         let mut n = self.bcr[6] & 0xFFFF;
         if n == 0 {
             n = 0x10000;
@@ -251,12 +265,15 @@ impl Dma {
             write32(ram, addr, next);
             addr = addr.wrapping_sub(4) & 0x1F_FFFF;
         }
+        n
     }
 
-    fn complete(&mut self, ch: usize) {
+    fn complete(&mut self, ch: usize, words: u32) {
+        let hyper = (words + 15) / 16;
+        let dur = words.saturating_mul(Self::clocks_per_word(ch)).saturating_add(hyper).max(1);
         if self.dicr & (1 << 23) != 0 && self.dicr & (1 << (16 + ch)) != 0 {
             self.dicr |= 1 << (24 + ch);
-            self.irq_delay = self.irq_delay.max(IRQ_DELAY);
+            self.irq_delay = self.irq_delay.max(dur);
         }
     }
 

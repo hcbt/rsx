@@ -163,19 +163,24 @@ impl Cdrom {
     fn command(&mut self, cmd: u8, _irq: &mut Irq) {
         self.status |= 1 << 7; // busy
         let (first, second) = match cmd {
-            0x01 => (Some((1000, 3, vec![self.controller_stat()])), None), // Getstat
+            0x01 => (Some((0xC4E1, 3, vec![self.controller_stat()])), None), // Getstat
             0x02 => {
                 // Setloc
                 if self.param.len() >= 3 {
                     self.loc = (self.param[0], self.param[1], self.param[2]);
                 }
-                (Some((1000, 3, vec![self.controller_stat()])), None)
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
             }
             0x06 => self.read_n(),
-            0x08 | 0x09 => {
+            0x08 => {
                 self.reading = false;
                 let stat = self.controller_stat();
-                (Some((2000, 3, vec![stat])), Some((10_000, 2, vec![stat])))
+                (Some((0xC4E1, 3, vec![stat])), Some((0x00D3_8ACA, 2, vec![stat])))
+            }
+            0x09 => {
+                self.reading = false;
+                let stat = self.controller_stat();
+                (Some((0xC4E1, 3, vec![stat])), Some((0x0021_181C, 2, vec![stat])))
             }
             0x0A => {
                 if self.disc.is_some() {
@@ -183,31 +188,31 @@ impl Cdrom {
                 }
                 self.reading = false;
                 let stat = self.controller_stat();
-                (Some((5000, 3, vec![stat])), Some((20_000, 2, vec![stat])))
+                (Some((0x13CCE, 3, vec![stat])), Some((0xC4E1, 2, vec![stat])))
             }
-            0x0C => (Some((1000, 3, vec![self.controller_stat()])), None), // Demute
+            0x0C => (Some((0xC4E1, 3, vec![self.controller_stat()])), None), // Demute
             0x0E => {
                 if let Some(&m) = self.param.first() {
                     self.mode = m;
                 }
-                (Some((1000, 3, vec![self.controller_stat()])), None)
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
             }
             0x15 => {
                 // SeekL
                 self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
                 let stat = self.controller_stat();
-                (Some((2000, 3, vec![stat])), Some((15_000, 2, vec![stat])))
+                (Some((0xC4E1, 3, vec![stat])), Some((451_584, 2, vec![stat])))
             }
             0x19 => {
                 let sub = self.param.first().copied().unwrap_or(0);
                 if sub == 0x20 {
-                    (Some((1000, 3, vec![0x94, 0x09, 0x19, 0xC0])), None)
+                    (Some((0xC4E1, 3, vec![0x94, 0x09, 0x19, 0xC0])), None)
                 } else {
-                    (Some((1000, 3, vec![self.controller_stat()])), None)
+                    (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
                 }
             }
             0x1A => self.get_id(),
-            _ => (Some((2000, 3, vec![self.controller_stat()])), None),
+            _ => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
         };
         self.param.clear();
         if let Some((cycles, irqn, result)) = first {
@@ -226,10 +231,10 @@ impl Cdrom {
             Some(disc) => {
                 let mut id = vec![stat, 0x00, 0x20, 0x00];
                 id.extend_from_slice(&disc.region);
-                (Some((4000, 3, vec![stat])), Some((50_000, 2, id)))
+                (Some((0xC4E1, 3, vec![stat])), Some((0x4A00, 2, id)))
             }
             None => (
-                Some((4000, 3, vec![stat])),
+                Some((0xC4E1, 3, vec![stat])),
                 Some((
                     30_000,
                     5,
@@ -253,7 +258,7 @@ impl Cdrom {
     fn read_n(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, u8, Vec<u8>)>) {
         if self.disc.is_none() {
             return (
-                Some((2000, 3, vec![self.controller_stat()])),
+                Some((0xC4E1, 3, vec![self.controller_stat()])),
                 Some((10_000, 5, vec![0x01])),
             );
         }
@@ -262,7 +267,7 @@ impl Cdrom {
         self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
         let stat = self.controller_stat();
         (
-            Some((2000, 3, vec![stat])),
+            Some((0xC4E1, 3, vec![stat])),
             Some((self.sector_cycles(), 1, vec![stat])),
         )
     }
@@ -371,7 +376,7 @@ mod tests {
         let mut irq = Irq::new();
         cd.irq_enable = 0x1F;
         cd.command(0x1A, &mut irq);
-        pump(&mut cd, &mut irq, 4000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         pump(&mut cd, &mut irq, 30_000);
         assert_eq!(cd.irq_flag & 7, 5, "INT5");
         assert_eq!(cd.result[0], 0x08);
@@ -387,7 +392,7 @@ mod tests {
         let mut irq = Irq::new();
         cd.irq_enable = 0x1F;
         cd.command(0x1A, &mut irq);
-        pump(&mut cd, &mut irq, 4000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         assert_eq!(cd.irq_flag & 7, 3, "INT3");
         pump(&mut cd, &mut irq, 50_000);
         assert_eq!(cd.irq_flag & 7, 2, "INT2");
@@ -406,12 +411,12 @@ mod tests {
         cd.irq_enable = 0x1F;
         cd.param = vec![0x80];
         cd.command(0x0E, &mut irq);
-        pump(&mut cd, &mut irq, 1000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         cd.param = vec![0x00, 0x02, 0x04];
         cd.command(0x02, &mut irq);
-        pump(&mut cd, &mut irq, 1000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         cd.command(0x06, &mut irq);
-        pump(&mut cd, &mut irq, 2000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         pump(&mut cd, &mut irq, 230_000);
         assert_eq!(cd.irq_flag & 7, 1, "INT1");
         let mut bytes = Vec::new();
@@ -436,12 +441,12 @@ mod tests {
         cd.irq_enable = 0x1F;
         cd.param = vec![0x80];
         cd.command(0x0E, &mut irq);
-        pump(&mut cd, &mut irq, 1000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         cd.param = vec![0x00, 0x02, 0x04];
         cd.command(0x02, &mut irq);
-        pump(&mut cd, &mut irq, 1000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         cd.command(0x06, &mut irq);
-        pump(&mut cd, &mut irq, 2_000);
+        pump(&mut cd, &mut irq, 0xC4E1);
         pump(&mut cd, &mut irq, 230_000);
         assert_eq!(cd.irq_flag & 7, 1);
         pump(&mut cd, &mut irq, 300_000);

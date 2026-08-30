@@ -32,6 +32,8 @@ struct Voice {
     end_after: bool,
     loop_repeat: bool,
     started: bool,
+    sweep_level: i32,
+    sweep_counter: u32,
 }
 
 impl Voice {
@@ -50,6 +52,8 @@ impl Voice {
             end_after: false,
             loop_repeat: false,
             started: false,
+            sweep_level: 0,
+            sweep_counter: 0,
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct Spu {
     endx: u32,
     cycle_accum: u32,
     samples: Vec<i16>,
+    main_sweep: [i32; 2],
+    main_sweep_ctr: [u32; 2],
     irq_pending: bool,
 }
 
@@ -82,6 +88,8 @@ impl Spu {
             endx: 0,
             cycle_accum: 0,
             samples: Vec::new(),
+            main_sweep: [0; 2],
+            main_sweep_ctr: [0; 2],
             irq_pending: false,
         }
     }
@@ -259,8 +267,8 @@ impl Spu {
         if enabled {
             for i in 0..VOICES {
                 let s = self.voice_sample(i);
-                let vol_l = voice_volume(self.regs[i * 8]);
-                let vol_r = voice_volume(self.regs[i * 8 + 1]);
+                let vol_l = self.volume(self.regs[i * 8], Some(i));
+                let vol_r = self.volume(self.regs[i * 8 + 1], Some(i));
                 left += (s * vol_l) >> 15;
                 right += (s * vol_r) >> 15;
             }
@@ -269,8 +277,8 @@ impl Spu {
             left = 0;
             right = 0;
         } else {
-            left = (left * voice_volume(self.regs[0xC0])) >> 15;
-            right = (right * voice_volume(self.regs[0xC1])) >> 15;
+            left = (left * self.volume(self.regs[0xC0], None)) >> 15;
+            right = (right * self.volume(self.regs[0xC1], None)) >> 15;
         }
         self.samples.push(left.clamp(-0x8000, 0x7FFF) as i16);
         self.samples.push(right.clamp(-0x8000, 0x7FFF) as i16);
@@ -411,13 +419,68 @@ impl Spu {
     }
 }
 
-fn voice_volume(reg: u16) -> i32 {
-    if reg & 0x8000 != 0 {
-        // Sweep not yet: hold mid volume so wet-looking writes still sound.
-        0x7FFF
-    } else {
-        i32::from((reg as i16) << 1)
+impl Spu {
+    fn volume(&mut self, reg: u16, voice: Option<usize>) -> i32 {
+        if reg & 0x8000 == 0 {
+            let v = i32::from((reg as i16) << 1);
+            match voice {
+                Some(i) => self.voices[i].sweep_level = v,
+                None => {}
+            }
+            v
+        } else {
+            let exp = reg & (1 << 14) != 0;
+            let dec = reg & (1 << 13) != 0;
+            let shift = u32::from((reg >> 2) & 0x1F);
+            let step = u32::from(reg & 3);
+            match voice {
+                Some(i) => {
+                    tick_level(
+                        &mut self.voices[i].sweep_level,
+                        &mut self.voices[i].sweep_counter,
+                        shift,
+                        step,
+                        exp,
+                        dec,
+                    );
+                    self.voices[i].sweep_level
+                }
+                None => {
+                    let slot = if reg == self.regs[0xC1] { 1 } else { 0 };
+                    tick_level(
+                        &mut self.main_sweep[slot],
+                        &mut self.main_sweep_ctr[slot],
+                        shift,
+                        step,
+                        exp,
+                        dec,
+                    );
+                    self.main_sweep[slot]
+                }
+            }
+        }
     }
+}
+
+fn tick_level(
+    level: &mut i32,
+    counter: &mut u32,
+    shift: u32,
+    step_value: u32,
+    exponential: bool,
+    decreasing: bool,
+) {
+    let mut dummy = Voice::new();
+    dummy.adsr_level = *level;
+    dummy.adsr_counter = *counter;
+    dummy.phase = if decreasing {
+        Phase::Release
+    } else {
+        Phase::Attack
+    };
+    envelope_tick(&mut dummy, shift, step_value, exponential, decreasing);
+    *level = dummy.adsr_level;
+    *counter = dummy.adsr_counter;
 }
 
 fn envelope_tick(v: &mut Voice, shift: u32, step_value: u32, exponential: bool, decreasing: bool) {
