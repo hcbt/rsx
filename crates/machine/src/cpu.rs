@@ -184,6 +184,16 @@ impl Cpu {
         }
     }
 
+    fn is_ram(addr: u32) -> bool {
+        (addr & 0x1FFF_FFFF) < 0x80_0000
+    }
+
+    fn wait_ram_ready(&mut self, bus: &mut Bus) {
+        while bus.ram_blocked() || bus.write_pending() {
+            bus.tick(1);
+        }
+    }
+
     fn delay_load(&mut self, rt: u8, value: u32) {
         if rt != 0 {
             self.pending_load = Some((rt, value));
@@ -251,6 +261,9 @@ impl Cpu {
         let cached = (addr >> 29) != 5; // not KSEG1
         let icache_on = bus.cache_ctrl() & (1 << 11) != 0;
         if !cached || self.cop0.isolate_cache() || !icache_on {
+            if Self::is_ram(addr) {
+                self.wait_ram_ready(bus);
+            }
             let w = bus.read32(addr)?;
             return Some((w, bus.access_cycles(addr, false, 4)));
         }
@@ -258,8 +271,15 @@ impl Cpu {
         let line = ((phys >> 4) & 0xFF) as usize;
         let word = ((phys >> 2) & 3) as usize;
         let tag = phys >> 12;
-        let c = &mut self.icache[line];
-        if c.tag != tag || (c.valid & (1 << word)) == 0 {
+        let miss = {
+            let c = &self.icache[line];
+            c.tag != tag || (c.valid & (1 << word)) == 0
+        };
+        if miss {
+            if Self::is_ram(addr) {
+                self.wait_ram_ready(bus);
+            }
+            let c = &mut self.icache[line];
             c.tag = tag;
             c.valid = 0;
             let base = addr & !0xF;
@@ -584,6 +604,9 @@ impl Cpu {
             Width::Half => 2,
             Width::Word => 4,
         };
+        if Self::is_ram(addr) {
+            self.wait_ram_ready(bus);
+        }
         self.data_cycles = self.data_cycles.max(bus.access_cycles(addr, false, bytes));
         match width {
             Width::Byte => {
@@ -617,6 +640,22 @@ impl Cpu {
         if self.cop0.isolate_cache() {
             self.store_icache(bus.cache_ctrl(), addr, value);
             return;
+        }
+        if Self::is_ram(addr) {
+            while bus.write_queue_full() {
+                bus.tick(1);
+            }
+        }
+        let p = addr & 0x1FFF_FFFF & !3;
+        if p == 0x1F80_1810 {
+            while bus.gpu_fifo_full() {
+                bus.tick(1);
+            }
+        }
+        if (0x1F80_1080..=0x1F80_10FC).contains(&p) {
+            while bus.write_pending() {
+                bus.tick(1);
+            }
         }
         match width {
             Width::Byte => bus.write8(addr, value as u8),

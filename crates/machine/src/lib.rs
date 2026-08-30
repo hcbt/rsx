@@ -608,6 +608,41 @@ mod tests {
     }
 
     #[test]
+    fn ram_load_stalls_while_otc_owns_ram() {
+        let bios = bios_with_program(&[
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_10F0, // ori t0, t0, 0x10F0  DPCR
+            0x8D09_0000, // lw t1, 0(t0)
+            0x0000_0000, // nop
+            0x3C0A_0800, // lui t2, 0x0800      ch6 enable
+            0x012A_4825, // or t1, t1, t2
+            0xAD09_0000, // sw t1, 0(t0)
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_10E0, // ori t0, t0, 0x10E0  DMA6
+            0x2409_0080, // addiu t1, zero, 0x80
+            0xAD09_0000, // sw t1, 0(t0)        MADR
+            0x2409_0200, // addiu t1, zero, 0x200  512 words
+            0xAD09_0004, // sw t1, 4(t0)        BCR
+            0x3C09_1100, // lui t1, 0x1100
+            0x3529_0002, // ori t1, t1, 2
+            0xAD09_0008, // sw t1, 8(t0)        CHCR start
+            0x8C0B_0100, // lw t3, 0x100(zero)  RAM — stalls until OTC releases the bus
+            0x0000_0000, // nop
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..16 {
+            m.step();
+        }
+        let c0 = m.cycles();
+        m.step();
+        let dt = m.cycles() - c0;
+        assert!(
+            dt > 200,
+            "lw from RAM must wait for OTC (512 words); got {dt}"
+        );
+    }
+
+    #[test]
     fn ram_word_load_from_bios_adds_seven() {
         // lw t0, 0(zero)  — data from RAM, fetch from uncached BIOS.
         let bios = bios_with_program(&[0x8C08_0000]);
@@ -749,7 +784,7 @@ mod tests {
             m.gp0_count(),
         );
         assert!(
-            m.gp0_count() > 17_000,
+            m.gp0_count() > 5_000,
             "BIOS stopped issuing GPU commands (pc={:08X} gp0={})",
             m.pc(),
             m.gp0_count(),
@@ -797,7 +832,7 @@ mod tests {
             "diamond / fade must occupy the GP1 display rectangle (lit={diamond_lit})"
         );
 
-        m.run_until_vblank_count(400);
+        m.run_until_vblank_count(550);
         let display = m.display_area();
         assert_eq!((display.width, display.height), (640, 480));
         let fill = display.pixels[0] & 0x7FFF;

@@ -1,7 +1,10 @@
+use std::collections::VecDeque;
+
 use crate::DisplayArea;
 
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
+const FIFO_WORDS: usize = 16;
 
 pub struct Gpu {
     vram: Vec<u16>,
@@ -72,6 +75,11 @@ pub struct Gpu {
     crt_w: u32,
     crt_h: u32,
     crt_line: u32,
+    fifo: VecDeque<u32>,
+    draw_busy: u32,
+    plot_cost: u32,
+    plotting: bool,
+    block28: bool,
 }
 
 #[allow(dead_code)]
@@ -154,6 +162,11 @@ impl Gpu {
             crt_w: 0,
             crt_h: 0,
             crt_line: u32::MAX,
+            fifo: VecDeque::with_capacity(FIFO_WORDS),
+            draw_busy: 0,
+            plot_cost: 1,
+            plotting: false,
+            block28: false,
         };
         g.update_stat();
         g
@@ -167,16 +180,48 @@ impl Gpu {
         self.stat
     }
 
+    pub fn fifo_full(&self) -> bool {
+        self.fifo.len() >= FIFO_WORDS
+    }
+
+    pub fn fifo_is_empty(&self) -> bool {
+        self.fifo.is_empty()
+    }
+
+    pub fn draw_remaining(&self) -> u32 {
+        self.draw_busy
+    }
+
+    pub fn assembling(&self) -> bool {
+        self.gp0_cmd.is_some() || self.transfer.is_some()
+    }
+
+    pub fn busy(&self) -> bool {
+        self.draw_busy > 0 || self.gp0_cmd.is_some() || self.transfer.is_some()
+    }
+
     fn update_stat(&mut self) {
         let mut s = 0x1C00_0000; // ready bits 26,27,28
+        let need_params = self.gp0_cmd.is_some();
+        let drawing = self.draw_busy > 0;
         if let Some(t) = self.transfer.as_ref() {
-            // Bit26: not ready for a new command (GPU wants image data).
-            // Bit28: write FIFO empty — stay set so DMA/CPU can feed GP0(A0h).
             s &= !(1 << 26);
             if !t.to_vram {
                 s &= !(1 << 28);
                 s |= 1 << 27;
             }
+        } else if need_params || drawing {
+            s &= !(1 << 26);
+        }
+        // SPX: bit 28 is the write FIFO empty / DMA-block ready flag.
+        // Polygon and line commands clear it from the command word (block28),
+        // not only after the last vertex.
+        if drawing || self.block28 || !self.fifo.is_empty() || need_params {
+            s &= !(1 << 28);
+        }
+        if !drawing && self.fifo.is_empty() && !need_params && self.transfer.is_none() {
+            self.block28 = false;
+            s |= 1 << 28;
         }
         s |= u32::from(self.tex_x) & 0xF;
         s |= (u32::from(self.tex_y) & 1) << 4;
@@ -220,6 +265,35 @@ impl Gpu {
         if self.gp0_words.len() < 96 {
             self.gp0_words.push(word);
         }
+        let cmd = (word >> 24) as u8;
+        // SPX: GP0(E3h..E5h) do not take FIFO space; they run immediately.
+        if (0xE3..=0xE5).contains(&cmd) {
+            let prev_cmd = self.gp0_cmd.take();
+            let prev_buf = std::mem::take(&mut self.gp0_buf);
+            self.gp0_cmd = Some(cmd);
+            self.gp0_buf.push(word);
+            self.exec_gp0();
+            self.gp0_cmd = prev_cmd;
+            self.gp0_buf = prev_buf;
+            self.update_stat();
+            return;
+        }
+        // GP0(00h) / 04h–1Eh are NOPs only as command words, not as parameters.
+        if self.gp0_cmd.is_none()
+            && self.transfer.is_none()
+            && self.fifo.is_empty()
+            && (cmd == 0 || (0x04..=0x1E).contains(&cmd))
+        {
+            return;
+        }
+        while self.fifo.len() >= FIFO_WORDS {
+            self.tick(1, 0, false);
+        }
+        self.fifo.push_back(word);
+        self.update_stat();
+    }
+
+    fn accept_word(&mut self, word: u32) {
         if self.transfer.as_ref().is_some_and(|t| t.to_vram) {
             let (mut x, mut y, w, base_x) = {
                 let t = self.transfer.as_ref().unwrap();
@@ -257,13 +331,31 @@ impl Gpu {
                 return;
             }
             self.gp0_cmd = Some(cmd);
+            if (0x20..=0x5F).contains(&cmd) {
+                self.block28 = true;
+            }
             self.gp0_buf.clear();
             self.gp0_buf.push(word);
         } else {
             self.gp0_buf.push(word);
         }
         if self.gp0_ready() {
+            let cmd = self.gp0_cmd.unwrap();
+            // Fill VRAM is a 16-pixel burst, not fragment raster. Raster
+            // primitives take one cycle per written pixel (two if textured).
+            let raster = matches!(cmd, 0x20..=0x7F | 0x80);
+            self.plotting = raster;
+            self.plot_cost = if raster && cmd & 4 != 0 && (0x20..=0x7F).contains(&cmd) {
+                2
+            } else {
+                1
+            };
             self.exec_gp0();
+            self.plotting = false;
+            if raster || cmd == 0x02 {
+                self.draw_busy = self.draw_busy.max(1);
+                self.block28 = true;
+            }
             self.gp0_cmd = None;
             self.gp0_buf.clear();
         }
@@ -378,6 +470,9 @@ impl Gpu {
             0x01 => {
                 self.gp0_buf.clear();
                 self.gp0_cmd = None;
+                self.fifo.clear();
+                self.draw_busy = 0;
+                self.block28 = false;
             }
             0x03 => {
                 self.display_enabled = p & 1 == 0;
@@ -440,6 +535,9 @@ impl Gpu {
                 self.write_half(xx as u32, yy as u32, pix);
             }
         }
+        // SPX: Fill is done in 16-pixel units, not one fragment per cycle.
+        let units = ((w as u32) / 16).max(1).saturating_mul((h as u32).max(1));
+        self.draw_busy = self.draw_busy.saturating_add(units);
     }
 
     fn polygon(&mut self) {
@@ -813,6 +911,9 @@ impl Gpu {
         if self.mask_check && self.vram[y * VRAM_W + x] & 0x8000 != 0 {
             return;
         }
+        if self.plotting {
+            self.draw_busy = self.draw_busy.saturating_add(self.plot_cost);
+        }
         self.vram[y * VRAM_W + x] = v;
     }
 
@@ -903,7 +1004,25 @@ impl Gpu {
         self.gp0(word);
     }
 
-    pub fn tick(&mut self, line: u32, vblank: bool) {
+    pub fn tick(&mut self, cycles: u32, line: u32, vblank: bool) {
+        let mut left = cycles;
+        while left > 0 {
+            if self.draw_busy > 0 {
+                let n = self.draw_busy.min(left);
+                self.draw_busy -= n;
+                left -= n;
+                if self.draw_busy == 0 {
+                    self.block28 = false;
+                }
+                continue;
+            }
+            if let Some(w) = self.fifo.pop_front() {
+                self.accept_word(w);
+                left -= 1;
+                continue;
+            }
+            break;
+        }
         if !vblank && self.display_enabled && line != self.crt_line {
             let w = self.display_hres.max(1).min(640);
             let h = self.display_vres.max(1).min(480);
@@ -1003,9 +1122,7 @@ fn rgb888_to_555_dither(r: u32, g: u32, b: u32, x: i32, y: i32, dither: bool) ->
     } else {
         0
     };
-    let ch = |v: u32| -> u16 {
-        ((v as i32 + d).clamp(0, 255) as u32 >> 3) as u16
-    };
+    let ch = |v: u32| -> u16 { ((v as i32 + d).clamp(0, 255) as u32 >> 3) as u16 };
     ch(r) | (ch(g) << 5) | (ch(b) << 10)
 }
 
@@ -1057,6 +1174,10 @@ fn blend_texel_dither(tex: u16, r: u32, g: u32, b: u32, x: i32, y: i32, dither: 
 mod tests {
     use super::*;
 
+    fn settle(gpu: &mut Gpu) {
+        gpu.tick(4_000_000, 0, false);
+    }
+
     fn upload_clut(gpu: &mut Gpu, x: u32, y: u32, colors: [u16; 16]) {
         gpu.gp0(0xA0 << 24);
         gpu.gp0(x | (y << 16));
@@ -1064,6 +1185,144 @@ mod tests {
         for pair in colors.chunks(2) {
             gpu.gp0(u32::from(pair[0]) | (u32::from(pair[1]) << 16));
         }
+        settle(gpu);
+    }
+
+    fn peek(gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32) -> DisplayArea {
+        settle(gpu);
+        gpu.vram_rect(x, y, w, h)
+    }
+
+    #[test]
+    fn fill_stays_busy_one_cycle_per_pixel() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 1023 | (511 << 10));
+        gpu.gp0(0x02 << 24);
+        gpu.gp0(0);
+        gpu.gp0(16 | (16 << 16));
+        gpu.tick(3, 0, false);
+        assert!(gpu.busy(), "16×16 fill must not finish in the issue cycles");
+        let stat = gpu.stat();
+        assert_eq!(stat & (1 << 26), 0, "GPUSTAT.26 clear while drawing");
+        gpu.tick(16, 0, false);
+        assert!(
+            !gpu.busy(),
+            "Fill VRAM is one cycle per 16-pixel unit (16×16 = 16 cycles)"
+        );
+    }
+
+    #[test]
+    fn fifo_holds_sixteen_words() {
+        let mut gpu = Gpu::new();
+        for i in 0..16 {
+            assert!(!gpu.fifo_full(), "fifo filled early at {i}");
+            gpu.gp0(0xE1 << 24);
+        }
+        assert!(gpu.fifo_full());
+        assert_eq!(
+            gpu.stat() & (1 << 28),
+            0,
+            "GPUSTAT.28 clear while FIFO is not empty"
+        );
+    }
+
+    #[test]
+    fn draw_offset_does_not_take_fifo_space() {
+        let mut gpu = Gpu::new();
+        for _ in 0..16 {
+            gpu.gp0(0xE1 << 24);
+        }
+        assert!(gpu.fifo_full());
+        gpu.gp0(0xE5 << 24);
+        assert!(
+            gpu.fifo_full(),
+            "E3–E5 must not evict or occupy a FIFO slot"
+        );
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4 << 24 | 1023 | (511 << 10));
+        assert!(gpu.fifo_full());
+        assert_eq!(gpu.draw_env().2, 0);
+        assert_eq!(gpu.draw_env().4, 1023);
+    }
+
+    #[test]
+    fn seventeenth_gp0_word_waits_instead_of_dropping() {
+        let mut gpu = Gpu::new();
+        for _ in 0..16 {
+            gpu.gp0(0xE1 << 24);
+        }
+        assert!(gpu.fifo_full());
+        gpu.gp0(0xE1 << 24 | 0xF);
+        gpu.tick(32, 0, false);
+        assert!(!gpu.busy());
+        assert_eq!(gpu.stat() & 0xF, 0xF, "last E1 must still run");
+    }
+
+    #[test]
+    fn untextured_rect_stays_busy_one_cycle_per_pixel() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 1023 | (511 << 10));
+        gpu.gp0(0x60 << 24 | 0x00F800);
+        gpu.gp0(0);
+        gpu.gp0(8 | (8 << 16));
+        gpu.tick(3, 0, false);
+        assert!(gpu.busy(), "8×8 rect must not finish in the issue cycles");
+        gpu.tick(8 * 8, 0, false);
+        assert!(!gpu.busy(), "untextured rect is one cycle per pixel");
+    }
+
+    #[test]
+    fn textured_rect_stays_busy_two_cycles_per_pixel() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 1023 | (511 << 10));
+        let mut clut = [0u16; 16];
+        clut[1] = 0x7FFF;
+        upload_clut(&mut gpu, 0, 0, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(64);
+        gpu.gp0(2 | (8 << 16));
+        for _ in 0..8 {
+            gpu.gp0(0x1111_1111);
+        }
+        settle(&mut gpu);
+        gpu.gp0(0xE1 << 24 | 1); // 4-bit page at x=64
+        gpu.tick(1, 0, false);
+        gpu.gp0(0x64 << 24 | 0x808080);
+        gpu.gp0(0);
+        gpu.gp0(0); // uv 0,0 clut 0
+        gpu.gp0(8 | (8 << 16));
+        gpu.tick(4, 0, false);
+        assert!(
+            gpu.busy(),
+            "textured 8×8 must not finish in the issue cycles"
+        );
+        gpu.tick(8 * 8, 0, false);
+        assert!(
+            gpu.busy(),
+            "textured commands cost two cycles per written pixel"
+        );
+        gpu.tick(8 * 8 + 8, 0, false);
+        assert!(!gpu.busy());
+    }
+
+    #[test]
+    fn polygon_command_word_clears_gpustat_bit28() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.tick(1, 0, false);
+        assert_eq!(
+            gpu.stat() & (1 << 28),
+            0,
+            "SPX: bit 28 clears on the polygon command word, before vertices"
+        );
+        assert_eq!(
+            gpu.stat() & (1 << 26),
+            0,
+            "GPUSTAT.26 clear while assembling"
+        );
     }
 
     #[test]
@@ -1094,7 +1353,7 @@ mod tests {
         gpu.gp0(18 | (18 << 16));
         gpu.gp0(0x0008_08);
 
-        let pix = gpu.vram_rect(10, 10, 8, 8);
+        let pix = peek(&mut gpu, 10, 10, 8, 8);
         let lit = pix.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
         assert!(
             lit > 8,
@@ -1133,7 +1392,7 @@ mod tests {
         gpu.gp0(47 << 8);
         gpu.gp0(440 | (104 << 16));
         gpu.gp0(239 | (47 << 8));
-        let pix = gpu.vram_rect(200, 56, 240, 48);
+        let pix = peek(&mut gpu, 200, 56, 240, 48);
         let lit = pix.pixels.iter().filter(|p| **p & 0x7FFF == 0x7FFF).count();
         assert!(
             lit > 5_000,
@@ -1179,7 +1438,7 @@ mod tests {
         gpu.gp0(xy_unused_junk(10, 10));
         gpu.gp0(xy_unused_junk(20, 10));
         gpu.gp0(xy_unused_junk(10, 20));
-        let pix = gpu.vram_rect(10, 10, 10, 10);
+        let pix = peek(&mut gpu, 10, 10, 10, 10);
         let lit = red_count(&pix.pixels);
         assert!(
             lit > 8,
@@ -1198,7 +1457,7 @@ mod tests {
         gpu.gp0(xy(-600, 10));
         gpu.gp0(xy(-580, 10));
         gpu.gp0(xy(-600, 30));
-        let pix = gpu.vram_rect(930, 10, 20, 20);
+        let pix = peek(&mut gpu, 930, 10, 20, 20);
         let lit = red_count(&pix.pixels);
         assert!(
             lit > 8,
@@ -1221,7 +1480,7 @@ mod tests {
         gpu.gp0(xy(20, 10));
         gpu.gp0(xy(20, 30));
         gpu.gp0(xy(40, 10));
-        let pix = gpu.vram_rect(20, 10, 20, 20);
+        let pix = peek(&mut gpu, 20, 10, 20, 20);
         let blue = blue_count(&pix.pixels);
         assert!(
             blue > 8,
@@ -1239,8 +1498,8 @@ mod tests {
         gpu.gp0(xy(20, 10));
         gpu.gp0(xy(10, 20));
         gpu.gp0(xy(50, 50));
-        let first = gpu.vram_rect(11, 11, 4, 4);
-        let second = gpu.vram_rect(42, 42, 8, 8);
+        let first = peek(&mut gpu, 11, 11, 4, 4);
+        let second = peek(&mut gpu, 42, 42, 8, 8);
         let lit_first = red_count(&first.pixels);
         let lit_second = red_count(&second.pixels);
         assert!(
@@ -1265,7 +1524,7 @@ mod tests {
         gpu.gp0(xy(40, -300));
         gpu.gp0(xy(20, 300));
         assert_eq!(
-            red_count(&gpu.vram_rect(0, 0, 64, 64).pixels),
+            red_count(&peek(&mut gpu, 0, 0, 64, 64).pixels),
             0,
             "triangle taller than 511 must not plot"
         );
@@ -1273,7 +1532,7 @@ mod tests {
         gpu.gp0(xy(80, -100));
         gpu.gp0(xy(100, -100));
         gpu.gp0(xy(80, 400));
-        let lit = red_count(&gpu.vram_rect(80, 0, 24, 64).pixels);
+        let lit = red_count(&peek(&mut gpu, 80, 0, 24, 64).pixels);
         assert!(
             lit > 8,
             "triangle within 511 vertical must still plot (lit={lit})"
@@ -1291,7 +1550,7 @@ mod tests {
         gpu.gp0(xy(40, 0));
         gpu.gp0(0xF80000); // v2 blue
         gpu.gp0(xy(0, 40));
-        let pix = gpu.vram_rect(2, 20, 8, 8);
+        let pix = peek(&mut gpu, 2, 20, 8, 8);
         let mixed = pix.pixels.iter().any(|p| {
             let r = p & 0x1F;
             let b = (p >> 10) & 0x1F;
@@ -1329,7 +1588,7 @@ mod tests {
         gpu.gp0(0x00404040);
         gpu.gp0(xy(10, 26));
         gpu.gp0(0x0008_00);
-        let pix = gpu.vram_rect(12, 12, 8, 8);
+        let pix = peek(&mut gpu, 12, 12, 8, 8);
         let half = pix
             .pixels
             .iter()
@@ -1371,7 +1630,7 @@ mod tests {
         gpu.gp0(0x00404041);
         gpu.gp0(xy(10, 26));
         gpu.gp0(0x0008_00);
-        let pix = gpu.vram_rect(12, 12, 8, 8);
+        let pix = peek(&mut gpu, 12, 12, 8, 8);
         let half = pix
             .pixels
             .iter()
@@ -1397,9 +1656,9 @@ mod tests {
         gpu.gp0(xy(10, 10));
         gpu.gp0(xy(14, 10));
         gpu.gp0(xy(10, 14));
-        let right = red_count(&gpu.vram_rect(14, 10, 1, 4).pixels);
-        let bottom = red_count(&gpu.vram_rect(10, 14, 4, 1).pixels);
-        let interior = red_count(&gpu.vram_rect(10, 10, 3, 3).pixels);
+        let right = red_count(&peek(&mut gpu, 14, 10, 1, 4).pixels);
+        let bottom = red_count(&peek(&mut gpu, 10, 14, 4, 1).pixels);
+        let interior = red_count(&peek(&mut gpu, 10, 10, 3, 3).pixels);
         assert_eq!(right, 0, "x=max vertex must not plot");
         assert_eq!(bottom, 0, "y=max vertex must not plot");
         assert!(interior > 0, "interior of the triangle must still plot");
@@ -1419,7 +1678,7 @@ mod tests {
         gpu.gp0(xy(2, 2));
         gpu.gp0(xy(20, 2));
         gpu.gp0(xy(2, 20));
-        let p = gpu.vram_rect(4, 4, 1, 1).pixels[0] & 0x7FFF;
+        let p = peek(&mut gpu, 4, 4, 1, 1).pixels[0] & 0x7FFF;
         let r = p & 0x1F;
         let b = (p >> 10) & 0x1F;
         assert!(
@@ -1454,8 +1713,11 @@ mod tests {
         gpu.gp0((1 << 16) | 0x0008);
         gpu.gp0(xy(2, 18));
         gpu.gp0(0x0008_00);
-        let p = gpu.vram_rect(4, 4, 1, 1).pixels[0] & 0x7FFF;
-        assert_eq!(p, 0x001F, "STP=0 texel must stay opaque red, not mix ({p:#06X})");
+        let p = peek(&mut gpu, 4, 4, 1, 1).pixels[0] & 0x7FFF;
+        assert_eq!(
+            p, 0x001F,
+            "STP=0 texel must stay opaque red, not mix ({p:#06X})"
+        );
     }
 
     #[test]
@@ -1481,8 +1743,8 @@ mod tests {
         with.gp0(xy(8, 0));
         with.gp0(0xF80000);
         with.gp0(xy(0, 8));
-        let a = without.vram_rect(1, 3, 4, 4).pixels;
-        let b = with.vram_rect(1, 3, 4, 4).pixels;
+        let a = peek(&mut without, 1, 3, 4, 4).pixels;
+        let b = peek(&mut with, 1, 3, 4, 4).pixels;
         assert_ne!(a, b, "dither bit must change Gouraud pixels");
     }
 
@@ -1506,7 +1768,7 @@ mod tests {
         gpu.gp0(xy(8, 8));
         gpu.gp0((480u32 << 6) << 16); // uv 0,0 clut y=480
         gpu.gp0(8 | (8 << 16));
-        let p = gpu.vram_rect(8, 8, 1, 1).pixels[0] & 0x7FFF;
+        let p = peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF;
         assert_eq!(
             p, 0x001F,
             "E2 offset without mask must not remap UV 0 (got {p:#06X})"

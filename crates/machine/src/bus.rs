@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
@@ -35,6 +37,7 @@ pub struct Bus {
     pub io_spu: u64,
     pub io_irq: u64,
     pub io_gpu: u64,
+    write_q: VecDeque<(u32, u32)>,
 }
 
 impl Bus {
@@ -73,6 +76,7 @@ impl Bus {
             io_spu: 0,
             io_irq: 0,
             io_gpu: 0,
+            write_q: VecDeque::with_capacity(4),
         }
     }
 
@@ -90,6 +94,7 @@ impl Bus {
         self.scanline = 0;
         self.vblanks = 0;
         self.in_vblank = false;
+        self.write_q.clear();
     }
 
     pub fn gpu(&self) -> &Gpu {
@@ -173,19 +178,107 @@ impl Bus {
                     .unwrap_or([0; 4]),
             );
         }
-        let a = (p as usize) & (RAM_SIZE - 1) & !3;
-        u32::from_le_bytes(self.ram[a..a + 4].try_into().unwrap())
+        self.ram_word_including_queue(p)
     }
 
-    pub fn tick(&mut self, cycles: u32) {
-        self.cycles += u64::from(cycles);
-        self.timers.tick(cycles, &mut self.irq);
-        self.cdrom.tick(cycles, &mut self.irq);
-        self.spu.tick(cycles);
+    fn ram_word_including_queue(&self, p: u32) -> u32 {
+        let a = (p as usize) & (RAM_SIZE - 1) & !3;
+        let mut v = u32::from_le_bytes(self.ram[a..a + 4].try_into().unwrap());
+        let aligned = (p & !3) & (RAM_SIZE as u32 - 1);
+        for &(addr, val) in &self.write_q {
+            if addr & (RAM_SIZE as u32 - 1) == aligned {
+                v = val;
+            }
+        }
+        v
+    }
+
+    pub fn ram_blocked(&self) -> bool {
+        self.dma.occupies_ram(&self.gpu)
+    }
+
+    pub fn write_pending(&self) -> bool {
+        !self.write_q.is_empty()
+    }
+
+    pub fn write_queue_full(&self) -> bool {
+        self.write_q.len() >= 4
+    }
+
+    pub fn write_queue_len(&self) -> usize {
+        self.write_q.len()
+    }
+
+    pub fn gpu_fifo_full(&self) -> bool {
+        self.gpu.fifo_full()
+    }
+
+    pub fn flush_write_queue(&mut self) -> u32 {
+        let n = self.write_q.len() as u32;
+        self.drain_writes(n);
+        n
+    }
+
+    fn drain_writes(&mut self, n: u32) {
+        for _ in 0..n {
+            if let Some((addr, value)) = self.write_q.pop_front() {
+                self.commit_write32(addr, value);
+            }
+        }
+    }
+
+    pub fn tick(&mut self, mut cycles: u32) {
+        while cycles > 0 {
+            let to_line = (CYCLES_PER_LINE - (self.cycles % CYCLES_PER_LINE)) as u32;
+            let n = self.step_size(cycles.min(to_line.max(1)));
+            self.advance(n);
+            cycles -= n;
+        }
+    }
+
+    fn step_size(&self, max: u32) -> u32 {
+        if max == 0 {
+            return 1;
+        }
+        let dma = self.dma.active();
+        let gpu_wait = self.dma.waiting_on_gpu(&self.gpu);
+        let draw = self.gpu.draw_remaining();
+        let fifo_work = !self.gpu.fifo_is_empty() || self.gpu.assembling();
+        if dma && !gpu_wait {
+            if self.dma.gpu_from_ram() {
+                return 1;
+            }
+            return max.min(self.dma.burst_cycles());
+        }
+        if gpu_wait && draw > 0 {
+            return max.min(draw);
+        }
+        if gpu_wait {
+            return 1;
+        }
+        if !self.write_q.is_empty() {
+            return max.min(self.write_q.len() as u32).max(1);
+        }
+        if draw > 0 && !fifo_work {
+            return max.min(draw);
+        }
+        if fifo_work {
+            return 1;
+        }
+        max
+    }
+
+    fn advance(&mut self, n: u32) {
+        self.cycles += u64::from(n);
+        if !self.dma.occupies_ram(&self.gpu) {
+            self.drain_writes(n.min(self.write_q.len() as u32));
+        }
+        self.timers.tick(n, &mut self.irq);
+        self.cdrom.tick(n, &mut self.irq);
+        self.spu.tick(n);
         if self.spu.take_irq() {
             self.irq.raise(crate::irq::IRQ_SPU);
         }
-        self.dma.tick(cycles, &mut self.irq);
         let line = ((self.cycles / CYCLES_PER_LINE) as u32) % LINES_PER_FRAME;
         if line != self.scanline {
             self.scanline = line;
@@ -197,7 +290,15 @@ impl Bus {
             }
             self.in_vblank = vblank;
         }
-        self.gpu.tick(self.scanline, self.in_vblank);
+        self.gpu.tick(n, self.scanline, self.in_vblank);
+        self.dma.tick(
+            n,
+            &mut self.ram,
+            &mut self.gpu,
+            &mut self.spu,
+            &mut self.cdrom,
+            &mut self.irq,
+        );
     }
 
     pub fn read8(&mut self, addr: u32) -> Option<u8> {
@@ -274,7 +375,12 @@ impl Bus {
         let p = phys(addr);
         match p {
             0x0000_0000..=0x007F_FFFF => {
-                self.ram[(p as usize) & (RAM_SIZE - 1)] = value;
+                let shift = (p & 3) * 8;
+                let cur = self.ram_word_including_queue(p);
+                self.write32(
+                    addr & !3,
+                    (cur & !(0xFF << shift)) | (u32::from(value) << shift),
+                );
             }
             0x1F80_0000..=0x1F80_03FF => {
                 self.scratch[(p - 0x1F80_0000) as usize] = value;
@@ -301,6 +407,14 @@ impl Bus {
         let p = phys(addr);
         self.note_io(p);
         match p {
+            0x0000_0000..=0x007F_FFFF => {
+                let shift = (p & 2) * 8;
+                let cur = self.ram_word_including_queue(p);
+                self.write32(
+                    addr & !3,
+                    (cur & !(0xFFFF << shift)) | (u32::from(value) << shift),
+                );
+            }
             0x1F80_1C00..=0x1F80_1FFF => self.spu.write16(p, value),
             0x1F80_1040..=0x1F80_104F => self.joy.write16(p, value),
             0x1F80_1070..=0x1F80_1076 => self.irq.write16(p, value),
@@ -319,6 +433,24 @@ impl Bus {
 
     pub fn write32(&mut self, addr: u32, value: u32) {
         let p = phys(addr) & !3;
+        if (0x1F80_0000..=0x1F80_03FF).contains(&p) {
+            self.commit_write32(p, value);
+            return;
+        }
+        if (0x0000_0000..=0x007F_FFFF).contains(&p) {
+            if self.write_q.len() >= 4 {
+                self.drain_writes(1);
+            }
+            self.write_q.push_back((p, value));
+            return;
+        }
+        if (0x1F80_1080..=0x1F80_10FC).contains(&p) {
+            self.flush_write_queue();
+        }
+        self.commit_write32(p, value);
+    }
+
+    fn commit_write32(&mut self, p: u32, value: u32) {
         self.note_io(p);
         match p {
             0x0000_0000..=0x007F_FFFF => {
@@ -431,5 +563,65 @@ fn phys(addr: u32) -> u32 {
         4 => addr & 0x1FFF_FFFF, // KSEG0
         5 => addr & 0x1FFF_FFFF, // KSEG1
         _ => addr,               // KSEG2 / cache control
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bios::BIOS_LEN;
+
+    fn bus() -> Bus {
+        Bus::new(vec![0; BIOS_LEN])
+    }
+
+    #[test]
+    fn ram_stores_sit_in_a_four_entry_write_queue() {
+        let mut b = bus();
+        for i in 0..4 {
+            b.write32(i * 4, i + 1);
+        }
+        assert!(b.write_queue_full());
+        assert_eq!(b.write_queue_len(), 4);
+        b.tick(1);
+        assert_eq!(b.write_queue_len(), 3);
+        b.tick(3);
+        assert_eq!(b.write_queue_len(), 0);
+        assert_eq!(b.ram_word(0), 1);
+        assert_eq!(b.ram_word(12), 4);
+    }
+
+    #[test]
+    fn io_writes_do_not_take_write_queue_slots() {
+        let mut b = bus();
+        b.write32(0x1F80_1814, 0x0400_0002); // GP1 DMA direction = CPU to GP0
+        assert_eq!(b.write_queue_len(), 0);
+        assert_eq!((b.gpu().stat() >> 29) & 3, 2);
+    }
+
+    #[test]
+    fn scratchpad_writes_are_immediate() {
+        let mut b = bus();
+        b.write32(0x1F80_0000, 0xAABBCCDD);
+        assert_eq!(b.write_queue_len(), 0);
+        assert_eq!(b.read32(0x1F80_0000).unwrap(), 0xAABBCCDD);
+    }
+
+    #[test]
+    fn dma_start_flushes_the_write_queue() {
+        let mut b = bus();
+        b.write32(0x80, 0x1111_1111);
+        assert_eq!(b.write_queue_len(), 1);
+        b.write32(0x1F80_10F0, 0xFFFF_FFFF);
+        b.write32(0x1F80_10E0, 0x80);
+        b.write32(0x1F80_10E4, 1);
+        b.write32(0x1F80_10E8, 0x1100_0002);
+        assert_eq!(b.write_queue_len(), 0, "OTC must see the posted RAM store");
+        b.tick(8);
+        assert_eq!(
+            b.ram_word(0x80),
+            0x00FF_FFFF,
+            "OTC overwrote the posted word"
+        );
     }
 }
