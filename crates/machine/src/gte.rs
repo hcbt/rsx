@@ -196,14 +196,17 @@ impl Gte {
             self.data[25 + i] = shifted as u32;
             self.set_ir(i, shifted, lm);
         }
-        let sz = (mac[2] >> ((1 - sf) * 12)).clamp(0, 0xFFFF) as u32;
+        // SPX: MAC3 is already SAR(sf*12); SZ3 = MAC3 SAR ((1-sf)*12).
+        // Together that is always the 12-bit-shifted Z, not the unshifted product.
+        let sz_raw = mac[2] >> 12;
+        if !(0..=0xFFFF).contains(&sz_raw) {
+            self.flag(18);
+        }
+        let sz = sz_raw.clamp(0, 0xFFFF) as u32;
         self.data[16] = self.data[17];
         self.data[17] = self.data[18];
         self.data[18] = self.data[19];
         self.data[19] = sz;
-        if mac[2] >> ((1 - sf) * 12) > 0xFFFF {
-            self.flag(18);
-        }
         let n = unr_divide(self.ctrl[26] as u16, sz as u16, &mut self.ctrl[31]);
         let ofx = self.ctrl[24] as i32 as i64;
         let ofy = self.ctrl[25] as i32 as i64;
@@ -549,6 +552,45 @@ fn saturate_sy(v: i64, flag: &mut u32) -> i32 {
         0x3FF
     } else {
         v as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity_rtps(sf: bool) -> Gte {
+        let mut g = Gte::new();
+        // RT = identity in 3.12 (0x1000 = 1.0).
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(7, 5888); // TRZ
+        g.write_control(24, 320 << 16); // OFX
+        g.write_control(25, 240 << 16); // OFY
+        g.write_control(26, 0x200); // H
+        g.write_data(0, 0);
+        g.write_data(1, 0);
+        let cmd = 0x01 | if sf { 1 << 19 } else { 0 };
+        g.command(cmd);
+        g
+    }
+
+    #[test]
+    fn rtps_sz3_is_mac3_after_the_12bit_shift() {
+        // SPX: IR3 = MAC3 = (TRZ*1000h + …) SAR (sf*12);
+        //      SZ3 = MAC3 SAR ((1-sf)*12). With V=0 that is TRZ, not TRZ<<12.
+        let g = identity_rtps(true);
+        let sz3 = g.read_data(19) & 0xFFFF;
+        assert_eq!(
+            sz3,
+            5888,
+            "RTPS sf=1 SZ3 must be TRZ (got {sz3:#X}, FLAG={:08X})",
+            g.read_control(31)
+        );
+        let g0 = identity_rtps(false);
+        let sz0 = g0.read_data(19) & 0xFFFF;
+        assert_eq!(sz0, 5888, "RTPS sf=0 SZ3 must also be TRZ (got {sz0:#X})");
     }
 }
 

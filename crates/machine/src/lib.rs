@@ -624,4 +624,47 @@ mod tests {
             m.pc()
         );
     }
+
+    #[test]
+    fn licensed_logo_draws_the_mark_when_present() {
+        let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../roms/Crash Bandicoot (USA)/Crash Bandicoot (USA).cue");
+        if !bios.exists() || !disc.exists() {
+            eprintln!("skipping: no local BIOS or Disc");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&bios).unwrap();
+        m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(550);
+        let area = m.display_area();
+        assert_eq!((area.width, area.height), (640, 480));
+        let w = area.width as usize;
+        let mut lit = 0usize;
+        let mut color = 0usize;
+        for y in 80..260 {
+            for x in 120..520 {
+                let p = area.pixels[y * w + x] & 0x7FFF;
+                if p == 0 {
+                    continue;
+                }
+                lit += 1;
+                let r = p & 0x1F;
+                let g = (p >> 5) & 0x1F;
+                let b = (p >> 10) & 0x1F;
+                if r != g || g != b {
+                    color += 1;
+                }
+            }
+        }
+        assert!(
+            lit > 8_000,
+            "3D P/S mark must occupy the area above PlayStation (lit={lit} color={color} pc={:08X})",
+            m.pc()
+        );
+        assert!(
+            color > 2_000,
+            "P/S mark is red and striped, not grey (lit={lit} color={color})"
+        );
+    }
 }
