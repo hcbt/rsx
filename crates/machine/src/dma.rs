@@ -2,12 +2,17 @@ use crate::gpu::Gpu;
 use crate::irq::{self, Irq};
 use crate::spu::Spu;
 
+/// Cycles after a transfer before DICR/IRQ3 assert. The BIOS often arms the
+/// wait *after* writing CHCR; raising in that same write misses it.
+const IRQ_DELAY: u32 = 256;
+
 pub struct Dma {
     madr: [u32; 7],
     bcr: [u32; 7],
     chcr: [u32; 7],
     dpcr: u32,
     dicr: u32,
+    irq_delay: u32,
 }
 
 impl Dma {
@@ -18,11 +23,24 @@ impl Dma {
             chcr: [0; 7],
             dpcr: 0x0765_4321,
             dicr: 0,
+            irq_delay: 0,
         }
     }
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    pub fn tick(&mut self, cycles: u32, irq: &mut Irq) {
+        if self.irq_delay == 0 {
+            return;
+        }
+        if cycles >= self.irq_delay {
+            self.irq_delay = 0;
+            self.update_master(irq);
+        } else {
+            self.irq_delay -= cycles;
+        }
     }
 
     pub fn read32(&self, addr: u32) -> u32 {
@@ -70,7 +88,15 @@ impl Dma {
         } else if addr == 0x1F80_10F0 {
             self.dpcr = value;
         } else if addr == 0x1F80_10F4 {
-            let ack = (value & 0x7F00_0000) >> 24;
+            // Bits 24-30 are W1C. The BIOS IRQ handler does
+            //   (DICR & 00FFFFFFh) | 88000000h
+            // which sets bit 31 (read-only master flag) rather than the
+            // channel flag it just handled; treat a write with bit 31 set
+            // as acknowledging every pending channel.
+            let mut ack = (value & 0x7F00_0000) >> 24;
+            if value & (1 << 31) != 0 {
+                ack = 0x7F;
+            }
             let flags = (self.dicr & 0x7F00_0000) >> 24;
             let flags = flags & !ack;
             self.dicr = (value & 0x00FF_FFFF) | (flags << 24);
@@ -90,7 +116,8 @@ impl Dma {
             _ => {}
         }
         self.chcr[ch] &= !(1 << 24);
-        self.complete(ch, irq);
+        self.complete(ch);
+        self.update_master(irq);
     }
 
     fn gpu(&mut self, ram: &mut [u8], gpu: &mut Gpu) {
@@ -160,21 +187,27 @@ impl Dma {
         }
     }
 
-    fn complete(&mut self, ch: usize, irq: &mut Irq) {
+    fn complete(&mut self, ch: usize) {
         if self.dicr & (1 << 23) != 0 && self.dicr & (1 << (16 + ch)) != 0 {
             self.dicr |= 1 << (24 + ch);
-            self.update_master(irq);
+            self.irq_delay = self.irq_delay.max(IRQ_DELAY);
         }
     }
 
     fn update_master(&mut self, irq: &mut Irq) {
-        let master = (self.dicr & (1 << 15) != 0)
+        let flagged = (self.dicr & (1 << 15) != 0)
             || (self.dicr & (1 << 23) != 0 && (self.dicr & 0x7F00_0000) != 0);
-        if master {
+        let was_master = self.dicr & (1 << 31) != 0;
+        if flagged && self.irq_delay == 0 {
             self.dicr |= 1 << 31;
-            irq.raise(irq::IRQ_DMA);
-        } else {
+            // I_STAT.3 is edge-triggered on DICR.31 0→1. A DICR RMW that
+            // leaves flags set must not re-assert after the BIOS acked I_STAT.
+            if !was_master {
+                irq.raise(irq::IRQ_DMA);
+            }
+        } else if !flagged {
             self.dicr &= !(1 << 31);
+            self.irq_delay = 0;
         }
     }
 }

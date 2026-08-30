@@ -290,6 +290,47 @@ mod tests {
     }
 
     #[test]
+    fn dma_irq_does_not_fire_on_the_start_write() {
+        let bios = bios_with_program(&[
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_10F0, // ori t0, t0, 0x10F0  DPCR
+            0x8D09_0000, // lw t1, 0(t0)
+            0x0000_0000, // nop
+            0x3C0A_0800, // lui t2, 0x0800      ch6 enable
+            0x012A_4825, // or t1, t1, t2
+            0xAD09_0000, // sw t1, 0(t0)
+            0x3C09_00C0, // lui t1, 0x00C0      DICR master + ch6 IRQ
+            0xAD09_0004, // sw t1, 4(t0)
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_10E0, // ori t0, t0, 0x10E0  DMA6
+            0x2409_0080, // addiu t1, zero, 0x80
+            0xAD09_0000, // sw t1, 0(t0)        MADR
+            0x2409_0004, // addiu t1, zero, 4
+            0xAD09_0004, // sw t1, 4(t0)        BCR
+            0x3C09_1100, // lui t1, 0x1100
+            0x3529_0002, // ori t1, t1, 2
+            0xAD09_0008, // sw t1, 8(t0)        CHCR start
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..24 {
+            m.step();
+        }
+        assert_eq!(
+            m.irq_stat() & (1 << 3),
+            0,
+            "IRQ3 must not assert in the CHCR write"
+        );
+        for _ in 0..200 {
+            m.step();
+        }
+        assert_eq!(
+            m.irq_stat() & (1 << 3),
+            1 << 3,
+            "IRQ3 after DMA completion delay"
+        );
+    }
+
+    #[test]
     fn ori_combines_with_lui() {
         let bios = bios_with_program(&[
             0x3C08_0013, // lui $t0, 0x0013
@@ -346,12 +387,26 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        m.run_until_vblank_count(450);
+        m.run_until_vblank_count(600);
         assert_ne!(
             m.pc() & 0xFFFF,
             0x45D0,
             "BIOS stuck waiting for JOY RX (pc={:08X})",
             m.pc()
+        );
+        assert_eq!(
+            m.irq_stat() & (1 << 3),
+            0,
+            "DMA IRQ stuck pending (pc={:08X} irq={:04X} gp0={})",
+            m.pc(),
+            m.irq_stat(),
+            m.gp0_count(),
+        );
+        assert!(
+            m.gp0_count() > 17_000,
+            "BIOS stopped issuing GPU commands (pc={:08X} gp0={})",
+            m.pc(),
+            m.gp0_count(),
         );
     }
 }
