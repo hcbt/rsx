@@ -229,6 +229,10 @@ impl Machine {
         self.bus.gpu().last_max_dy
     }
 
+    pub fn last_poly_ops(&self) -> [u32; 32] {
+        self.bus.gpu().last_poly_op
+    }
+
     /// 512×240 occupancy of last-frame GP0(30) vertices, x wrapped per buffer.
     pub fn last_gouraud_scatter(&self) -> DisplayArea {
         let s = &self.bus.gpu().last_scatter;

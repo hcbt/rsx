@@ -60,6 +60,9 @@ pub struct Gpu {
     frame_long30: u32,
     pub last_max_dy: i32,
     frame_max_dy: i32,
+    /// Last completed frame: GP0(20h–3Fh) counts by command byte.
+    pub last_poly_op: [u32; 32],
+    frame_poly_op: [u32; 32],
 }
 
 #[allow(dead_code)]
@@ -132,6 +135,8 @@ impl Gpu {
             frame_long30: 0,
             last_max_dy: 0,
             frame_max_dy: 0,
+            last_poly_op: [0; 32],
+            frame_poly_op: [0; 32],
         };
         g.update_stat();
         g
@@ -486,7 +491,12 @@ impl Gpu {
                 self.frame_long30 += 1;
             }
         }
-        let blend = textured && cmd & 1 == 0;
+        // SPX GP0 bit24: 0=texture blended (texel×vertex/80h), 1=raw. Not RGB.0.
+        let op = ((cmd >> 24) as u8).wrapping_sub(0x20) as usize;
+        if op < 32 {
+            self.frame_poly_op[op] += 1;
+        }
+        let blend = textured && cmd & (1 << 24) == 0;
         self.tri(verts[0], verts[1], verts[2], textured, blend);
         if quad {
             self.tri(verts[1], verts[2], verts[3], textured, blend);
@@ -515,8 +525,18 @@ impl Gpu {
         if dx > 1023 || dy > 511 {
             return;
         }
+        // SPX: polygons are displayed up to <excluding> their lower-right
+        // coordinates (top/left edges in, right/bottom vertex coords out).
+        let max_vx = a.0.max(b.0).max(c.0);
+        let max_vy = a.1.max(b.1).max(c.1);
         for y in miny..=maxy {
+            if y >= max_vy {
+                continue;
+            }
             for x in minx..=maxx {
+                if x >= max_vx {
+                    continue;
+                }
                 let w0 = orient(b.0, b.1, c.0, c.1, x, y);
                 let w1 = orient(c.0, c.1, a.0, a.1, x, y);
                 let w2 = orient(a.0, a.1, b.0, b.1, x, y);
@@ -661,7 +681,7 @@ impl Gpu {
             }
         };
         let pix = rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
-        let blend = textured && cmd & 1 == 0;
+        let blend = textured && cmd & (1 << 24) == 0;
         for yy in 0..h {
             for xx in 0..w {
                 let color = if textured {
@@ -850,8 +870,10 @@ impl Gpu {
             self.last_y_bins = self.frame_y_bins;
             self.last_long30 = self.frame_long30;
             self.last_max_dy = self.frame_max_dy;
+            self.last_poly_op = self.frame_poly_op;
             std::mem::swap(&mut self.last_scatter, &mut self.frame_scatter);
             self.frame_scatter.fill(0);
+            self.frame_poly_op = [0; 32];
             self.frame_n30 = 0;
             self.frame_n30_out = 0;
             self.frame_long30 = 0;
@@ -1209,6 +1231,64 @@ mod tests {
             "GP0(34h) 40h blend must dim a white texel (got {:04X?})",
             pix.pixels
         );
+    }
+
+    #[test]
+    fn texture_blend_is_command_bit24_not_rgb_lsb() {
+        // SPX bit24: 0=blended. RGB.0 of 41h must not switch the poly to raw.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x7FFF;
+        upload_clut(&mut gpu, 0, 0, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(64);
+        gpu.gp0(2 | (8 << 16));
+        for _ in 0..8 {
+            gpu.gp0(0x1111_1111);
+        }
+        gpu.gp0(0x34 << 24 | 0x00404041);
+        gpu.gp0(xy(10, 10));
+        gpu.gp0(0x0000);
+        gpu.gp0(0x00404041);
+        gpu.gp0(xy(26, 10));
+        gpu.gp0((1 << 16) | 0x0008);
+        gpu.gp0(0x00404041);
+        gpu.gp0(xy(10, 26));
+        gpu.gp0(0x0008_00);
+        let pix = gpu.vram_rect(12, 12, 8, 8);
+        let half = pix
+            .pixels
+            .iter()
+            .filter(|p| {
+                let r = *p & 0x1F;
+                r > 4 && r < 0x1C
+            })
+            .count();
+        assert!(
+            half > 4,
+            "GP0(34h) with odd RGB.0 must still blend (got {:04X?})",
+            pix.pixels
+        );
+    }
+
+    #[test]
+    fn polygon_excludes_lower_right_vertex_coordinates() {
+        // SPX: displayed up to <excluding> lower-right coordinates.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(10, 10));
+        gpu.gp0(xy(14, 10));
+        gpu.gp0(xy(10, 14));
+        let right = red_count(&gpu.vram_rect(14, 10, 1, 4).pixels);
+        let bottom = red_count(&gpu.vram_rect(10, 14, 4, 1).pixels);
+        let interior = red_count(&gpu.vram_rect(10, 10, 3, 3).pixels);
+        assert_eq!(right, 0, "x=max vertex must not plot");
+        assert_eq!(bottom, 0, "y=max vertex must not plot");
+        assert!(interior > 0, "interior of the triangle must still plot");
     }
 }
 

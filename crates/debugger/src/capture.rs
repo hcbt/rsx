@@ -101,6 +101,14 @@ pub fn capture_at_vblanks(
             machine.last_long30(),
             machine.last_max_dy()
         );
+        let pops = machine.last_poly_ops();
+        let poly_hist: Vec<String> = (0..32u8)
+            .filter(|&i| pops[i as usize] > 0)
+            .map(|i| format!("{:02X}={}", 0x20 + i, pops[i as usize]))
+            .collect();
+        if !poly_hist.is_empty() {
+            eprintln!("  gp0-poly {}", poly_hist.join(" "));
+        }
         let ops = machine.gte_op_counts();
         let names = [
             (0x01u8, "RTPS"),

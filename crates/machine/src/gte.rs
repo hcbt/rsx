@@ -354,8 +354,7 @@ impl Gte {
                 (tr[r] << 12) + i64::from(self.rt_el(r, 0)) * i64::from(vx),
             );
             acc = self.mac(axis, acc + i64::from(self.rt_el(r, 1)) * i64::from(vy));
-            xyz[r] = acc + i64::from(self.rt_el(r, 2)) * i64::from(vz);
-            self.mac(axis, xyz[r]);
+            xyz[r] = self.mac(axis, acc + i64::from(self.rt_el(r, 2)) * i64::from(vz));
         }
         let shift = sf * 12;
         for i in 0..2 {
@@ -512,7 +511,8 @@ impl Gte {
     fn sqr(&mut self, sf: u32) {
         for i in 0..3 {
             let ir = self.data[9 + i] as i16 as i64;
-            let mac = (ir * ir) >> (sf * 12);
+            let acc = self.mac((i as u32) + 1, ir * ir);
+            let mac = acc >> (sf * 12);
             self.data[25 + i] = mac as u32;
             self.set_ir(i, mac, false);
         }
@@ -525,9 +525,9 @@ impl Gte {
         let ir1 = self.data[9] as i16 as i64;
         let ir2 = self.data[10] as i16 as i64;
         let ir3 = self.data[11] as i16 as i64;
-        let mac1 = (ir3 * d2 - ir2 * d3) >> (sf * 12);
-        let mac2 = (ir1 * d3 - ir3 * d1) >> (sf * 12);
-        let mac3 = (ir2 * d1 - ir1 * d2) >> (sf * 12);
+        let mac1 = self.mac(1, ir3 * d2 - ir2 * d3) >> (sf * 12);
+        let mac2 = self.mac(2, ir1 * d3 - ir3 * d1) >> (sf * 12);
+        let mac3 = self.mac(3, ir2 * d1 - ir1 * d2) >> (sf * 12);
         self.data[25] = mac1 as u32;
         self.data[26] = mac2 as u32;
         self.data[27] = mac3 as u32;
@@ -815,7 +815,8 @@ impl Gte {
         let ir0 = self.data[8] as i16 as i64;
         for i in 0..3 {
             let ir = self.data[9 + i] as i16 as i64;
-            let mac = (ir * ir0) >> (sf * 12);
+            let acc = self.mac((i as u32) + 1, ir * ir0);
+            let mac = acc >> (sf * 12);
             self.data[25 + i] = mac as u32;
             self.set_ir(i, mac, lm);
         }
@@ -827,7 +828,8 @@ impl Gte {
         for i in 0..3 {
             let ir = self.data[9 + i] as i16 as i64;
             let mac_old = (self.data[25 + i] as i32 as i64) << (sf * 12);
-            let mac = (ir * ir0 + mac_old) >> (sf * 12);
+            let acc = self.mac((i as u32) + 1, ir * ir0 + mac_old);
+            let mac = acc >> (sf * 12);
             self.data[25 + i] = mac as u32;
             self.set_ir(i, mac, lm);
         }
@@ -1211,6 +1213,38 @@ mod tests {
         assert_eq!((rgb >> 8) & 0xFF, 0, "G sat from negative SAR 4");
         assert_eq!((rgb >> 16) & 0xFF, 0x80, "B");
         assert_ne!(g.read_control(31) & (1 << 20), 0, "FLAG.20 G sat");
+    }
+
+    #[test]
+    fn gpl_mac_overflow_sets_flag_a1() {
+        // SPX: GPL does MAC = (MAC << sf*12) + IR*IR0 on the 44-bit bus.
+        // MAC1 = 7FFFFFFFh << 12 plus 7FFFh*7FFFh exceeds +43-bit → FLAG.30.
+        let mut g = Gte::new();
+        g.write_data(25, 0x7FFF_FFFF);
+        g.write_data(9, 0x7FFF);
+        g.write_data(10, 0);
+        g.write_data(11, 0);
+        g.write_data(8, 0x7FFF);
+        g.command(0x3E | (1 << 19));
+        let f = g.read_control(31);
+        assert_ne!(f & (1 << 30), 0, "A1 FLAG.30 {f:#010X}");
+        assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
+    fn gpf_shifts_ir_times_ir0() {
+        // IR=0x800, IR0=0x1000, sf=1 → MAC = (0x800*0x1000)>>12 = 0x800, colour 0x80.
+        let mut g = Gte::new();
+        g.write_data(9, 0x800);
+        g.write_data(10, 0x800);
+        g.write_data(11, 0x800);
+        g.write_data(8, 0x1000);
+        g.write_data(6, 0x30 << 24);
+        g.command(0x3D | (1 << 19));
+        assert_eq!(g.read_data(25) as i32, 0x800, "MAC1");
+        assert_eq!(g.read_data(9) as i16, 0x800, "IR1");
+        let rgb = g.read_data(22);
+        assert_eq!(rgb & 0xFF, 0x80, "GPF colour R {rgb:#X}");
     }
 }
 
