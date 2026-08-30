@@ -14,6 +14,7 @@ pub struct Gte {
     pub last_hi_r21: i32,
     pub last_hi_r22: i32,
     pub last_hi_r23: i32,
+    pub last_hi_rt: [i32; 9],
     pub title_explode: u32,
     pub title_ir2_min: i32,
     pub title_ir2_max: i32,
@@ -37,6 +38,7 @@ impl Gte {
             last_hi_r21: 0,
             last_hi_r22: 0,
             last_hi_r23: 0,
+            last_hi_rt: [0; 9],
             title_explode: 0,
             title_ir2_min: i32::MAX,
             title_ir2_max: i32::MIN,
@@ -278,9 +280,17 @@ impl Gte {
             self.title_vy_min = self.title_vy_min.min(vy);
             self.title_vy_max = self.title_vy_max.max(vy);
             if sy > self.last_hi_sy {
-                let r21 = self.rt_el(1, 0);
-                let r22 = self.rt_el(1, 1);
-                let r23 = self.rt_el(1, 2);
+                let rt = [
+                    self.rt_el(0, 0),
+                    self.rt_el(0, 1),
+                    self.rt_el(0, 2),
+                    self.rt_el(1, 0),
+                    self.rt_el(1, 1),
+                    self.rt_el(1, 2),
+                    self.rt_el(2, 0),
+                    self.rt_el(2, 1),
+                    self.rt_el(2, 2),
+                ];
                 self.last_hi_sy = sy;
                 self.last_hi_ir2 = ir2 as i32;
                 self.last_hi_n = n;
@@ -288,9 +298,10 @@ impl Gte {
                 self.last_hi_vy = vy;
                 self.last_hi_try = tr[1] as i32;
                 self.last_hi_trz = tr[2] as i32;
-                self.last_hi_r21 = r21;
-                self.last_hi_r22 = r22;
-                self.last_hi_r23 = r23;
+                self.last_hi_r21 = rt[3];
+                self.last_hi_r22 = rt[4];
+                self.last_hi_r23 = rt[5];
+                self.last_hi_rt = rt;
             }
         }
         self.data[12] = self.data[13];
@@ -876,6 +887,21 @@ mod tests {
         assert_eq!((rgb >> 8) & 0xFF, 0x80, "CC G");
         assert_eq!((rgb >> 16) & 0xFF, 0x80, "CC B");
         assert_eq!(rgb >> 24, 0x30, "CC CODE");
+    }
+
+    #[test]
+    fn mvmva_rtv0_identity_is_the_vector() {
+        // PSY-Q rtv0: sf=1 mx=RT v=V0 cv=None. Identity RT, V=(100,-50,25) → IR=V.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_data(0, 100u32 | ((-50i16 as u16 as u32) << 16));
+        g.write_data(1, 25);
+        g.command(0x01 << 19 | 3 << 13 | 0x12); // sf=1, cv=None, v=V0
+        assert_eq!(g.read_data(9) as i16, 100, "IR1");
+        assert_eq!(g.read_data(10) as i16, -50, "IR2");
+        assert_eq!(g.read_data(11) as i16, 25, "IR3");
     }
 }
 

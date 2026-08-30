@@ -63,8 +63,13 @@ pub fn capture_at_vblanks(
             machine.gte_control(2) as u16,
         );
         let (ir2lo, ir2hi, vylo, vyhi, htrz, r21, r22, r23) = machine.gte_title_ir2();
+        let rt = machine.gte_title_rt();
         eprintln!(
             "  title-rtps IR2={ir2lo}..{ir2hi} VY={vylo}..{vyhi} hi-TRZ={htrz} R2=[{r21},{r22},{r23}]"
+        );
+        eprintln!(
+            "  title-rt [[{},{},{}],[{},{},{}],[{},{},{}]]",
+            rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], rt[7], rt[8]
         );
         let ops = machine.gte_op_counts();
         let names = [
