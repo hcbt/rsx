@@ -682,35 +682,28 @@ impl Gpu {
         }
     }
 
+    pub fn display_origin(&self) -> (u32, u32, u32, u32, bool) {
+        (
+            self.display_x,
+            self.display_y,
+            self.display_hres,
+            self.display_vres,
+            self.display_enabled,
+        )
+    }
+
     pub fn display_area(&self) -> DisplayArea {
         let w = self.display_hres.max(1).min(640);
         let h = self.display_vres.max(1).min(480);
         let mut pixels = Vec::with_capacity((w * h) as usize);
-        let mut dark = 0usize;
         for y in 0..h {
             for x in 0..w {
-                let p = self.read_half(self.display_x + x, self.display_y + y);
-                if p & 0x7FFF == 0 || (p & 0x1F) + ((p >> 5) & 0x1F) + ((p >> 10) & 0x1F) < 8 {
-                    dark += 1;
-                }
+                let p = if self.display_enabled {
+                    self.read_half(self.display_x + x, self.display_y + y)
+                } else {
+                    0
+                };
                 pixels.push(p);
-            }
-        }
-        // The BIOS draws the SCE wordmark at (640,0) while GP1 still
-        // points at the just-cleared 640×480 buffer. When that buffer is
-        // near-black, show the wordmark rect instead.
-        if dark * 10 >= pixels.len() * 9 {
-            let alt = self.vram_rect(640, 0, 320, 240);
-            let bright = alt
-                .pixels
-                .iter()
-                .filter(|p| {
-                    let v = **p;
-                    (v & 0x1F) + ((v >> 5) & 0x1F) + ((v >> 10) & 0x1F) > 40
-                })
-                .count();
-            if bright > 500 {
-                return alt;
             }
         }
         DisplayArea {
@@ -768,6 +761,95 @@ fn interp(w0: i32, w1: i32, w2: i32, a: u32, b: u32, c: u32, sum: i32) -> i32 {
 
 fn rgb888_to_555(r: u32, g: u32, b: u32) -> u16 {
     ((r >> 3) as u16) | (((g >> 3) as u16) << 5) | (((b >> 3) as u16) << 10)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upload_clut(gpu: &mut Gpu, x: u32, y: u32, colors: [u16; 16]) {
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(x | (y << 16));
+        gpu.gp0(16 | (1 << 16));
+        for pair in colors.chunks(2) {
+            gpu.gp0(u32::from(pair[0]) | (u32::from(pair[1]) << 16));
+        }
+    }
+
+    #[test]
+    fn textured_quad_samples_4bit_clut() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 639 | (479 << 10));
+        let mut clut = [0u16; 16];
+        clut[1] = 0x7FFF;
+        clut[2] = 0x001F;
+        upload_clut(&mut gpu, 192, 480, clut);
+        // 4-bit page at x=832 (page 0xD): 8×8 texels of index 1 (0x1111 per halfword).
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(832);
+        gpu.gp0(2 | (8 << 16));
+        for _ in 0..8 {
+            gpu.gp0(0x1111_1111);
+        }
+
+        // GP0(2C) 8×8 sprite at (10,10), UVs covering the two texels.
+        gpu.gp0(0x2C80_8080);
+        gpu.gp0(10 | (10 << 16));
+        gpu.gp0((0x780C << 16) | 0x0000); // clut (192,480), uv 0,0
+        gpu.gp0(18 | (10 << 16));
+        gpu.gp0((0x000D << 16) | 0x0008); // page 0xD, uv 8,0
+        gpu.gp0(10 | (18 << 16));
+        gpu.gp0(0x0008_00);
+        gpu.gp0(18 | (18 << 16));
+        gpu.gp0(0x0008_08);
+
+        let pix = gpu.vram_rect(10, 10, 8, 8);
+        let lit = pix.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
+        assert!(
+            lit > 8,
+            "4-bit 2C sprite must plot CLUT colors (lit={lit} pixels={:04X?})",
+            pix.pixels
+        );
+        assert!(
+            pix.pixels.iter().any(|p| *p & 0x7FFF == 0x7FFF)
+                || pix.pixels.iter().any(|p| *p & 0x7FFF == 0x001F),
+            "sprite pixels should include CLUT entries 1 or 2 ({:04X?})",
+            pix.pixels
+        );
+    }
+
+    #[test]
+    fn textured_quad_covers_bios_sce_sprite() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 639 | (479 << 10));
+        let mut clut = [0u16; 16];
+        clut[1] = 0x7FFF;
+        upload_clut(&mut gpu, 192, 480, clut);
+        // Page 0xD at x=832: 60 halfwords × 48 rows of index 1 (240×48 4-bit texels).
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(832);
+        gpu.gp0(60 | (48 << 16));
+        for _ in 0..((60 * 48 + 1) / 2) {
+            gpu.gp0(0x1111_1111);
+        }
+        gpu.gp0(0x2C80_8080);
+        gpu.gp0(200 | (56 << 16));
+        gpu.gp0((0x780C << 16) | 0x0000);
+        gpu.gp0(440 | (56 << 16));
+        gpu.gp0((0x000D << 16) | 239);
+        gpu.gp0(200 | (104 << 16));
+        gpu.gp0(47 << 8);
+        gpu.gp0(440 | (104 << 16));
+        gpu.gp0(239 | (47 << 8));
+        let pix = gpu.vram_rect(200, 56, 240, 48);
+        let lit = pix.pixels.iter().filter(|p| **p & 0x7FFF == 0x7FFF).count();
+        assert!(
+            lit > 5_000,
+            "BIOS-sized 2C sprite must cover the dest rect (lit={lit} / 11520)"
+        );
+    }
 }
 
 fn sign11(v: u32) -> i32 {

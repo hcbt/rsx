@@ -126,6 +126,10 @@ impl Machine {
         &self.bus.gpu().gp1_cmds
     }
 
+    pub fn display_origin(&self) -> (u32, u32, u32, u32, bool) {
+        self.bus.gpu().display_origin()
+    }
+
     pub fn io_writes(&self) -> u64 {
         self.bus.io_writes
     }
@@ -423,23 +427,6 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        m.run_until_vblank_count(451);
-        let wordmark = m.display_area();
-        let bright = wordmark
-            .pixels
-            .iter()
-            .filter(|p| {
-                let v = **p;
-                (v & 0x1F) + ((v >> 5) & 0x1F) + ((v >> 10) & 0x1F) > 40
-            })
-            .count();
-        assert_eq!(wordmark.width, 320, "wordmark is 320×240 at VRAM (640,0)");
-        assert_eq!(wordmark.height, 240);
-        assert!(
-            bright > 500,
-            "SCE wordmark not visible (bright={bright} gp0={})",
-            m.gp0_count()
-        );
         m.run_until_vblank_count(500);
         assert_ne!(
             m.pc() & 0xFFFF,
@@ -460,6 +447,67 @@ mod tests {
             "BIOS stopped issuing GPU commands (pc={:08X} gp0={})",
             m.pc(),
             m.gp0_count(),
+        );
+    }
+
+    #[test]
+    fn intro_does_not_present_texpage_before_the_diamond_when_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        if !path.exists() {
+            eprintln!("skipping: no local SCPH1001.BIN");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&path).unwrap();
+        m.run_until_vblank_count(100);
+        let tex = m.vram_rect(640, 0, 320, 240);
+        let tex_lit = tex.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
+        assert!(
+            tex_lit > 1_000,
+            "Intro textures should already be in VRAM (tex_lit={tex_lit})"
+        );
+        let (dx, dy, dw, dh, enabled) = m.display_origin();
+        let display = m.display_area();
+        let display_lit = display.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
+        assert_ne!(
+            (display.width, display.height),
+            (320, 240),
+            "display must not be the 320×240 texpage before the diamond (origin=({dx},{dy}) {dw}×{dh})"
+        );
+        assert!(
+            !enabled,
+            "GP1 has not enabled the display yet (origin=({dx},{dy}) {dw}×{dh})"
+        );
+        assert_eq!(
+            display_lit, 0,
+            "disabled display must be blank, not the uploaded texpage (display_lit={display_lit} tex_lit={tex_lit})"
+        );
+
+        m.run_until_vblank_count(150);
+        let diamond = m.display_area();
+        assert_eq!((diamond.width, diamond.height), (640, 480));
+        let diamond_lit = diamond.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
+        assert!(
+            diamond_lit > 50_000,
+            "diamond / fade must occupy the GP1 display rectangle (lit={diamond_lit})"
+        );
+
+        m.run_until_vblank_count(250);
+        let display = m.display_area();
+        assert_eq!((display.width, display.height), (640, 480));
+        let fill = display.pixels[0] & 0x7FFF;
+        let w = display.width as usize;
+        let mut banner = 0usize;
+        // SCE text sprites sit at VRAM y=56..104, x=200..440. Display starts at y=2.
+        for y in 54..102 {
+            for x in 200..440 {
+                if display.pixels[y * w + x] & 0x7FFF != fill {
+                    banner += 1;
+                }
+            }
+        }
+        assert!(
+            banner > 1_000,
+            "SCE text sprites must be on the display during the diamond (banner={banner} fill={fill:04X})"
         );
     }
 }
