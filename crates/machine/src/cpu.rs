@@ -120,6 +120,26 @@ impl Cpu {
         self.gte.last_hi_rt
     }
 
+    pub fn gte_on_vblank(&mut self) {
+        self.gte.on_vblank();
+    }
+
+    pub fn gte_frame_obj(&self) -> (u32, u32, i32, i32, i32, i32, i32, i32, i32, i32) {
+        let g = &self.gte;
+        (
+            g.frame_rtps,
+            g.frame_obj_n,
+            g.frame_obj_sy_min,
+            g.frame_obj_sy_max,
+            g.frame_obj_vy_min,
+            g.frame_obj_vy_max,
+            g.frame_obj_try,
+            g.frame_obj_trz,
+            g.frame_obj_vx_min,
+            g.frame_obj_vx_max,
+        )
+    }
+
     fn set_gpr(&mut self, i: u8, v: u32) {
         if i != 0 {
             self.gpr[i as usize] = v;

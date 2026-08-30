@@ -81,6 +81,7 @@ impl Machine {
         let now = self.bus.vblank_count();
         if now > prev_vblanks {
             self.vblank_count = now;
+            self.cpu.gte_on_vblank();
         }
     }
 
@@ -190,6 +191,10 @@ impl Machine {
 
     pub fn gte_title_rt(&self) -> [i32; 9] {
         self.cpu.gte_title_rt()
+    }
+
+    pub fn gte_frame_obj(&self) -> (u32, u32, i32, i32, i32, i32, i32, i32, i32, i32) {
+        self.cpu.gte_frame_obj()
     }
 
     pub fn last_y_bins(&self) -> [u32; 16] {

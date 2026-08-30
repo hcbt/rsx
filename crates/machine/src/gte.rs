@@ -21,6 +21,27 @@ pub struct Gte {
     pub title_vy_min: i32,
     pub title_vy_max: i32,
     pub op_counts: [u32; 64],
+    /// Last completed frame (copied on vblank). Object-like = yaw R with 5/8 Y.
+    pub frame_rtps: u32,
+    pub frame_obj_n: u32,
+    pub frame_obj_sy_min: i32,
+    pub frame_obj_sy_max: i32,
+    pub frame_obj_vy_min: i32,
+    pub frame_obj_vy_max: i32,
+    pub frame_obj_try: i32,
+    pub frame_obj_trz: i32,
+    pub frame_obj_vx_min: i32,
+    pub frame_obj_vx_max: i32,
+    acc_rtps: u32,
+    acc_obj_n: u32,
+    acc_obj_sy_min: i32,
+    acc_obj_sy_max: i32,
+    acc_obj_vy_min: i32,
+    acc_obj_vy_max: i32,
+    acc_obj_try: i32,
+    acc_obj_trz: i32,
+    acc_obj_vx_min: i32,
+    acc_obj_vx_max: i32,
 }
 
 impl Gte {
@@ -45,7 +66,50 @@ impl Gte {
             title_vy_min: i32::MAX,
             title_vy_max: i32::MIN,
             op_counts: [0; 64],
+            frame_rtps: 0,
+            frame_obj_n: 0,
+            frame_obj_sy_min: i32::MAX,
+            frame_obj_sy_max: i32::MIN,
+            frame_obj_vy_min: i32::MAX,
+            frame_obj_vy_max: i32::MIN,
+            frame_obj_try: 0,
+            frame_obj_trz: 0,
+            frame_obj_vx_min: i32::MAX,
+            frame_obj_vx_max: i32::MIN,
+            acc_rtps: 0,
+            acc_obj_n: 0,
+            acc_obj_sy_min: i32::MAX,
+            acc_obj_sy_max: i32::MIN,
+            acc_obj_vy_min: i32::MAX,
+            acc_obj_vy_max: i32::MIN,
+            acc_obj_try: 0,
+            acc_obj_trz: 0,
+            acc_obj_vx_min: i32::MAX,
+            acc_obj_vx_max: i32::MIN,
         }
+    }
+
+    pub fn on_vblank(&mut self) {
+        self.frame_rtps = self.acc_rtps;
+        self.frame_obj_n = self.acc_obj_n;
+        self.frame_obj_sy_min = self.acc_obj_sy_min;
+        self.frame_obj_sy_max = self.acc_obj_sy_max;
+        self.frame_obj_vy_min = self.acc_obj_vy_min;
+        self.frame_obj_vy_max = self.acc_obj_vy_max;
+        self.frame_obj_try = self.acc_obj_try;
+        self.frame_obj_trz = self.acc_obj_trz;
+        self.frame_obj_vx_min = self.acc_obj_vx_min;
+        self.frame_obj_vx_max = self.acc_obj_vx_max;
+        self.acc_rtps = 0;
+        self.acc_obj_n = 0;
+        self.acc_obj_sy_min = i32::MAX;
+        self.acc_obj_sy_max = i32::MIN;
+        self.acc_obj_vy_min = i32::MAX;
+        self.acc_obj_vy_max = i32::MIN;
+        self.acc_obj_try = 0;
+        self.acc_obj_trz = 0;
+        self.acc_obj_vx_min = i32::MAX;
+        self.acc_obj_vx_max = i32::MIN;
     }
 
     pub fn read_data(&self, reg: u8) -> u32 {
@@ -221,6 +285,21 @@ impl Gte {
         self.ctrl[31] |= 1 << bit;
     }
 
+    /// 44-bit MAC1/2/3 (or 32-bit MAC0): flag A1/A2/A3/A0 then sign-extend.
+    fn mac(&mut self, axis: u32, v: i64) -> i64 {
+        if axis == 0 {
+            if v > i64::from(i32::MAX) || v < i64::from(i32::MIN) {
+                self.flag(16);
+            }
+            (v << 32) >> 32
+        } else {
+            if v > (1i64 << 43) - 1 || v < -(1i64 << 43) {
+                self.flag(31 - axis);
+            }
+            (v << 20) >> 20
+        }
+    }
+
     fn rtp_vector(&mut self, vec: usize, sf: u32, lm: bool) {
         let (vx, vy, vz) = self.vx(vec);
         let tr = [
@@ -232,9 +311,14 @@ impl Gte {
         for r in 0..3 {
             // SPX/hardware: each partial sum is 44-bit (sign-extended) before
             // the next multiply-add. DuckStation's RTPS matches this chaining.
-            let mut acc = mac44((tr[r] << 12) + i64::from(self.rt_el(r, 0)) * i64::from(vx));
-            acc = mac44(acc + i64::from(self.rt_el(r, 1)) * i64::from(vy));
+            let axis = (r as u32) + 1;
+            let mut acc = self.mac(
+                axis,
+                (tr[r] << 12) + i64::from(self.rt_el(r, 0)) * i64::from(vx),
+            );
+            acc = self.mac(axis, acc + i64::from(self.rt_el(r, 1)) * i64::from(vy));
             xyz[r] = acc + i64::from(self.rt_el(r, 2)) * i64::from(vz);
+            self.mac(axis, xyz[r]);
         }
         let shift = sf * 12;
         for i in 0..2 {
@@ -275,10 +359,35 @@ impl Gte {
         let sx = saturate_sx(sx, &mut self.ctrl[31]);
         let sy = saturate_sy(sy, &mut self.ctrl[31]);
         if self.ctrl[26] as u16 == 0x1F4 {
+            self.acc_rtps = self.acc_rtps.saturating_add(1);
             self.title_ir2_min = self.title_ir2_min.min(ir2 as i32);
             self.title_ir2_max = self.title_ir2_max.max(ir2 as i32);
             self.title_vy_min = self.title_vy_min.min(vy);
             self.title_vy_max = self.title_vy_max.max(vy);
+            let r12 = self.rt_el(0, 1);
+            let r21 = self.rt_el(1, 0);
+            let r22 = self.rt_el(1, 1);
+            let r23 = self.rt_el(1, 2);
+            let r32 = self.rt_el(2, 1);
+            // Crash object R is yaw + 5/8 Y + Z negate: off-axis Y terms ≈ 0.
+            let object = r12.abs() < 200
+                && r21.abs() < 200
+                && r23.abs() < 200
+                && r32.abs() < 200
+                && r22 < -1000;
+            if object {
+                self.acc_obj_n = self.acc_obj_n.saturating_add(1);
+                self.acc_obj_sy_min = self.acc_obj_sy_min.min(sy);
+                self.acc_obj_vy_min = self.acc_obj_vy_min.min(vy);
+                self.acc_obj_vy_max = self.acc_obj_vy_max.max(vy);
+                self.acc_obj_vx_min = self.acc_obj_vx_min.min(vx);
+                self.acc_obj_vx_max = self.acc_obj_vx_max.max(vx);
+                if sy >= self.acc_obj_sy_max {
+                    self.acc_obj_sy_max = sy;
+                    self.acc_obj_try = tr[1] as i32;
+                    self.acc_obj_trz = tr[2] as i32;
+                }
+            }
             if sy > self.last_hi_sy {
                 let rt = [
                     self.rt_el(0, 0),
@@ -326,7 +435,7 @@ impl Gte {
             - sx(0) * sy(2)
             - sx(1) * sy(0)
             - sx(2) * sy(1);
-        self.data[24] = mac0 as u32;
+        self.data[24] = self.mac(0, mac0) as u32;
     }
 
     fn avsz3(&mut self) {
@@ -421,20 +530,23 @@ impl Gte {
         let shift = sf * 12;
         for r in 0..3 {
             let t = [tx, ty, tz][r];
+            let axis = (r as u32) + 1;
             if cv == 2 {
                 // SPX: FC translation is bugged — FLAG uses T+M*Vx, result is
                 // only the last two multiply-adds.
-                let _flag = mac44((t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
-                let acc = mac44(
+                let _flag = self.mac(axis, (t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
+                let acc = self.mac(
+                    axis,
                     i64::from(m[r][1]) * i64::from(vec.1) + i64::from(m[r][2]) * i64::from(vec.2),
                 );
                 let shifted = acc >> shift;
                 self.data[25 + r] = shifted as u32;
                 self.set_ir(r, shifted, lm);
             } else {
-                let mut acc = mac44((t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
-                acc = mac44(acc + i64::from(m[r][1]) * i64::from(vec.1));
+                let mut acc = self.mac(axis, (t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
+                acc = self.mac(axis, acc + i64::from(m[r][1]) * i64::from(vec.1));
                 acc += i64::from(m[r][2]) * i64::from(vec.2);
+                self.mac(axis, acc);
                 let shifted = acc >> shift;
                 self.data[25 + r] = shifted as u32;
                 self.set_ir(r, shifted, lm);
@@ -522,9 +634,12 @@ impl Gte {
         let ir = self.ir_vec();
         for r in 0..3 {
             let bk = self.ctrl[13 + r] as i32 as i64;
-            let mut acc = mac44((bk << 12) + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0));
-            acc = mac44(acc + i64::from(self.mx_el(2, r, 1)) * i64::from(ir.1));
+            let axis = (r as u32) + 1;
+            let mut acc =
+                self.mac(axis, (bk << 12) + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0));
+            acc = self.mac(axis, acc + i64::from(self.mx_el(2, r, 1)) * i64::from(ir.1));
             acc += i64::from(self.mx_el(2, r, 2)) * i64::from(ir.2);
+            self.mac(axis, acc);
             let shifted = acc >> (sf * 12);
             self.data[25 + r] = shifted as u32;
             self.set_ir(r, shifted, lm);
@@ -890,6 +1005,19 @@ mod tests {
     }
 
     #[test]
+    fn rtps_mac_overflow_sets_flag_a3() {
+        // TRZ at i32::MAX, R33=VZ=0x7FFF: MAC3 exceeds 43 bits → FLAG.28 and bit 31.
+        let mut g = Gte::new();
+        g.write_control(4, 0x7FFF);
+        g.write_control(7, 0x7FFF_FFFF);
+        g.write_data(1, 0x7FFF);
+        g.command(0x01 | (1 << 19));
+        let f = g.read_control(31);
+        assert_ne!(f & (1 << 28), 0, "A3 FLAG.28");
+        assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
     fn mvmva_rtv0_identity_is_the_vector() {
         // PSY-Q rtv0: sf=1 mx=RT v=V0 cv=None. Identity RT, V=(100,-50,25) → IR=V.
         let mut g = Gte::new();
@@ -925,10 +1053,6 @@ const UNR_TABLE: [u8; 257] = [
     0x07, 0x07, 0x06, 0x06, 0x05, 0x05, 0x04, 0x04, 0x03, 0x03, 0x02, 0x02, 0x01, 0x01, 0x00, 0x00,
     0x00,
 ];
-
-fn mac44(v: i64) -> i64 {
-    (v << 20) >> 20
-}
 
 fn unr_divide(h: u16, sz: u16, flag: &mut u32) -> u32 {
     if u32::from(h) >= u32::from(sz) * 2 {

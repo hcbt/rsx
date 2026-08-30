@@ -71,6 +71,10 @@ pub fn capture_at_vblanks(
             "  title-rt [[{},{},{}],[{},{},{}],[{},{},{}]]",
             rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], rt[7], rt[8]
         );
+        let (frtps, on, osy0, osy1, ovy0, ovy1, otry, otrz, ovx0, ovx1) = machine.gte_frame_obj();
+        eprintln!(
+            "  frame-rtps={frtps} obj n={on} SY={osy0}..{osy1} VY={ovy0}..{ovy1} VX={ovx0}..{ovx1} TRY={otry} TRZ={otrz}"
+        );
         let ops = machine.gte_op_counts();
         let names = [
             (0x01u8, "RTPS"),
