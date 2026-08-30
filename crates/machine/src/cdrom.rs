@@ -11,6 +11,10 @@ pub struct CdromView {
     pub lba: u32,
     pub pending_cycles: Option<u32>,
     pub fifo_bytes: u32,
+    pub mode: u8,
+    pub last_cmd: u8,
+    /// Oldest→newest, 16 slots; unused are 0xFF.
+    pub recent: [u8; 16],
 }
 
 /// 33.8688 MHz / 75 sectors/s (1×). Mode bit 7 selects 2×.
@@ -34,6 +38,9 @@ pub struct Cdrom {
     reading: bool,
     fifo: Vec<u8>,
     fifo_i: usize,
+    last_cmd: u8,
+    recent: [u8; 16],
+    recent_n: u8,
 }
 
 struct Pending {
@@ -62,6 +69,9 @@ impl Cdrom {
             reading: false,
             fifo: Vec::new(),
             fifo_i: 0,
+            last_cmd: 0,
+            recent: [0xFF; 16],
+            recent_n: 0,
         }
     }
 
@@ -173,6 +183,10 @@ impl Cdrom {
     }
 
     fn command(&mut self, cmd: u8, _irq: &mut Irq) {
+        self.last_cmd = cmd;
+        let i = (self.recent_n as usize) % 16;
+        self.recent[i] = cmd;
+        self.recent_n = self.recent_n.saturating_add(1);
         self.status |= 1 << 7; // busy
         let (first, second) = match cmd {
             0x01 => (Some((0xC4E1, 3, vec![self.controller_stat()])), None), // Getstat
@@ -269,6 +283,16 @@ impl Cdrom {
     }
 
     pub fn view(&self) -> CdromView {
+        let mut recent = [0xFFu8; 16];
+        let n = (self.recent_n as usize).min(16);
+        let start = if self.recent_n as usize > 16 {
+            (self.recent_n as usize) % 16
+        } else {
+            0
+        };
+        for i in 0..n {
+            recent[i] = self.recent[(start + i) % 16];
+        }
         CdromView {
             status: self.status,
             controller: self.controller_stat(),
@@ -277,6 +301,9 @@ impl Cdrom {
             lba: self.lba,
             pending_cycles: self.pending.as_ref().map(|p| p.cycles),
             fifo_bytes: self.fifo.len().saturating_sub(self.fifo_i) as u32,
+            mode: self.mode,
+            last_cmd: self.last_cmd,
+            recent,
         }
     }
 

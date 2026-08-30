@@ -25,6 +25,9 @@ pub struct Sample {
     pub cd_lba: u32,
     pub cd_pending: Option<u32>,
     pub cd_fifo: u32,
+    pub cd_mode: u8,
+    pub cd_last: u8,
+    pub cd_recent: [u8; 16],
     pub irq_stat: u16,
     pub irq_mask: u16,
     pub wq: usize,
@@ -37,6 +40,9 @@ pub struct Sample {
     pub hash: u64,
     pub io_cd: u64,
     pub io_gpu: u64,
+    pub t2_value: u16,
+    pub t2_mode: u16,
+    pub t2_target: u16,
     pub pace: Option<HostPace>,
 }
 
@@ -68,6 +74,9 @@ impl Sample {
             cd_lba: cd.lba,
             cd_pending: cd.pending_cycles,
             cd_fifo: cd.fifo_bytes,
+            cd_mode: cd.mode,
+            cd_last: cd.last_cmd,
+            cd_recent: cd.recent,
             irq_stat: machine.irq_stat(),
             irq_mask: machine.irq_mask(),
             wq: machine.write_queue_len(),
@@ -80,6 +89,9 @@ impl Sample {
             hash: machine.display_area_hash(),
             io_cd: machine.io_cd(),
             io_gpu: machine.io_gpu(),
+            t2_value: machine.timer_value(2),
+            t2_mode: machine.timer_mode(2),
+            t2_target: machine.timer_target(2),
             pace,
         }
     }
@@ -89,21 +101,33 @@ impl Sample {
             Some(p) => p.line(),
             None => "pace —".to_string(),
         };
+        let recent: Vec<String> = self
+            .cd_recent
+            .iter()
+            .filter(|&&c| c != 0xFF)
+            .map(|c| format!("{c:02X}"))
+            .collect();
         let cd = if self.cd_reading {
             format!(
-                "read lba={} pend={} fifo={}",
+                "read lba={} pend={} fifo={} mode={:02X} last={:02X} [{}]",
                 self.cd_lba,
                 self.cd_pending.unwrap_or(0),
-                self.cd_fifo
+                self.cd_fifo,
+                self.cd_mode,
+                self.cd_last,
+                recent.join(",")
             )
         } else if self.cd_motor {
             format!(
-                "motor lba={} pend={}",
+                "motor lba={} pend={} mode={:02X} last={:02X} [{}]",
                 self.cd_lba,
-                self.cd_pending.unwrap_or(0)
+                self.cd_pending.unwrap_or(0),
+                self.cd_mode,
+                self.cd_last,
+                recent.join(",")
             )
         } else {
-            "idle".to_string()
+            format!("idle last={:02X} [{}]", self.cd_last, recent.join(","))
         };
         let mut dma = format!("dma={:02X}", self.dma_jobs);
         for (i, &chcr) in self.dma_chcr.iter().enumerate() {
@@ -112,7 +136,7 @@ impl Sample {
             }
         }
         format!(
-            "vblank={} cycles={} pc={:08X} gpustat={:08X} {pace} gpu fifo={} draw={} busy={} gp0={} {dma} cd={cd} irq={:04X}/{:04X} wq={} ram={} display=({},{}) {}x{} on={} hash={:016x} io_cd={} io_gpu={}",
+            "vblank={} cycles={} pc={:08X} gpustat={:08X} {pace} gpu fifo={} draw={} busy={} gp0={} {dma} cd={cd} irq={:04X}/{:04X} wq={} ram={} display=({},{}) {}x{} on={} hash={:016x} io_cd={} io_gpu={} t2={:04X}/{:04X}/{:04X}",
             self.vblank,
             self.cycles,
             self.pc,
@@ -133,6 +157,9 @@ impl Sample {
             self.hash,
             self.io_cd,
             self.io_gpu,
+            self.t2_value,
+            self.t2_mode,
+            self.t2_target,
         )
     }
 }
@@ -208,6 +235,15 @@ mod tests {
             cd_lba: 150,
             cd_pending: Some(451_584),
             cd_fifo: 0,
+            cd_mode: 0x80,
+            cd_last: 0x06,
+            cd_recent: {
+                let mut r = [0xFFu8; 16];
+                r[0] = 0x0E;
+                r[1] = 0x02;
+                r[2] = 0x06;
+                r
+            },
             irq_stat: 0x0004,
             irq_mask: 0x0007,
             wq: 0,
@@ -220,6 +256,9 @@ mod tests {
             hash: 0xBA52_1443_3916_99A1,
             io_cd: 40,
             io_gpu: 9,
+            t2_value: 0,
+            t2_mode: 0,
+            t2_target: 0,
             pace: clock::measure(CPU_HZ, 60, Duration::from_secs(1)),
         }
     }
@@ -232,6 +271,7 @@ mod tests {
         assert!(line.contains("clock="), "{line}");
         assert!(line.contains("fps="), "{line}");
         assert!(line.contains("cd=read lba=150"), "{line}");
+        assert!(line.contains("last=06"), "{line}");
         assert!(line.contains("display=(0,2) 640x480 on=1"), "{line}");
         assert!(line.contains("gpu fifo=0 draw=0 busy=0"), "{line}");
         assert!(line.contains("dma=00"), "{line}");

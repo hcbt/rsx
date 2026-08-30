@@ -409,6 +409,10 @@ impl Machine {
     pub fn timer_mode(&self, i: usize) -> u16 {
         self.bus.timers().mode(i)
     }
+
+    pub fn timer_target(&self, i: usize) -> u16 {
+        self.bus.timers().target(i)
+    }
 }
 
 fn hash_pixels(area: &DisplayArea) -> u64 {
