@@ -67,6 +67,11 @@ pub struct Gpu {
     /// Last completed frame: GP0(20h–3Fh) counts by command byte.
     pub last_poly_op: [u32; 32],
     frame_poly_op: [u32; 32],
+    /// CRT: last latched field. `display_area` is this, not live VRAM.
+    crt: Vec<u16>,
+    crt_w: u32,
+    crt_h: u32,
+    crt_line: u32,
 }
 
 #[allow(dead_code)]
@@ -145,6 +150,10 @@ impl Gpu {
             frame_max_dy: 0,
             last_poly_op: [0; 32],
             frame_poly_op: [0; 32],
+            crt: Vec::new(),
+            crt_w: 0,
+            crt_h: 0,
+            crt_line: u32::MAX,
         };
         g.update_stat();
         g
@@ -869,21 +878,24 @@ impl Gpu {
     pub fn display_area(&self) -> DisplayArea {
         let w = self.display_hres.max(1).min(640);
         let h = self.display_vres.max(1).min(480);
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let p = if self.display_enabled {
-                    self.read_half(self.display_x + x, self.display_y + y)
-                } else {
-                    0
-                };
-                pixels.push(p);
-            }
+        if !self.display_enabled {
+            return DisplayArea {
+                width: w,
+                height: h,
+                pixels: vec![0; (w * h) as usize],
+            };
+        }
+        if self.crt_w == w && self.crt_h == h && self.crt.len() == (w * h) as usize {
+            return DisplayArea {
+                width: w,
+                height: h,
+                pixels: self.crt.clone(),
+            };
         }
         DisplayArea {
             width: w,
             height: h,
-            pixels,
+            pixels: vec![0; (w * h) as usize],
         }
     }
 
@@ -891,7 +903,24 @@ impl Gpu {
         self.gp0(word);
     }
 
-    pub fn tick(&mut self, vblank: bool) {
+    pub fn tick(&mut self, line: u32, vblank: bool) {
+        if !vblank && self.display_enabled && line != self.crt_line {
+            let w = self.display_hres.max(1).min(640);
+            let h = self.display_vres.max(1).min(480);
+            if self.crt_w != w || self.crt_h != h {
+                self.crt_w = w;
+                self.crt_h = h;
+                self.crt.resize((w * h) as usize, 0);
+            }
+            if line < h {
+                let row = (line * w) as usize;
+                for x in 0..w {
+                    self.crt[row + x as usize] =
+                        self.read_half(self.display_x + x, self.display_y + line);
+                }
+            }
+            self.crt_line = line;
+        }
         if vblank && !self.in_vblank {
             self.odd_frame = !self.odd_frame;
             self.last_n30 = self.frame_n30;

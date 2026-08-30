@@ -197,7 +197,7 @@ impl Bus {
             }
             self.in_vblank = vblank;
         }
-        self.gpu.tick(self.in_vblank);
+        self.gpu.tick(self.scanline, self.in_vblank);
     }
 
     pub fn read8(&mut self, addr: u32) -> Option<u8> {
