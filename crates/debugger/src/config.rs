@@ -3,13 +3,33 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Cli {
     pub bios: Option<PathBuf>,
     pub disc: Option<PathBuf>,
     /// Headless: run to each vblank and capture the Display area.
     pub capture_at: Vec<u64>,
     pub capture_dir: Option<PathBuf>,
+    /// No window: run the Machine and print measurements on stdout.
+    pub headless: bool,
+    /// Stop after this many vblanks. None means until SIGINT.
+    pub until_vblank: Option<u64>,
+    /// Print one sample every this many vblanks (default 60 ≈ one NTSC second).
+    pub period: u64,
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            bios: None,
+            disc: None,
+            capture_at: Vec::new(),
+            capture_dir: None,
+            headless: false,
+            until_vblank: None,
+            period: 60,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -64,6 +84,20 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Cli {
             }
         } else if a == "--capture-dir" {
             cli.capture_dir = it.next().map(PathBuf::from);
+        } else if a == "--headless" {
+            cli.headless = true;
+        } else if a == "--until-vblank" {
+            if let Some(v) = it.next() {
+                cli.until_vblank = v.parse().ok();
+            }
+        } else if a == "--period" {
+            if let Some(v) = it.next() {
+                if let Ok(n) = v.parse::<u64>() {
+                    if n > 0 {
+                        cli.period = n;
+                    }
+                }
+            }
         }
     }
     cli
@@ -161,6 +195,30 @@ mod tests {
         ]);
         assert_eq!(c.capture_at, vec![150, 450, 500]);
         assert_eq!(c.capture_dir.unwrap(), PathBuf::from("shots"));
+        assert!(!c.headless);
+    }
+
+    #[test]
+    fn parse_cli_headless_defaults_period() {
+        let c = parse_cli(["rsx".into(), "--headless".into()]);
+        assert!(c.headless);
+        assert_eq!(c.until_vblank, None);
+        assert_eq!(c.period, 60);
+    }
+
+    #[test]
+    fn parse_cli_headless_until_and_period() {
+        let c = parse_cli([
+            "rsx".into(),
+            "--headless".into(),
+            "--until-vblank".into(),
+            "1200".into(),
+            "--period".into(),
+            "30".into(),
+        ]);
+        assert!(c.headless);
+        assert_eq!(c.until_vblank, Some(1200));
+        assert_eq!(c.period, 30);
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod spu;
 mod timers;
 
 pub use bios::BiosError;
+pub use cdrom::CdromView;
 pub use disc::DiscError;
 
 use std::path::Path;
@@ -140,6 +141,38 @@ impl Machine {
 
     pub fn gpustat(&self) -> u32 {
         self.bus.gpu().stat()
+    }
+
+    pub fn gpu_fifo_len(&self) -> usize {
+        self.bus.gpu().fifo_len()
+    }
+
+    pub fn gpu_draw_remaining(&self) -> u32 {
+        self.bus.gpu().draw_remaining()
+    }
+
+    pub fn gpu_busy(&self) -> bool {
+        self.bus.gpu().busy()
+    }
+
+    pub fn dma_job_mask(&self) -> u8 {
+        self.bus.dma().job_mask()
+    }
+
+    pub fn dma_chcr(&self, ch: usize) -> u32 {
+        self.bus.dma().chcr(ch)
+    }
+
+    pub fn write_queue_len(&self) -> usize {
+        self.bus.write_queue_len()
+    }
+
+    pub fn ram_blocked(&self) -> bool {
+        self.bus.ram_blocked()
+    }
+
+    pub fn cd_view(&self) -> CdromView {
+        self.bus.cdrom().view()
     }
 
     pub fn display_area(&self) -> DisplayArea {
@@ -445,6 +478,23 @@ mod tests {
         let bios = bios_with_program(&[0x3C08_0013]);
         let m = Machine::from_bios_path(bios.path()).unwrap();
         assert_eq!(m.pc(), 0xBFC0_0000);
+    }
+
+    #[test]
+    fn inspect_is_idle_on_reset() {
+        let bios = bios_with_program(&[0x3C08_0013]);
+        let m = Machine::from_bios_path(bios.path()).unwrap();
+        let cd = m.cd_view();
+        assert!(!cd.reading);
+        assert!(!cd.motor);
+        assert_eq!(cd.lba, 0);
+        assert!(cd.pending_cycles.is_none());
+        assert_eq!(cd.fifo_bytes, 0);
+        assert_eq!(m.dma_job_mask(), 0);
+        assert_eq!(m.gpu_fifo_len(), 0);
+        assert!(!m.gpu_busy());
+        assert_eq!(m.write_queue_len(), 0);
+        assert!(!m.ram_blocked());
     }
 
     #[test]

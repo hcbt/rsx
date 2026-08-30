@@ -1,6 +1,18 @@
 use crate::disc::Disc;
 use crate::irq::{self, Irq};
 
+/// Inspectable CD-ROM controller state. The Debugger prints this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CdromView {
+    pub status: u8,
+    pub controller: u8,
+    pub reading: bool,
+    pub motor: bool,
+    pub lba: u32,
+    pub pending_cycles: Option<u32>,
+    pub fifo_bytes: u32,
+}
+
 /// 33.8688 MHz / 75 sectors/s (1×). Mode bit 7 selects 2×.
 const CYCLES_PER_SECTOR_1X: u32 = 451_584;
 
@@ -175,12 +187,18 @@ impl Cdrom {
             0x08 => {
                 self.reading = false;
                 let stat = self.controller_stat();
-                (Some((0xC4E1, 3, vec![stat])), Some((0x00D3_8ACA, 2, vec![stat])))
+                (
+                    Some((0xC4E1, 3, vec![stat])),
+                    Some((0x00D3_8ACA, 2, vec![stat])),
+                )
             }
             0x09 => {
                 self.reading = false;
                 let stat = self.controller_stat();
-                (Some((0xC4E1, 3, vec![stat])), Some((0x0021_181C, 2, vec![stat])))
+                (
+                    Some((0xC4E1, 3, vec![stat])),
+                    Some((0x0021_181C, 2, vec![stat])),
+                )
             }
             0x0A => {
                 if self.disc.is_some() {
@@ -188,7 +206,10 @@ impl Cdrom {
                 }
                 self.reading = false;
                 let stat = self.controller_stat();
-                (Some((0x13CCE, 3, vec![stat])), Some((0xC4E1, 2, vec![stat])))
+                (
+                    Some((0x13CCE, 3, vec![stat])),
+                    Some((0xC4E1, 2, vec![stat])),
+                )
             }
             0x0C => (Some((0xC4E1, 3, vec![self.controller_stat()])), None), // Demute
             0x0E => {
@@ -201,7 +222,10 @@ impl Cdrom {
                 // SeekL
                 self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
                 let stat = self.controller_stat();
-                (Some((0xC4E1, 3, vec![stat])), Some((451_584, 2, vec![stat])))
+                (
+                    Some((0xC4E1, 3, vec![stat])),
+                    Some((451_584, 2, vec![stat])),
+                )
             }
             0x19 => {
                 let sub = self.param.first().copied().unwrap_or(0);
@@ -241,6 +265,18 @@ impl Cdrom {
                     vec![0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 )),
             ),
+        }
+    }
+
+    pub fn view(&self) -> CdromView {
+        CdromView {
+            status: self.status,
+            controller: self.controller_stat(),
+            reading: self.reading,
+            motor: self.motor,
+            lba: self.lba,
+            pending_cycles: self.pending.as_ref().map(|p| p.cycles),
+            fifo_bytes: self.fifo.len().saturating_sub(self.fifo_i) as u32,
         }
     }
 

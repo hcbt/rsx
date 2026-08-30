@@ -192,6 +192,10 @@ impl Gpu {
         (FIFO_WORDS.saturating_sub(self.fifo.len())) as u32
     }
 
+    pub fn fifo_len(&self) -> usize {
+        self.fifo.len()
+    }
+
     pub fn draw_remaining(&self) -> u32 {
         self.draw_busy
     }

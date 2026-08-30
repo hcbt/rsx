@@ -2,6 +2,7 @@ mod audio;
 mod capture;
 mod clock;
 mod config;
+mod headless;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -278,6 +279,13 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if cli.headless {
+        if let Err(e) = run_headless(bios, disc, cli.until_vblank, cli.period) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 720.0]),
         ..Default::default()
@@ -287,6 +295,22 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |_cc| Ok(Box::new(Debugger::new(bios, disc, cap_dir)))),
     )
+}
+
+fn run_headless(
+    bios: Result<PathBuf, String>,
+    disc: Result<Option<PathBuf>, String>,
+    until_vblank: Option<u64>,
+    period: u64,
+) -> Result<(), String> {
+    let bios = bios?;
+    let disc = disc?;
+    let mut machine = Machine::from_bios_path(&bios).map_err(|e| e.to_string())?;
+    if let Some(p) = disc {
+        machine.insert_disc(&p).map_err(|e| e.to_string())?;
+    }
+    headless::run(&mut machine, until_vblank, period, &mut std::io::stdout())
+        .map_err(|e| e.to_string())
 }
 
 fn run_capture(

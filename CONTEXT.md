@@ -21,7 +21,7 @@ The BIOS program after the Intro: the "insert PlayStation CD-ROM" screen and the
 _Avoid_: BIOS menu, OSD, dashboard, shell as a name for the host UI
 
 **Debugger**:
-The host egui UI for inspecting and controlling the emulated PlayStation.
+The host egui UI for inspecting and controlling the emulated PlayStation. `--headless` is the same binary without the window: it runs the Machine unpaced and prints one measurement line per period on stdout (guest vblank/PC/GPU/DMA/CD, host pace).
 _Avoid_: shell, frontend, GUI
 
 **Machine**:
@@ -53,7 +53,7 @@ A host PNG of the Display area, taken by the Debugger (`--capture-at`, or the Ca
 _Avoid_: screenshot, dump, framebuffer grab as the canonical name
 
 **Clock**:
-The SCPH-1001 master crystal at 33.8688 MHz. CPU, bus, DMA, GPU (including the CRT), SPU, CD-ROM, and timers all move on this clock. Host realtime is `origin_cycles + elapsed_ns × CPU_HZ / 1e9`. The Debugger runs the Machine until that cycle and presents the current Display area and PCM. The audio device is a speaker, not the clock. **Pace** is guest cycles and vblanks per wall second versus that crystal (33.87 MHz) and NTSC vblank (`CPU_HZ / (2160 × 263)` ≈ 59.62 Hz). The Debugger shows it live and logs when the host falls behind 95% of the crystal.
+The SCPH-1001 master crystal at 33.8688 MHz. CPU, bus, DMA, GPU (including the CRT), SPU, CD-ROM, and timers all move on this clock. Host realtime is `origin_cycles + elapsed_ns × CPU_HZ / 1e9`. The Debugger runs the Machine until that cycle and presents the current Display area and PCM. The audio device is a speaker, not the clock. **Pace** is guest cycles and vblanks per wall second versus that crystal (33.87 MHz) and NTSC vblank (`CPU_HZ / (2160 × 263)` ≈ 59.62 Hz). The Debugger shows it live and logs when the host falls behind 95% of the crystal. `--headless` prints that pace on stdout with the rest of the sample; it does not wait on wall time, so >100% is host throughput.
 _Avoid_: audio buffer as master clock, vsync as the guest clock, event delay as the guest clock
 
 **SPU**:

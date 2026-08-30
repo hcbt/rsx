@@ -82,6 +82,21 @@ impl Dma {
         self.jobs.iter().any(|j| j.is_some())
     }
 
+    /// Bit i set when channel i has a job on the bus.
+    pub fn job_mask(&self) -> u8 {
+        let mut m = 0u8;
+        for ch in 0..7 {
+            if self.jobs[ch].is_some() {
+                m |= 1 << ch;
+            }
+        }
+        m
+    }
+
+    pub fn chcr(&self, ch: usize) -> u32 {
+        self.chcr.get(ch).copied().unwrap_or(0)
+    }
+
     pub fn gpu_from_ram(&self) -> bool {
         match &self.jobs[2] {
             Some(Job::List { .. }) => true,

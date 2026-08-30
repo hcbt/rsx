@@ -104,6 +104,10 @@ impl Bus {
         &self.dma
     }
 
+    pub fn cdrom(&self) -> &Cdrom {
+        &self.cdrom
+    }
+
     pub fn insert_disc(&mut self, disc: crate::disc::Disc) {
         self.cdrom.insert(disc);
     }
