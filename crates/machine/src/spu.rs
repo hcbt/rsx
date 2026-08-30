@@ -5,7 +5,7 @@ include!("spu_gauss.rs");
 const SPU_RAM: usize = 512 * 1024;
 const CYCLES_PER_SAMPLE: u32 = 768;
 const VOICES: usize = 24;
-const SAMPLE_CAP: usize = 44_100 * 2 * 120;
+
 
 const FILTER: [[i32; 2]; 5] = [
     [0, 0],
@@ -278,10 +278,6 @@ impl Spu {
         } else {
             left = (left * voice_volume(self.regs[0xC0])) >> 15;
             right = (right * voice_volume(self.regs[0xC1])) >> 15;
-        }
-        if self.samples.len() >= SAMPLE_CAP {
-            let drop = self.samples.len() - SAMPLE_CAP + 2;
-            self.samples.drain(..drop);
         }
         self.samples.push(left.clamp(-0x8000, 0x7FFF) as i16);
         self.samples.push(right.clamp(-0x8000, 0x7FFF) as i16);

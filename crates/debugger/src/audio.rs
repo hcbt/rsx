@@ -6,10 +6,6 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample};
 
-/// Emergency cap (1 s). Drop oldest so a burst never cuts the current sound.
-/// Not a speed control — guest realtime is CPU_HZ versus wall.
-const MAX_FRAMES: usize = 44_100;
-
 struct PcmBuf {
     q: VecDeque<(i16, i16)>,
 }
@@ -23,9 +19,6 @@ impl PcmBuf {
 
     fn push_interleaved(&mut self, pcm: &[i16]) {
         for c in pcm.chunks_exact(2) {
-            if self.q.len() >= MAX_FRAMES {
-                self.q.pop_front();
-            }
             self.q.push_back((c[0], c[1]));
         }
     }
@@ -58,25 +51,13 @@ impl Output {
         config.channels = 2;
         let buf = Arc::new(Mutex::new(PcmBuf::new()));
         let err_fn = |e| eprintln!("audio stream: {e}");
-        let stream = match open(
+        let stream = open(
             &device,
             &config,
             supported.sample_format(),
             buf.clone(),
             err_fn,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                let fallback = supported.config();
-                open(
-                    &device,
-                    &fallback,
-                    supported.sample_format(),
-                    buf.clone(),
-                    err_fn,
-                )?
-            }
-        };
+        )?;
         stream.play().map_err(|e| format!("audio play: {e}"))?;
         Ok(Self {
             buf,
@@ -164,14 +145,15 @@ mod tests {
     }
 
     #[test]
-    fn overflow_keeps_the_newest_frame() {
+    fn queue_does_not_drop_frames() {
         let mut b = PcmBuf::new();
-        b.push_interleaved(&vec![7, 8].repeat(MAX_FRAMES));
+        let n = 44_100 + 10;
+        b.push_interleaved(&vec![7, 8].repeat(n));
         b.push_interleaved(&[9, 10]);
-        assert_eq!(b.len(), MAX_FRAMES);
-        for _ in 0..MAX_FRAMES - 1 {
+        assert_eq!(b.len(), n + 1);
+        for _ in 0..n {
             b.pop();
         }
-        assert_eq!(b.pop(), (9, 10), "the current sound must not be cut off");
+        assert_eq!(b.pop(), (9, 10));
     }
 }

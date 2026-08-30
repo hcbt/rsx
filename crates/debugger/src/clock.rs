@@ -4,8 +4,11 @@ use std::time::Duration;
 
 use rsx_machine::{cycles_in_nanos, CPU_HZ};
 
-/// Host wake-up floor so egui does not spin when guest and wall are in sync.
-pub const QUANTUM: Duration = Duration::from_millis(4);
+/// Wall time of one SPU sample (768 master cycles). In-sync wake, not a guessed floor.
+pub fn sample_period() -> Duration {
+    let ns = (768u128 * 1_000_000_000 + u128::from(CPU_HZ) - 1) / u128::from(CPU_HZ);
+    Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pace {
@@ -39,9 +42,12 @@ pub fn pace(guest_cycles: u64, origin_cycles: u64, elapsed: Duration) -> Pace {
         Pace::Run
     } else {
         let wait = wait_for_wall(guest_cycles, origin_cycles, elapsed)
-            .unwrap_or(Duration::ZERO)
-            .max(QUANTUM);
-        Pace::Wait(wait)
+            .unwrap_or(Duration::ZERO);
+        Pace::Wait(if wait.is_zero() {
+            sample_period()
+        } else {
+            wait
+        })
     }
 }
 
@@ -69,11 +75,13 @@ mod tests {
     }
 
     #[test]
-    fn in_sync_waits_a_quantum_instead_of_spinning() {
-        assert_eq!(pace(0, 0, Duration::ZERO), Pace::Wait(QUANTUM));
+    fn in_sync_waits_one_spu_sample() {
+        let sample = sample_period();
+        assert_eq!(sample, Duration::from_nanos(22_676));
+        assert_eq!(pace(0, 0, Duration::ZERO), Pace::Wait(sample));
         assert_eq!(
             pace(33_868_800, 0, Duration::from_secs(1)),
-            Pace::Wait(QUANTUM)
+            Pace::Wait(sample)
         );
     }
 
