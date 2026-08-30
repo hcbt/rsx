@@ -7,6 +7,9 @@ use serde::Deserialize;
 pub struct Cli {
     pub bios: Option<PathBuf>,
     pub disc: Option<PathBuf>,
+    /// Headless: run to each vblank and capture the Display area.
+    pub capture_at: Vec<u64>,
+    pub capture_dir: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]
@@ -54,9 +57,29 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Cli {
             cli.bios = it.next().map(PathBuf::from);
         } else if a == "--disc" {
             cli.disc = it.next().map(PathBuf::from);
+        } else if a == "--capture-at" {
+            if let Some(v) = it.next() {
+                cli.capture_at = parse_vblank_list(&v);
+            }
+        } else if a == "--capture-dir" {
+            cli.capture_dir = it.next().map(PathBuf::from);
         }
     }
     cli
+}
+
+fn parse_vblank_list(s: &str) -> Vec<u64> {
+    let mut v: Vec<u64> = s
+        .split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+pub fn capture_dir(cli: Option<PathBuf>) -> PathBuf {
+    cli.unwrap_or_else(|| PathBuf::from("target/rsx-display"))
 }
 
 #[cfg(test)]
@@ -127,6 +150,19 @@ mod tests {
         .unwrap();
         let got = resolve_disc(None, dir.path()).unwrap();
         assert_eq!(got, Some(PathBuf::from("from-toml.cue")));
+    }
+
+    #[test]
+    fn parse_cli_capture_at() {
+        let c = parse_cli([
+            "rsx".into(),
+            "--capture-at".into(),
+            "500,150,150,450".into(),
+            "--capture-dir".into(),
+            "shots".into(),
+        ]);
+        assert_eq!(c.capture_at, vec![150, 450, 500]);
+        assert_eq!(c.capture_dir.unwrap(), PathBuf::from("shots"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod capture;
 mod config;
 
 use std::path::PathBuf;
@@ -11,16 +12,22 @@ struct Debugger {
     running: bool,
     log: Vec<String>,
     texture: Option<egui::TextureHandle>,
+    capture_dir: PathBuf,
 }
 
 impl Debugger {
-    fn new(bios: Result<PathBuf, String>, disc: Result<Option<PathBuf>, String>) -> Self {
+    fn new(
+        bios: Result<PathBuf, String>,
+        disc: Result<Option<PathBuf>, String>,
+        capture_dir: PathBuf,
+    ) -> Self {
         let mut d = Self {
             machine: None,
             error: None,
             running: false,
             log: Vec::new(),
             texture: None,
+            capture_dir,
         };
         match (bios, disc) {
             (Ok(bios), Ok(disc)) => d.load(bios, disc),
@@ -84,6 +91,15 @@ impl eframe::App for Debugger {
                     m.run_until_vblank_count(n);
                 }
             }
+            if ui.button("Capture display").clicked() {
+                if let Some(m) = self.machine.as_ref() {
+                    let path = self.capture_dir.join("latest.png");
+                    match capture::write_png(&m.display_area(), &path) {
+                        Ok(()) => self.log.push(format!("captured {}", path.display())),
+                        Err(e) => self.log.push(e),
+                    }
+                }
+            }
         });
 
         egui::SidePanel::left("regs").resizable(true).show(ctx, |ui| {
@@ -133,23 +149,25 @@ impl eframe::App for Debugger {
 }
 
 fn area_to_color_image(area: &DisplayArea) -> egui::ColorImage {
-    let mut rgb = Vec::with_capacity((area.width * area.height * 3) as usize);
-    for p in &area.pixels {
-        let r = ((p & 0x1F) << 3) as u8;
-        let g = (((p >> 5) & 0x1F) << 3) as u8;
-        let b = (((p >> 10) & 0x1F) << 3) as u8;
-        rgb.push(r);
-        rgb.push(g);
-        rgb.push(b);
-    }
-    egui::ColorImage::from_rgb([area.width as usize, area.height as usize], &rgb)
+    egui::ColorImage::from_rgb(
+        [area.width as usize, area.height as usize],
+        &area.to_rgb888(),
+    )
 }
 
 fn main() -> eframe::Result<()> {
     let cli = config::parse_cli(std::env::args());
     let cwd = std::path::Path::new(".");
-    let bios = config::resolve_bios(cli.bios, cwd);
-    let disc = config::resolve_disc(cli.disc, cwd);
+    let bios = config::resolve_bios(cli.bios.clone(), cwd);
+    let disc = config::resolve_disc(cli.disc.clone(), cwd);
+    let cap_dir = config::capture_dir(cli.capture_dir.clone());
+    if !cli.capture_at.is_empty() {
+        if let Err(e) = run_capture(bios, disc, &cap_dir, &cli.capture_at) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 720.0]),
         ..Default::default()
@@ -157,6 +175,25 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "rsx",
         options,
-        Box::new(move |_cc| Ok(Box::new(Debugger::new(bios, disc)))),
+        Box::new(move |_cc| Ok(Box::new(Debugger::new(bios, disc, cap_dir)))),
     )
+}
+
+fn run_capture(
+    bios: Result<PathBuf, String>,
+    disc: Result<Option<PathBuf>, String>,
+    dir: &std::path::Path,
+    at: &[u64],
+) -> Result<(), String> {
+    let bios = bios?;
+    let disc = disc?;
+    let mut machine = Machine::from_bios_path(&bios).map_err(|e| e.to_string())?;
+    if let Some(p) = disc {
+        machine.insert_disc(&p).map_err(|e| e.to_string())?;
+    }
+    let written = capture::capture_at_vblanks(&mut machine, dir, at)?;
+    for p in written {
+        eprintln!("captured {}", p.display());
+    }
+    Ok(())
 }

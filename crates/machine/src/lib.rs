@@ -32,6 +32,19 @@ pub struct DisplayArea {
     pub pixels: Vec<u16>,
 }
 
+impl DisplayArea {
+    /// 8-bit RGB, row-major, 3 bytes per pixel. The Debugger captures this.
+    pub fn to_rgb888(&self) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(self.pixels.len() * 3);
+        for p in &self.pixels {
+            rgb.push(((p & 0x1F) << 3) as u8);
+            rgb.push((((p >> 5) & 0x1F) << 3) as u8);
+            rgb.push((((p >> 10) & 0x1F) << 3) as u8);
+        }
+        rgb
+    }
+}
+
 pub struct Machine {
     cpu: Cpu,
     bus: Bus,
@@ -232,6 +245,16 @@ mod tests {
         f.write_all(&data).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn display_area_to_rgb888_expands_rgb555() {
+        let area = DisplayArea {
+            width: 1,
+            height: 1,
+            pixels: vec![0x001F],
+        };
+        assert_eq!(area.to_rgb888(), vec![0xF8, 0, 0]);
     }
 
     #[test]

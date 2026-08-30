@@ -48,6 +48,10 @@ _Avoid_: framebuffer as the name for the whole memory
 The rectangle of VRAM the GPU currently outputs as the visible picture.
 _Avoid_: screen, framebuffer when you mean this rectangle
 
+**Capture**:
+A host PNG of the Display area, taken by the Debugger (`--capture-at`, or the Capture display control). This is how the picture is inspected without sitting in the window.
+_Avoid_: screenshot, dump, framebuffer grab as the canonical name
+
 **SPU**:
 The PlayStation sound processor, with its own 512 KiB RAM. In the first proof it answers the BIOS but produces no host audio; the Intro jingle is the next proof.
 _Avoid_: audio, mixer
