@@ -663,7 +663,10 @@ impl Gpu {
             return;
         }
         // SPX: polygons are displayed up to <excluding> their lower-right
-        // coordinates (top/left edges in, right/bottom vertex coords out).
+        // coordinates. A pixel on an edge (weight 0) is inside; only the
+        // triangle's max vertex x/y are skipped. `(w ^ area) < 0` rejects
+        // weight 0 when area < 0, which punches a 1px hole on every shared
+        // edge of a clockwise mesh.
         let max_vx = a.0.max(b.0).max(c.0);
         let max_vy = a.1.max(b.1).max(c.1);
         for y in miny..=maxy {
@@ -677,7 +680,10 @@ impl Gpu {
                 let w0 = orient(b.0, b.1, c.0, c.1, x, y);
                 let w1 = orient(c.0, c.1, a.0, a.1, x, y);
                 let w2 = orient(a.0, a.1, b.0, b.1, x, y);
-                if (w0 ^ area) < 0 || (w1 ^ area) < 0 || (w2 ^ area) < 0 {
+                if (w0 != 0 && (w0 ^ area) < 0)
+                    || (w1 != 0 && (w1 ^ area) < 0)
+                    || (w2 != 0 && (w2 ^ area) < 0)
+                {
                     continue;
                 }
                 let sum = w0 + w1 + w2;
@@ -1729,6 +1735,53 @@ mod tests {
         assert_eq!(right, 0, "x=max vertex must not plot");
         assert_eq!(bottom, 0, "y=max vertex must not plot");
         assert!(interior > 0, "interior of the triangle must still plot");
+    }
+
+    #[test]
+    fn quad_split_leaves_no_holes_on_the_shared_diagonal() {
+        // SPX: a quad is triangles (v1,v2,v3) and (v2,v3,v4). Lower-right
+        // coordinates are excluded, so [2,10)×[2,10) must be solid.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(2, 2));
+        gpu.gp0(xy(10, 2));
+        gpu.gp0(xy(2, 10));
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(10, 2));
+        gpu.gp0(xy(2, 10));
+        gpu.gp0(xy(10, 10));
+        let pix = peek(&mut gpu, 2, 2, 8, 8);
+        let missing = pix.pixels.iter().filter(|p| *p & 0x7FFF == 0).count();
+        assert_eq!(
+            missing, 0,
+            "shared diagonal must not leave holes ({missing} of 64 unfilled)"
+        );
+    }
+
+    #[test]
+    fn clockwise_pair_sharing_a_diagonal_leaves_no_holes() {
+        // Both triangles clockwise (area < 0). Crash title keeps negative
+        // NCLIP, so the face mesh is this case. SPX only excludes the
+        // lower-right vertex coordinates; a pixel on the shared edge is in.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(2, 2));
+        gpu.gp0(xy(2, 10));
+        gpu.gp0(xy(10, 2));
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(10, 2));
+        gpu.gp0(xy(2, 10));
+        gpu.gp0(xy(10, 10));
+        let pix = peek(&mut gpu, 2, 2, 8, 8);
+        let missing = pix.pixels.iter().filter(|p| *p & 0x7FFF == 0).count();
+        assert_eq!(
+            missing, 0,
+            "clockwise shared diagonal must not leave holes ({missing} of 64 unfilled)"
+        );
     }
 
     #[test]
