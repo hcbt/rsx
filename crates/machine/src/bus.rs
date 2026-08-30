@@ -116,6 +116,10 @@ impl Bus {
         self.vblanks
     }
 
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.spu.take_samples()
+    }
+
     pub fn memctrl_bios_delay(&self) -> u32 {
         self.memctrl[4]
     }
@@ -174,6 +178,9 @@ impl Bus {
         self.timers.tick(cycles, &mut self.irq);
         self.cdrom.tick(cycles, &mut self.irq);
         self.spu.tick(cycles);
+        if self.spu.take_irq() {
+            self.irq.raise(crate::irq::IRQ_SPU);
+        }
         self.dma.tick(cycles, &mut self.irq);
         let line = ((self.cycles / CYCLES_PER_LINE) as u32) % LINES_PER_FRAME;
         if line != self.scanline {

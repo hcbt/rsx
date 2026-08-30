@@ -53,7 +53,7 @@ A host PNG of the Display area, taken by the Debugger (`--capture-at`, or the Ca
 _Avoid_: screenshot, dump, framebuffer grab as the canonical name
 
 **SPU**:
-The PlayStation sound processor, with its own 512 KiB RAM. In the first proof it answers the BIOS but produces no host audio; the Intro jingle is the next proof.
+The PlayStation sound processor, with its own 512 KiB RAM. It mixes 24 ADPCM voices to 44100 Hz stereo PCM. The Debugger plays that and `--capture-at` writes `audio.wav`. CD-XA and reverb are not implemented.
 _Avoid_: audio, mixer
 
 **CD-ROM**:

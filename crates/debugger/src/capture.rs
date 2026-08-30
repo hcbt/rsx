@@ -4,6 +4,40 @@ use std::path::Path;
 
 use rsx_machine::{DisplayArea, Machine};
 
+pub fn write_wav(pcm: &[i16], path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("capture dir: {e}"))?;
+        }
+    }
+    let mut file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let nchan = 2u16;
+    let rate = 44100u32;
+    let bits = 16u16;
+    let data_bytes = (pcm.len() * 2) as u32;
+    let mut hdr = Vec::new();
+    hdr.extend_from_slice(b"RIFF");
+    hdr.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    hdr.extend_from_slice(b"WAVE");
+    hdr.extend_from_slice(b"fmt ");
+    hdr.extend_from_slice(&16u32.to_le_bytes());
+    hdr.extend_from_slice(&1u16.to_le_bytes());
+    hdr.extend_from_slice(&nchan.to_le_bytes());
+    hdr.extend_from_slice(&rate.to_le_bytes());
+    hdr.extend_from_slice(&(rate * u32::from(nchan) * u32::from(bits) / 8).to_le_bytes());
+    hdr.extend_from_slice(&(nchan * bits / 8).to_le_bytes());
+    hdr.extend_from_slice(&bits.to_le_bytes());
+    hdr.extend_from_slice(b"data");
+    hdr.extend_from_slice(&data_bytes.to_le_bytes());
+    use std::io::Write;
+    file.write_all(&hdr).map_err(|e| format!("wav header: {e}"))?;
+    for s in pcm {
+        file.write_all(&s.to_le_bytes())
+            .map_err(|e| format!("wav data: {e}"))?;
+    }
+    Ok(())
+}
+
 pub fn write_png(area: &DisplayArea, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -28,6 +62,7 @@ pub fn capture_at_vblanks(
 ) -> Result<Vec<std::path::PathBuf>, String> {
     fs::create_dir_all(dir).map_err(|e| format!("capture dir: {e}"))?;
     let mut written = Vec::new();
+    let mut audio = Vec::new();
     for &n in vblanks {
         machine.run_until_vblank_count(n);
         let area = machine.display_area();
@@ -35,6 +70,17 @@ pub fn capture_at_vblanks(
         write_png(&area, &path)?;
         let latest = dir.join("latest.png");
         write_png(&area, &latest)?;
+        let pcm = machine.take_audio();
+        audio.extend_from_slice(&pcm);
+        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let wav = dir.join("audio.wav");
+        write_wav(&audio, &wav)?;
+        eprintln!(
+            "  audio {} +{} frames peak={peak} total_frames={}",
+            wav.display(),
+            pcm.len() / 2,
+            audio.len() / 2
+        );
         let (dx, dy, dw, dh, on) = machine.display_origin();
         let (ox, oy, x1, y1, x2, y2) = machine.draw_env();
         let (n30, px0, px1, py0, py1, nout) = machine.last_gouraud_tri_stats();
@@ -650,5 +696,16 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert_eq!(&data[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         assert!(path.metadata().unwrap().len() > 32);
+    }
+
+    #[test]
+    fn write_wav_has_riff_header_and_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.wav");
+        write_wav(&[0, 0, 16, -16], &path).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(&data[0..4], b"RIFF");
+        assert_eq!(&data[8..12], b"WAVE");
+        assert_eq!(data.len(), 44 + 8);
     }
 }

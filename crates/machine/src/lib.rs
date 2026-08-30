@@ -92,6 +92,11 @@ impl Machine {
         self.vblank_count = self.bus.vblank_count();
     }
 
+    /// Interleaved stereo i16 at 44100 Hz, drained since the last take.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.bus.take_audio()
+    }
+
     pub fn pc(&self) -> u32 {
         self.cpu.pc()
     }
@@ -595,6 +600,25 @@ mod tests {
             m.exception_log().iter().all(|e| e.0 != 9),
             "Intro hit BREAK (exc={:?})",
             m.exception_log()
+        );
+    }
+
+    #[test]
+    fn intro_jingle_is_audible_when_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        if !path.exists() {
+            eprintln!("skipping: no local SCPH1001.BIN");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&path).unwrap();
+        m.run_until_vblank_count(250);
+        let pcm = m.take_audio();
+        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let energy: u64 = pcm.iter().map(|s| u64::from(s.unsigned_abs())).sum();
+        assert!(
+            peak > 512 && energy > 10_000,
+            "Intro jingle must mix non-silent PCM (peak={peak} energy={energy} n={})",
+            pcm.len()
         );
     }
 

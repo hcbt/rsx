@@ -1,3 +1,4 @@
+mod audio;
 mod capture;
 mod config;
 
@@ -13,6 +14,7 @@ struct Debugger {
     log: Vec<String>,
     texture: Option<egui::TextureHandle>,
     capture_dir: PathBuf,
+    audio: Option<audio::Output>,
 }
 
 impl Debugger {
@@ -28,7 +30,12 @@ impl Debugger {
             log: Vec::new(),
             texture: None,
             capture_dir,
+            audio: None,
         };
+        match audio::Output::start() {
+            Ok(o) => d.audio = Some(o),
+            Err(e) => d.log.push(format!("host audio: {e}")),
+        }
         match (bios, disc) {
             (Ok(bios), Ok(disc)) => d.load(bios, disc),
             (Err(e), _) | (_, Err(e)) => d.error = Some(e),
@@ -66,6 +73,10 @@ impl eframe::App for Debugger {
             if let Some(m) = self.machine.as_mut() {
                 let target = m.vblank_count() + 1;
                 m.run_until_vblank_count(target);
+                let pcm = m.take_audio();
+                if let Some(a) = self.audio.as_ref() {
+                    a.push(&pcm);
+                }
             }
             ctx.request_repaint();
         }
