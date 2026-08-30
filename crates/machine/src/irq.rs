@@ -15,9 +15,7 @@ impl Irq {
     }
 
     pub fn raise(&mut self, bit: u8) {
-        let prev = self.stat;
         self.stat |= 1 << bit;
-        let _ = prev;
     }
 
     pub fn pending_for_cop0(&self) -> bool {
