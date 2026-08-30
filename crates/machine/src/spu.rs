@@ -6,14 +6,7 @@ const SPU_RAM: usize = 512 * 1024;
 const CYCLES_PER_SAMPLE: u32 = 768;
 const VOICES: usize = 24;
 
-
-const FILTER: [[i32; 2]; 5] = [
-    [0, 0],
-    [60, 0],
-    [115, -52],
-    [98, -55],
-    [122, -60],
-];
+const FILTER: [[i32; 2]; 5] = [[0, 0], [60, 0], [115, -52], [98, -55], [122, -60]];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -581,10 +574,7 @@ mod tests {
                 + i32::from(GAUSS[0x1FF - i])
                 + i32::from(GAUSS[0x100 + i])
                 + i32::from(GAUSS[i]);
-            assert!(
-                (sum - 0x7F80).abs() <= 2,
-                "gauss taps at {i} sum {sum:#X}"
-            );
+            assert!((sum - 0x7F80).abs() <= 2, "gauss taps at {i} sum {sum:#X}");
         }
     }
 }

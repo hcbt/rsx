@@ -25,6 +25,8 @@ pub struct Cpu {
     branch_delay: bool,
     in_delay: bool,
     icache: Vec<ICacheLine>,
+    data_cycles: u32,
+    muldiv_busy: u32,
     last_exception: Option<(u8, u32, u32)>,
     pub exception_log: Vec<(u8, u32, u32)>,
     /// First CPU store of Crash title trans.y (NTSC-U 0x800566B4+0x84) that is not 0.
@@ -53,6 +55,8 @@ impl Cpu {
             exception_log: Vec::new(),
             trans_y_write: None,
             trans_y_writes: Vec::new(),
+            data_cycles: 0,
+            muldiv_busy: 0,
             icache: (0..ICACHE_LINES)
                 .map(|_| ICacheLine {
                     tag: 0,
@@ -199,19 +203,23 @@ impl Cpu {
         let irq = self.cop0.iec() && (self.cop0.cause & self.cop0.sr & 0xFF00) != 0;
         if irq && !self.in_delay {
             self.exception(bus, cop0::EXC_INT, 0);
+            bus.tick(1);
             return;
         }
 
         if self.current_pc & 3 != 0 {
             self.cop0.badvaddr = self.current_pc;
             self.exception(bus, cop0::EXC_ADEL, 0);
+            bus.tick(1);
             return;
         }
 
-        let instr = match self.fetch(bus) {
-            Some(w) => w,
+        self.data_cycles = 0;
+        let (instr, fetch_c) = match self.fetch(bus) {
+            Some(x) => x,
             None => {
                 self.exception(bus, cop0::EXC_IBE, 0);
+                bus.tick(1);
                 return;
             }
         };
@@ -228,15 +236,23 @@ impl Cpu {
                 self.gpr[reg as usize] = val;
             }
         }
-        bus.tick(2);
+        let extra = if fetch_c <= 1 {
+            self.data_cycles.saturating_sub(1)
+        } else {
+            self.data_cycles
+        };
+        let total = fetch_c.max(1) + extra;
+        self.muldiv_busy = self.muldiv_busy.saturating_sub(total);
+        bus.tick(total);
     }
 
-    fn fetch(&mut self, bus: &mut Bus) -> Option<u32> {
+    fn fetch(&mut self, bus: &mut Bus) -> Option<(u32, u32)> {
         let addr = self.current_pc;
         let cached = (addr >> 29) != 5; // not KSEG1
         let icache_on = bus.cache_ctrl() & (1 << 11) != 0;
         if !cached || self.cop0.isolate_cache() || !icache_on {
-            return bus.read32(addr);
+            let w = bus.read32(addr)?;
+            return Some((w, bus.access_cycles(addr, false, 4)));
         }
         let phys = addr & 0x1FFF_FFFF;
         let line = ((phys >> 4) & 0xFF) as usize;
@@ -247,16 +263,20 @@ impl Cpu {
             c.tag = tag;
             c.valid = 0;
             let base = addr & !0xF;
+            let ac = bus.access_cycles(base, false, 4);
+            let mut n = 0u32;
             for i in word..4 {
                 if let Some(w) = bus.read32(base + (i as u32) * 4) {
                     c.data[i] = w;
                     c.valid |= 1 << i;
+                    n += 1;
                 } else {
                     return None;
                 }
             }
+            return Some((self.icache[line].data[word], ac.saturating_mul(n.max(1))));
         }
-        Some(self.icache[line].data[word])
+        Some((self.icache[line].data[word], 1))
     }
 
     fn exception(&mut self, _bus: &mut Bus, code: u8, ce: u8) {
@@ -360,19 +380,29 @@ impl Cpu {
             0x09 => self.jr(self.gpr(rs), Some(rd)),
             0x0C => self.exception(bus, cop0::EXC_SYS, 0),
             0x0D => self.exception(bus, cop0::EXC_BP, 0),
-            0x10 => self.set_gpr(rd, self.hi),
+            0x10 => {
+                self.data_cycles = self.data_cycles.max(self.muldiv_busy);
+                self.muldiv_busy = 0;
+                self.set_gpr(rd, self.hi);
+            }
             0x11 => self.hi = self.gpr(rs),
-            0x12 => self.set_gpr(rd, self.lo),
+            0x12 => {
+                self.data_cycles = self.data_cycles.max(self.muldiv_busy);
+                self.muldiv_busy = 0;
+                self.set_gpr(rd, self.lo);
+            }
             0x13 => self.lo = self.gpr(rs),
             0x18 => {
                 let r = (self.gpr(rs) as i32 as i64) * (self.gpr(rt) as i32 as i64);
                 self.lo = r as u32;
                 self.hi = (r >> 32) as u32;
+                self.muldiv_busy = self.muldiv_busy.max(mult_cycles(self.gpr(rs)));
             }
             0x19 => {
                 let r = u64::from(self.gpr(rs)) * u64::from(self.gpr(rt));
                 self.lo = r as u32;
                 self.hi = (r >> 32) as u32;
+                self.muldiv_busy = self.muldiv_busy.max(multu_cycles(self.gpr(rs)));
             }
             0x1A => {
                 let n = self.gpr(rs) as i32;
@@ -387,6 +417,7 @@ impl Cpu {
                     self.lo = (n / d) as u32;
                     self.hi = (n % d) as u32;
                 }
+                self.muldiv_busy = self.muldiv_busy.max(36);
             }
             0x1B => {
                 let n = self.gpr(rs);
@@ -398,6 +429,7 @@ impl Cpu {
                     self.lo = n / d;
                     self.hi = n % d;
                 }
+                self.muldiv_busy = self.muldiv_busy.max(36);
             }
             0x20 => {
                 if self.add_reg(rd, rs, rt, true) {
@@ -547,6 +579,12 @@ impl Cpu {
             self.delay_load(rt, 0);
             return;
         }
+        let bytes = match width {
+            Width::Byte => 1,
+            Width::Half => 2,
+            Width::Word => 4,
+        };
+        self.data_cycles = self.data_cycles.max(bus.access_cycles(addr, false, bytes));
         match width {
             Width::Byte => {
                 let v = bus.read8(addr).unwrap_or(0);
@@ -644,6 +682,7 @@ impl Cpu {
 
     fn lwl(&mut self, bus: &mut Bus, rt: u8, addr: u32) {
         let aligned = addr & !3;
+        self.data_cycles = self.data_cycles.max(bus.access_cycles(aligned, false, 4));
         let word = bus.read32(aligned).unwrap_or(0);
         let cur = self
             .incoming_load
@@ -661,6 +700,7 @@ impl Cpu {
 
     fn lwr(&mut self, bus: &mut Bus, rt: u8, addr: u32) {
         let aligned = addr & !3;
+        self.data_cycles = self.data_cycles.max(bus.access_cycles(aligned, false, 4));
         let word = bus.read32(aligned).unwrap_or(0);
         let cur = self
             .incoming_load
@@ -708,6 +748,7 @@ impl Cpu {
             self.exception(bus, cop0::EXC_ADEL, 0);
             return;
         }
+        self.data_cycles = self.data_cycles.max(bus.access_cycles(addr, false, 4));
         let v = bus.read32(addr).unwrap_or(0);
         self.gte.write_data(rt, v);
     }
@@ -726,4 +767,25 @@ enum Width {
     Byte,
     Half,
     Word,
+}
+
+fn multu_cycles(rs: u32) -> u32 {
+    if rs <= 0x7FF {
+        6
+    } else if rs <= 0xF_FFFF {
+        9
+    } else {
+        13
+    }
+}
+
+fn mult_cycles(rs: u32) -> u32 {
+    let s = rs as i32;
+    if (-0x800..=0x7FF).contains(&s) {
+        6
+    } else if (0x800..=0xF_FFFF).contains(&s) || (-0x10_0000..=-0x7FF).contains(&s) {
+        9
+    } else {
+        13
+    }
 }

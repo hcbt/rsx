@@ -597,14 +597,33 @@ mod tests {
         let mut m = Machine::from_bios_path(bios.path()).unwrap();
         let c0 = m.cycles();
         m.step();
-        assert_eq!(
-            m.cycles() - c0,
-            2,
-            "CPU currently accounts 2 clocks per insn"
+        let first = m.cycles() - c0;
+        assert!(
+            (27..=33).contains(&first),
+            "uncached BIOS fetch is 27..33 (SPX), got {first}"
         );
+        let c1 = m.cycles();
         m.step();
-        assert_eq!(m.cycles() - c0, 4);
+        let second = m.cycles() - c1;
+        assert!(
+            (27..=33).contains(&second),
+            "second BIOS fetch is 27..33, got {second}"
+        );
         assert_eq!(CPU_HZ % 768, 0, "SPU 44100 must divide the master crystal");
+    }
+
+    #[test]
+    fn ram_word_load_from_bios_adds_seven() {
+        // lw t0, 0(zero)  — data from RAM, fetch from uncached BIOS.
+        let bios = bios_with_program(&[0x8C08_0000]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        let c0 = m.cycles();
+        m.step();
+        let dt = m.cycles() - c0;
+        assert!(
+            (34..=40).contains(&dt),
+            "BIOS fetch 27..33 plus RAM lw 7, got {dt}"
+        );
     }
 
     #[test]
@@ -625,7 +644,7 @@ mod tests {
         m.run_until_cycle(c0 + 100);
         assert!(m.cycles() >= c0 + 100, "must not stop short of the target");
         assert!(
-            m.cycles() < c0 + 100 + 2,
+            m.cycles() < c0 + 100 + 64,
             "must not overshoot more than one instruction (got {})",
             m.cycles() - c0
         );
@@ -663,7 +682,7 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        m.run_until_vblank_count(150);
+        m.run_until_vblank_count(400);
         assert_ne!(m.pc(), 0xBFC0_0000, "CPU did not leave the reset vector");
         assert_eq!(
             m.bios_delay(),
@@ -719,7 +738,7 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        m.run_until_vblank_count(500);
+        m.run_until_vblank_count(700);
         assert_ne!(
             m.pc() & 0xFFFF,
             0x45D0,
@@ -750,7 +769,7 @@ mod tests {
             return;
         }
         let mut m = Machine::from_bios_path(&path).unwrap();
-        m.run_until_vblank_count(100);
+        m.run_until_vblank_count(250);
         let tex = m.vram_rect(640, 0, 320, 240);
         let tex_lit = tex.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
         assert!(
@@ -774,7 +793,7 @@ mod tests {
             "disabled display must be blank, not the uploaded texpage (display_lit={display_lit} tex_lit={tex_lit})"
         );
 
-        m.run_until_vblank_count(150);
+        m.run_until_vblank_count(350);
         let diamond = m.display_area();
         assert_eq!((diamond.width, diamond.height), (640, 480));
         let diamond_lit = diamond.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
@@ -783,7 +802,7 @@ mod tests {
             "diamond / fade must occupy the GP1 display rectangle (lit={diamond_lit})"
         );
 
-        m.run_until_vblank_count(250);
+        m.run_until_vblank_count(400);
         let display = m.display_area();
         assert_eq!((display.width, display.height), (640, 480));
         let fill = display.pixels[0] & 0x7FFF;
@@ -837,7 +856,7 @@ mod tests {
         let cue = write_america_cue(dir.path());
         let mut m = Machine::from_bios_path(&path).unwrap();
         m.insert_disc(&cue).unwrap();
-        m.run_until_vblank_count(500);
+        m.run_until_vblank_count(800);
         assert_ne!(
             m.pc() & 0xFFFFF000,
             0x8003_D000,
@@ -865,12 +884,12 @@ mod tests {
         }
         let mut m = Machine::from_bios_path(&bios).unwrap();
         m.insert_disc(&disc).unwrap();
-        m.run_until_vblank_count(620);
+        m.run_until_vblank_count(1000);
         let (dx, dy, dw, dh, _) = m.display_origin();
         assert_eq!(
             (dw, dh),
             (640, 480),
-            "CD 2× must still be on the licensed logo at vblank 620, not Crash 512×240 (pc={:08X} origin=({dx},{dy}) {dw}×{dh})",
+            "CD 2× must still be on the licensed logo at vblank 1000, not Crash 512×240 (pc={:08X} origin=({dx},{dy}) {dw}×{dh})",
             m.pc()
         );
         let black = m
@@ -897,7 +916,7 @@ mod tests {
         }
         let mut m = Machine::from_bios_path(&bios).unwrap();
         m.insert_disc(&disc).unwrap();
-        m.run_until_vblank_count(550);
+        m.run_until_vblank_count(800);
         let area = m.display_area();
         assert_eq!((area.width, area.height), (640, 480));
         let w = area.width as usize;

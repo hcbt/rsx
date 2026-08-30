@@ -41,8 +41,7 @@ pub fn pace(guest_cycles: u64, origin_cycles: u64, elapsed: Duration) -> Pace {
     if guest_cycles < target_cycles(origin_cycles, elapsed) {
         Pace::Run
     } else {
-        let wait = wait_for_wall(guest_cycles, origin_cycles, elapsed)
-            .unwrap_or(Duration::ZERO);
+        let wait = wait_for_wall(guest_cycles, origin_cycles, elapsed).unwrap_or(Duration::ZERO);
         Pace::Wait(if wait.is_zero() {
             sample_period()
         } else {

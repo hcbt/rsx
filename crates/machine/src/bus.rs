@@ -363,6 +363,66 @@ impl Bus {
             _ => {}
         }
     }
+
+    /// SPX bus occupancy for a transfer of `bytes` (1, 2, or 4).
+    pub fn access_cycles(&self, addr: u32, write: bool, bytes: u32) -> u32 {
+        let p = phys(addr);
+        match p {
+            0x0000_0000..=0x007F_FFFF => 7,
+            0x1F80_0000..=0x1F80_03FF => 1,
+            0x1FC0_0000..=0x1FFF_FFFF => self.region_cycles(4, write, bytes),
+            0x1F80_1800..=0x1F80_1803 => self.region_cycles(6, write, bytes.min(1)),
+            0x1F80_1C00..=0x1F80_1FFF => self.region_cycles(5, write, bytes.min(2)),
+            _ => 5,
+        }
+    }
+
+    fn region_cycles(&self, memctrl_i: usize, write: bool, bytes: u32) -> u32 {
+        let cfg = self.memctrl[memctrl_i];
+        let com = self.memctrl[8];
+        let access = if write { cfg & 0xF } else { (cfg >> 4) & 0xF } + 1;
+        let width16 = cfg & (1 << 12) != 0;
+        let beats = if width16 {
+            bytes.div_ceil(2).max(1)
+        } else {
+            bytes.max(1)
+        };
+        let com0 = com & 0xF;
+        let com2 = (com >> 8) & 0xF;
+        let com3 = (com >> 12) & 0xF;
+        let mut first = 0i32;
+        let mut seq = 0i32;
+        let mut min = 0i32;
+        if cfg & (1 << 8) != 0 {
+            first += com0 as i32 - 1;
+            seq += com0 as i32 - 1;
+        }
+        if cfg & (1 << 10) != 0 {
+            first += com2 as i32;
+            seq += com2 as i32;
+        }
+        if cfg & (1 << 11) != 0 {
+            min = com3 as i32;
+        }
+        if first < 6 {
+            first += 1;
+        }
+        first += access as i32 + 2;
+        seq += access as i32 + 2;
+        if first < min + 6 {
+            first = min + 6;
+        }
+        if seq < min + 2 {
+            seq = min + 2;
+        }
+        let first = first.max(1) as u32;
+        let seq = seq.max(1) as u32;
+        if beats <= 1 {
+            first
+        } else {
+            first + seq * (beats - 1)
+        }
+    }
 }
 
 fn phys(addr: u32) -> u32 {
