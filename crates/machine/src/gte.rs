@@ -4,6 +4,19 @@
 pub struct Gte {
     data: [u32; 32],
     ctrl: [u32; 32],
+    pub last_hi_sy: i32,
+    pub last_hi_ir2: i32,
+    pub last_hi_n: u32,
+    pub last_hi_sz: u32,
+    pub last_hi_vy: i32,
+    pub last_hi_try: i32,
+    pub last_hi_trz: i32,
+    pub title_explode: u32,
+    pub title_ir2_min: i32,
+    pub title_ir2_max: i32,
+    pub title_vy_min: i32,
+    pub title_vy_max: i32,
+    pub op_counts: [u32; 64],
 }
 
 impl Gte {
@@ -11,6 +24,19 @@ impl Gte {
         Self {
             data: [0; 32],
             ctrl: [0; 32],
+            last_hi_sy: 0,
+            last_hi_ir2: 0,
+            last_hi_n: 0,
+            last_hi_sz: 0,
+            last_hi_vy: 0,
+            last_hi_try: 0,
+            last_hi_trz: 0,
+            title_explode: 0,
+            title_ir2_min: i32::MAX,
+            title_ir2_max: i32::MIN,
+            title_vy_min: i32::MAX,
+            title_vy_max: i32::MIN,
+            op_counts: [0; 64],
         }
     }
 
@@ -41,6 +67,10 @@ impl Gte {
                 self.data[11] = b;
             }
             29 | 31 => {}
+            1 | 3 | 5 | 8 | 9 | 10 | 11 => {
+                self.data[reg as usize] = sign16(value as u16) as u32;
+            }
+            7 | 16 | 17 | 18 | 19 => self.data[reg as usize] = value & 0xFFFF,
             r => self.data[r as usize] = value,
         }
     }
@@ -54,7 +84,10 @@ impl Gte {
     }
 
     pub fn write_control(&mut self, reg: u8, value: u32) {
-        self.ctrl[reg as usize] = value;
+        self.ctrl[reg as usize] = match reg {
+            4 | 12 | 20 | 26 | 27 | 29 | 30 => sign16(value as u16) as u32,
+            _ => value,
+        };
     }
 
     pub fn command(&mut self, instr: u32) {
@@ -62,6 +95,7 @@ impl Gte {
         let sf = (instr >> 19) & 1;
         let lm = (instr >> 10) & 1 != 0;
         self.ctrl[31] = 0;
+        self.op_counts[op as usize] = self.op_counts[op as usize].saturating_add(1);
         match op {
             0x01 => self.rtps(sf, lm),
             0x06 => self.nclip(),
@@ -70,12 +104,14 @@ impl Gte {
             0x11 => self.intpl(sf, lm),
             0x12 => self.mvmva(instr, sf, lm),
             0x13 => self.ncds(sf, lm),
+            0x14 => self.cdp(sf, lm),
             0x16 => {
                 self.ncds(sf, lm);
                 self.ncd_vector(1, sf, lm);
                 self.ncd_vector(2, sf, lm);
             }
             0x1B => self.nccs(sf, lm),
+            0x1C => self.cc(sf, lm),
             0x1E => self.ncs(sf, lm),
             0x20 => {
                 self.ncs(sf, lm);
@@ -219,6 +255,9 @@ impl Gte {
         self.data[18] = self.data[19];
         self.data[19] = sz;
         let n = unr_divide(self.ctrl[26] as u16, sz as u16, &mut self.ctrl[31]);
+        if self.ctrl[26] as u16 == 0x1F4 && n == 0x1FFFF {
+            self.title_explode += 1;
+        }
         let ofx = self.ctrl[24] as i32 as i64;
         let ofy = self.ctrl[25] as i32 as i64;
         let ir1 = self.data[9] as i16 as i64;
@@ -227,6 +266,21 @@ impl Gte {
         let sy = ((i64::from(n) * ir2) + ofy) >> 16;
         let sx = saturate_sx(sx, &mut self.ctrl[31]);
         let sy = saturate_sy(sy, &mut self.ctrl[31]);
+        if self.ctrl[26] as u16 == 0x1F4 {
+            self.title_ir2_min = self.title_ir2_min.min(ir2 as i32);
+            self.title_ir2_max = self.title_ir2_max.max(ir2 as i32);
+            self.title_vy_min = self.title_vy_min.min(vy);
+            self.title_vy_max = self.title_vy_max.max(vy);
+            if sy > self.last_hi_sy {
+                self.last_hi_sy = sy;
+                self.last_hi_ir2 = ir2 as i32;
+                self.last_hi_n = n;
+                self.last_hi_sz = sz;
+                self.last_hi_vy = vy;
+                self.last_hi_try = tr[1] as i32;
+                self.last_hi_trz = tr[2] as i32;
+            }
+        }
         self.data[12] = self.data[13];
         self.data[13] = self.data[14];
         self.data[14] = ((sy as u32) << 16) | (sx as u16 as u32);
@@ -310,6 +364,19 @@ impl Gte {
             0..=2 => self.vx(v),
             _ => self.ir_vec(),
         };
+        let m = if mx == 3 {
+            let r = (self.data[6] & 0xFF) as i32 * 0x10;
+            let ir0 = self.data[8] as i16 as i32;
+            let rt13 = self.rt_el(0, 2);
+            let rt22 = self.rt_el(1, 1);
+            [[-r, r, ir0], [rt13, rt13, rt13], [rt22, rt22, rt22]]
+        } else {
+            [
+                [self.mx_el(mx, 0, 0), self.mx_el(mx, 0, 1), self.mx_el(mx, 0, 2)],
+                [self.mx_el(mx, 1, 0), self.mx_el(mx, 1, 1), self.mx_el(mx, 1, 2)],
+                [self.mx_el(mx, 2, 0), self.mx_el(mx, 2, 1), self.mx_el(mx, 2, 2)],
+            ]
+        };
         let (tx, ty, tz) = match cv {
             0 => (
                 self.ctrl[5] as i32 as i64,
@@ -321,17 +388,34 @@ impl Gte {
                 self.ctrl[14] as i32 as i64,
                 self.ctrl[15] as i32 as i64,
             ),
+            2 => (
+                self.ctrl[21] as i32 as i64,
+                self.ctrl[22] as i32 as i64,
+                self.ctrl[23] as i32 as i64,
+            ),
             _ => (0, 0, 0),
         };
+        let shift = sf * 12;
         for r in 0..3 {
-            let tr = [tx, ty, tz][r] << 12;
-            let m = tr
-                + i64::from(self.mx_el(mx, r, 0)) * i64::from(vec.0)
-                + i64::from(self.mx_el(mx, r, 1)) * i64::from(vec.1)
-                + i64::from(self.mx_el(mx, r, 2)) * i64::from(vec.2);
-            let shifted = m >> (sf * 12);
-            self.data[25 + r] = shifted as u32;
-            self.set_ir(r, shifted, lm);
+            let t = [tx, ty, tz][r];
+            if cv == 2 {
+                // SPX: FC translation is bugged — FLAG uses T+M*Vx, result is
+                // only the last two multiply-adds.
+                let _flag = mac44((t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
+                let acc = mac44(
+                    i64::from(m[r][1]) * i64::from(vec.1) + i64::from(m[r][2]) * i64::from(vec.2),
+                );
+                let shifted = acc >> shift;
+                self.data[25 + r] = shifted as u32;
+                self.set_ir(r, shifted, lm);
+            } else {
+                let mut acc = mac44((t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
+                acc = mac44(acc + i64::from(m[r][1]) * i64::from(vec.1));
+                acc += i64::from(m[r][2]) * i64::from(vec.2);
+                let shifted = acc >> shift;
+                self.data[25 + r] = shifted as u32;
+                self.set_ir(r, shifted, lm);
+            }
         }
     }
 
@@ -409,6 +493,53 @@ impl Gte {
 
     fn nccs(&mut self, sf: u32, lm: bool) {
         self.ncc_vector(0, sf, lm);
+    }
+
+    fn lcm_ir_bk(&mut self, sf: u32, lm: bool) {
+        let ir = self.ir_vec();
+        for r in 0..3 {
+            let bk = self.ctrl[13 + r] as i32 as i64;
+            let mut acc = mac44((bk << 12) + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0));
+            acc = mac44(acc + i64::from(self.mx_el(2, r, 1)) * i64::from(ir.1));
+            acc += i64::from(self.mx_el(2, r, 2)) * i64::from(ir.2);
+            let shifted = acc >> (sf * 12);
+            self.data[25 + r] = shifted as u32;
+            self.set_ir(r, shifted, lm);
+        }
+    }
+
+    fn cc(&mut self, sf: u32, lm: bool) {
+        self.lcm_ir_bk(sf, lm);
+        let rgb = self.data[6];
+        let r = (rgb & 0xFF) as i64;
+        let g = ((rgb >> 8) & 0xFF) as i64;
+        let b = ((rgb >> 16) & 0xFF) as i64;
+        let ir = self.ir_vec();
+        for i in 0..3 {
+            let mac = ([r, g, b][i] * i64::from([ir.0, ir.1, ir.2][i])) << 4;
+            let shifted = mac >> (sf * 12);
+            self.data[25 + i] = shifted as u32;
+            self.set_ir(i, shifted, lm);
+        }
+        self.push_color(lm);
+    }
+
+    fn cdp(&mut self, sf: u32, lm: bool) {
+        self.lcm_ir_bk(sf, lm);
+        let rgb = self.data[6];
+        let ir = self.ir_vec();
+        let mut mac = [
+            ((rgb & 0xFF) as i64 * i64::from(ir.0)) << 4,
+            (((rgb >> 8) & 0xFF) as i64 * i64::from(ir.1)) << 4,
+            (((rgb >> 16) & 0xFF) as i64 * i64::from(ir.2)) << 4,
+        ];
+        self.depth_cue(&mut mac, sf);
+        for i in 0..3 {
+            let shifted = mac[i] >> (sf * 12);
+            self.data[25 + i] = shifted as u32;
+            self.set_ir(i, shifted, lm);
+        }
+        self.push_color(lm);
     }
 
     fn ncc_vector(&mut self, vec: usize, sf: u32, lm: bool) {
@@ -675,6 +806,64 @@ mod tests {
             "AVSZ4 OTZ = ZSF4*(SZ0+SZ1+SZ2+SZ3)>>12 (got {:#X})",
             g.read_data(7)
         );
+    }
+
+    #[test]
+    fn mvmva_cv_none_does_not_add_translation() {
+        // PSY-Q rtir12: mx=RT, v=IR, cv=None, sf=1. TR must not leak into IR.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000); // R11=1
+        g.write_control(2, 0x1000); // R22=1
+        g.write_control(4, 0x1000); // R33=1
+        g.write_control(5, 100);
+        g.write_control(6, 200);
+        g.write_control(7, 300);
+        g.write_data(9, 0x1000);
+        g.write_data(10, 0x1000);
+        g.write_data(11, 0x1000);
+        // sf=1, mx=0, v=3 (IR), cv=3 (none), op=MVMVA
+        g.command(0x01 << 19 | 3 << 15 | 3 << 13 | 0x12);
+        assert_eq!(g.read_data(9) as i16, 0x1000, "IR1");
+        assert_eq!(g.read_data(10) as i16, 0x1000, "IR2");
+        assert_eq!(g.read_data(11) as i16, 0x1000, "IR3");
+    }
+
+    #[test]
+    fn mvmva_mx3_uses_garbage_matrix() {
+        // SPX: mx=3 is -R*10h, +R*10h, IR0 / RT13,RT13,RT13 / RT22,RT22,RT22.
+        let mut g = Gte::new();
+        g.write_data(6, 0x10); // R=16 → ±0x100
+        g.write_data(8, 0x20); // IR0
+        g.write_control(1, 0x0003); // RT13=3
+        g.write_control(2, 0x0004); // RT22=4
+        g.write_data(0, 1 | (1 << 16)); // V0 = (1,1,?)
+        g.write_data(1, 1);
+        g.command(0x01 << 19 | 3 << 17 | 0x12); // sf=1, mx=3, v=V0, cv=TR=0
+        // MAC1 = ((-0x100)*1 + 0x100*1 + 0x20*1) >> 12 = 0x20 >> 12 = 0
+        assert_eq!(g.read_data(9) as i16, 0, "IR1 garbage row0");
+        // MAC2 = (3+3+3)>>12 = 0
+        assert_eq!(g.read_data(10) as i16, 0, "IR2 garbage row1");
+        // MAC3 = (4+4+4)>>12 = 0
+        assert_eq!(g.read_data(11) as i16, 0, "IR3 garbage row2");
+    }
+
+    #[test]
+    fn cc_multiplies_lcm_ir_then_rgb() {
+        let mut g = Gte::new();
+        // LCM = identity 0x1000, BK=0, IR=1.0, RGB=0x80 → FIFO 0x80.
+        g.write_control(16, 0x1000);
+        g.write_control(18, 0x1000);
+        g.write_control(20, 0x1000);
+        g.write_data(9, 0x1000);
+        g.write_data(10, 0x1000);
+        g.write_data(11, 0x1000);
+        g.write_data(6, 0x80 | (0x80 << 8) | (0x80 << 16) | (0x30 << 24));
+        g.command(0x01 << 19 | 1 << 10 | 0x1C); // sf=1 lm=1 CC
+        let rgb = g.read_data(22);
+        assert_eq!(rgb & 0xFF, 0x80, "CC R {rgb:#X}");
+        assert_eq!((rgb >> 8) & 0xFF, 0x80, "CC G");
+        assert_eq!((rgb >> 16) & 0xFF, 0x80, "CC B");
+        assert_eq!(rgb >> 24, 0x30, "CC CODE");
     }
 }
 

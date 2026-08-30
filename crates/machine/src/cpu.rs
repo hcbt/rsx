@@ -85,6 +85,34 @@ impl Cpu {
         self.gte.read_control(reg)
     }
 
+    pub fn gte_hi_sy_trace(&self) -> (i32, i32, u32, u32, i32, i32, u32) {
+        let g = &self.gte;
+        (
+            g.last_hi_sy,
+            g.last_hi_ir2,
+            g.last_hi_n,
+            g.last_hi_sz,
+            g.last_hi_vy,
+            g.last_hi_try,
+            g.title_explode,
+        )
+    }
+
+    pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32) {
+        let g = &self.gte;
+        (
+            g.title_ir2_min,
+            g.title_ir2_max,
+            g.title_vy_min,
+            g.title_vy_max,
+            g.last_hi_trz,
+        )
+    }
+
+    pub fn gte_op_counts(&self) -> [u32; 64] {
+        self.gte.op_counts
+    }
+
     fn set_gpr(&mut self, i: u8, v: u32) {
         if i != 0 {
             self.gpr[i as usize] = v;

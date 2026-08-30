@@ -54,6 +54,54 @@ pub fn capture_at_vblanks(
         eprintln!(
             "  dma2-list empty={empty} pkts={pkts} start={astart:#X} n={sn} empty_before_pkt={ebefore} addr={amin:#X}..{amax:#X}"
         );
+        let (hsy, hir2, hn, hsz, hvy, htry, nexp) = machine.gte_hi_sy_trace();
+        eprintln!(
+            "  gte-hi-sy SY={hsy} IR2={hir2} n={hn:#X} SZ={hsz} VY={hvy} TRY={htry} explode={nexp} TRX={:#X} TRY_reg={:#X} TRZ={:#X} RT22={:#X}",
+            machine.gte_control(5) as i32,
+            machine.gte_control(6) as i32,
+            machine.gte_control(7) as i32,
+            machine.gte_control(2) as u16,
+        );
+        let (ir2lo, ir2hi, vylo, vyhi, htrz) = machine.gte_title_ir2();
+        eprintln!("  title-rtps IR2={ir2lo}..{ir2hi} VY={vylo}..{vyhi} hi-TRZ={htrz}");
+        let ops = machine.gte_op_counts();
+        let names = [
+            (0x01u8, "RTPS"),
+            (0x06, "NCLIP"),
+            (0x0C, "OP"),
+            (0x10, "DPCS"),
+            (0x11, "INTPL"),
+            (0x12, "MVMVA"),
+            (0x13, "NCDS"),
+            (0x14, "CDP"),
+            (0x16, "NCDT"),
+            (0x1B, "NCCS"),
+            (0x1C, "CC"),
+            (0x1E, "NCS"),
+            (0x20, "NCT"),
+            (0x28, "SQR"),
+            (0x29, "DCPL"),
+            (0x2A, "DPCT"),
+            (0x2D, "AVSZ3"),
+            (0x2E, "AVSZ4"),
+            (0x30, "RTPT"),
+            (0x3D, "GPF"),
+            (0x3E, "GPL"),
+            (0x3F, "NCCT"),
+        ];
+        let hist: Vec<String> = names
+            .iter()
+            .filter(|(op, _)| ops[*op as usize] > 0)
+            .map(|(op, n)| format!("{n}={}", ops[*op as usize]))
+            .collect();
+        eprintln!("  gte-ops {}", hist.join(" "));
+        eprintln!(
+            "  ot[0..3] {:08X} {:08X} {:08X} {:08X}",
+            machine.ram_word(astart),
+            machine.ram_word(astart.wrapping_add(4)),
+            machine.ram_word(astart.wrapping_add(8)),
+            machine.ram_word(astart.wrapping_add(12)),
+        );
         eprintln!(
             "  y-bins/32 {} hi_y_word={:#010X}",
             machine

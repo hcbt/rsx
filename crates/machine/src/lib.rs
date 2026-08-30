@@ -176,6 +176,18 @@ impl Machine {
         self.cpu.gte_control(reg)
     }
 
+    pub fn gte_hi_sy_trace(&self) -> (i32, i32, u32, u32, i32, i32, u32) {
+        self.cpu.gte_hi_sy_trace()
+    }
+
+    pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32) {
+        self.cpu.gte_title_ir2()
+    }
+
+    pub fn gte_op_counts(&self) -> [u32; 64] {
+        self.cpu.gte_op_counts()
+    }
+
     pub fn last_y_bins(&self) -> [u32; 16] {
         self.bus.gpu().last_y_bins
     }
