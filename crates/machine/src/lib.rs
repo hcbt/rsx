@@ -188,6 +188,10 @@ impl Machine {
         self.cpu.gte_op_counts()
     }
 
+    pub fn gte_title_rt(&self) -> [i32; 9] {
+        self.cpu.gte_title_rt()
+    }
+
     pub fn last_y_bins(&self) -> [u32; 16] {
         self.bus.gpu().last_y_bins
     }
@@ -341,6 +345,26 @@ mod tests {
         let bios = bios_with_program(&[0x3C08_0013]);
         let m = Machine::from_bios_path(bios.path()).unwrap();
         assert_eq!(m.pc(), 0xBFC0_0000);
+    }
+
+    #[test]
+    fn addi_overflow_takes_the_ovf_exception() {
+        // ADDI of 1 onto 0x7FFFFFFF must trap (EXC_OVF), not leave the dest stale.
+        let bios = bios_with_program(&[
+            0x3C08_7FFF, // lui t0, 0x7FFF
+            0x3508_FFFF, // ori t0, t0, 0xFFFF
+            0x2109_0001, // addi t1, t0, 1
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        m.step();
+        m.step();
+        m.step();
+        let (code, pc, _) = m
+            .last_exception()
+            .expect("ADDI overflow must raise an exception");
+        assert_eq!(code, cop0::EXC_OVF, "EXC_OVF");
+        assert_eq!(pc, 0xBFC0_0008, "EPC is the ADDI");
+        assert_eq!(m.gpr(9), 0, "overflow must not write the dest");
     }
 
     #[test]

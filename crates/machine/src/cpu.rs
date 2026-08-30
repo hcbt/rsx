@@ -116,6 +116,10 @@ impl Cpu {
         self.gte.op_counts
     }
 
+    pub fn gte_title_rt(&self) -> [i32; 9] {
+        self.gte.last_hi_rt
+    }
+
     fn set_gpr(&mut self, i: u8, v: u32) {
         if i != 0 {
             self.gpr[i as usize] = v;
@@ -244,7 +248,11 @@ impl Cpu {
             0x05 => self.branch(self.gpr(rs) != self.gpr(rt), simm, false),
             0x06 => self.branch((self.gpr(rs) as i32) <= 0, simm, false),
             0x07 => self.branch((self.gpr(rs) as i32) > 0, simm, false),
-            0x08 => self.add_imm(rt, rs, simm, true),
+            0x08 => {
+                if self.add_imm(rt, rs, simm, true) {
+                    self.exception(bus, cop0::EXC_OVF, 0);
+                }
+            }
             0x09 => self.set_gpr(rt, self.gpr(rs).wrapping_add(simm)),
             0x0A => self.set_gpr(rt, u32::from((self.gpr(rs) as i32) < (simm as i32))),
             0x0B => self.set_gpr(rt, u32::from(self.gpr(rs) < simm)),
@@ -338,9 +346,17 @@ impl Cpu {
                     self.hi = n % d;
                 }
             }
-            0x20 => self.add_reg(rd, rs, rt, true),
+            0x20 => {
+                if self.add_reg(rd, rs, rt, true) {
+                    self.exception(bus, cop0::EXC_OVF, 0);
+                }
+            }
             0x21 => self.set_gpr(rd, self.gpr(rs).wrapping_add(self.gpr(rt))),
-            0x22 => self.sub_reg(rd, rs, rt, true),
+            0x22 => {
+                if self.sub_reg(rd, rs, rt, true) {
+                    self.exception(bus, cop0::EXC_OVF, 0);
+                }
+            }
             0x23 => self.set_gpr(rd, self.gpr(rs).wrapping_sub(self.gpr(rt))),
             0x24 => self.set_gpr(rd, self.gpr(rs) & self.gpr(rt)),
             0x25 => self.set_gpr(rd, self.gpr(rs) | self.gpr(rt)),
@@ -352,34 +368,51 @@ impl Cpu {
         }
     }
 
-    fn add_imm(&mut self, rt: u8, rs: u8, simm: u32, trap: bool) {
+    fn add_imm(&mut self, rt: u8, rs: u8, simm: u32, trap: bool) -> bool {
         let a = self.gpr(rs) as i32;
         let b = simm as i32;
         match a.checked_add(b) {
-            Some(v) => self.set_gpr(rt, v as u32),
-            None if trap => {}
-            None => self.set_gpr(rt, a.wrapping_add(b) as u32),
+            Some(v) => {
+                self.set_gpr(rt, v as u32);
+                false
+            }
+            None if trap => true,
+            None => {
+                self.set_gpr(rt, a.wrapping_add(b) as u32);
+                false
+            }
         }
     }
 
-    fn add_reg(&mut self, rd: u8, rs: u8, rt: u8, trap: bool) {
+    fn add_reg(&mut self, rd: u8, rs: u8, rt: u8, trap: bool) -> bool {
         let a = self.gpr(rs) as i32;
         let b = self.gpr(rt) as i32;
         match a.checked_add(b) {
-            Some(v) => self.set_gpr(rd, v as u32),
-            None if trap => { /* overflow: handled by returning without write; caller exceptions */
+            Some(v) => {
+                self.set_gpr(rd, v as u32);
+                false
             }
-            None => self.set_gpr(rd, a.wrapping_add(b) as u32),
+            None if trap => true,
+            None => {
+                self.set_gpr(rd, a.wrapping_add(b) as u32);
+                false
+            }
         }
     }
 
-    fn sub_reg(&mut self, rd: u8, rs: u8, rt: u8, trap: bool) {
+    fn sub_reg(&mut self, rd: u8, rs: u8, rt: u8, trap: bool) -> bool {
         let a = self.gpr(rs) as i32;
         let b = self.gpr(rt) as i32;
         match a.checked_sub(b) {
-            Some(v) => self.set_gpr(rd, v as u32),
-            None if trap => {}
-            None => self.set_gpr(rd, a.wrapping_sub(b) as u32),
+            Some(v) => {
+                self.set_gpr(rd, v as u32);
+                false
+            }
+            None if trap => true,
+            None => {
+                self.set_gpr(rd, a.wrapping_sub(b) as u32);
+                false
+            }
         }
     }
 
