@@ -62,8 +62,10 @@ pub fn capture_at_vblanks(
             machine.gte_control(7) as i32,
             machine.gte_control(2) as u16,
         );
-        let (ir2lo, ir2hi, vylo, vyhi, htrz) = machine.gte_title_ir2();
-        eprintln!("  title-rtps IR2={ir2lo}..{ir2hi} VY={vylo}..{vyhi} hi-TRZ={htrz}");
+        let (ir2lo, ir2hi, vylo, vyhi, htrz, r21, r22, r23) = machine.gte_title_ir2();
+        eprintln!(
+            "  title-rtps IR2={ir2lo}..{ir2hi} VY={vylo}..{vyhi} hi-TRZ={htrz} R2=[{r21},{r22},{r23}]"
+        );
         let ops = machine.gte_op_counts();
         let names = [
             (0x01u8, "RTPS"),

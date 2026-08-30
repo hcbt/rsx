@@ -180,7 +180,7 @@ impl Machine {
         self.cpu.gte_hi_sy_trace()
     }
 
-    pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32) {
+    pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
         self.cpu.gte_title_ir2()
     }
 

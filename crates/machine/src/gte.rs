@@ -11,6 +11,9 @@ pub struct Gte {
     pub last_hi_vy: i32,
     pub last_hi_try: i32,
     pub last_hi_trz: i32,
+    pub last_hi_r21: i32,
+    pub last_hi_r22: i32,
+    pub last_hi_r23: i32,
     pub title_explode: u32,
     pub title_ir2_min: i32,
     pub title_ir2_max: i32,
@@ -31,6 +34,9 @@ impl Gte {
             last_hi_vy: 0,
             last_hi_try: 0,
             last_hi_trz: 0,
+            last_hi_r21: 0,
+            last_hi_r22: 0,
+            last_hi_r23: 0,
             title_explode: 0,
             title_ir2_min: i32::MAX,
             title_ir2_max: i32::MIN,
@@ -272,6 +278,9 @@ impl Gte {
             self.title_vy_min = self.title_vy_min.min(vy);
             self.title_vy_max = self.title_vy_max.max(vy);
             if sy > self.last_hi_sy {
+                let r21 = self.rt_el(1, 0);
+                let r22 = self.rt_el(1, 1);
+                let r23 = self.rt_el(1, 2);
                 self.last_hi_sy = sy;
                 self.last_hi_ir2 = ir2 as i32;
                 self.last_hi_n = n;
@@ -279,6 +288,9 @@ impl Gte {
                 self.last_hi_vy = vy;
                 self.last_hi_try = tr[1] as i32;
                 self.last_hi_trz = tr[2] as i32;
+                self.last_hi_r21 = r21;
+                self.last_hi_r22 = r22;
+                self.last_hi_r23 = r23;
             }
         }
         self.data[12] = self.data[13];

@@ -98,7 +98,7 @@ impl Cpu {
         )
     }
 
-    pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32) {
+    pub fn gte_title_ir2(&self) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
         let g = &self.gte;
         (
             g.title_ir2_min,
@@ -106,6 +106,9 @@ impl Cpu {
             g.title_vy_min,
             g.title_vy_max,
             g.last_hi_trz,
+            g.last_hi_r21,
+            g.last_hi_r22,
+            g.last_hi_r23,
         )
     }
 
