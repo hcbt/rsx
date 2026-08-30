@@ -53,5 +53,9 @@ The PlayStation sound processor, with its own 512 KiB RAM. In the first proof it
 _Avoid_: audio, mixer
 
 **CD-ROM**:
-The bus controller the BIOS talks to (status, GetID), not a disc image. First proof reports no disc; it does not read sectors.
-_Avoid_: drive, ISO, disc as the name for the controller
+The bus controller the BIOS talks to (status, GetID, Read).
+_Avoid_: drive, ISO as the name for the controller
+
+**Disc**:
+A user-supplied CD-ROM image (CUE/BIN), never part of the repository. Optional: missing means the drive is empty.
+_Avoid_: ROM, ISO as the name for the image

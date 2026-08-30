@@ -1,3 +1,4 @@
+use crate::cdrom::Cdrom;
 use crate::gpu::Gpu;
 use crate::irq::{self, Irq};
 use crate::spu::Spu;
@@ -69,6 +70,7 @@ impl Dma {
         ram: &mut [u8],
         gpu: &mut Gpu,
         spu: &mut Spu,
+        cdrom: &mut Cdrom,
         irq: &mut Irq,
     ) {
         let off = addr.wrapping_sub(0x1F80_1080);
@@ -80,7 +82,7 @@ impl Dma {
                 8 | 0xC => {
                     self.chcr[ch] = value;
                     if value & (1 << 24) != 0 {
-                        self.run(ch, ram, gpu, spu, irq);
+                        self.run(ch, ram, gpu, spu, cdrom, irq);
                     }
                 }
                 _ => {}
@@ -104,13 +106,22 @@ impl Dma {
         }
     }
 
-    fn run(&mut self, ch: usize, ram: &mut [u8], gpu: &mut Gpu, spu: &mut Spu, irq: &mut Irq) {
+    fn run(
+        &mut self,
+        ch: usize,
+        ram: &mut [u8],
+        gpu: &mut Gpu,
+        spu: &mut Spu,
+        cdrom: &mut Cdrom,
+        irq: &mut Irq,
+    ) {
         if (self.dpcr >> (ch * 4 + 3)) & 1 == 0 {
             self.chcr[ch] &= !(1 << 24);
             return;
         }
         match ch {
             2 => self.gpu(ram, gpu),
+            3 => self.cd(ram, cdrom),
             4 => self.spu(ram, spu),
             6 => self.otc(ram),
             _ => {}
@@ -118,6 +129,19 @@ impl Dma {
         self.chcr[ch] &= !(1 << 24);
         self.complete(ch);
         self.update_master(irq);
+    }
+
+    fn cd(&mut self, ram: &mut [u8], cdrom: &mut Cdrom) {
+        let bs = self.bcr[3] & 0xFFFF;
+        let ba = self.bcr[3] >> 16;
+        let bs = if bs == 0 { 0x1_0000 } else { bs };
+        let ba = if ba == 0 { 1 } else { ba };
+        let n = bs.saturating_mul(ba).min(1_000_000);
+        let mut addr = self.madr[3] & 0x1F_FFFF;
+        for _ in 0..n {
+            write32(ram, addr, cdrom.dma_read32());
+            addr = addr.wrapping_add(4) & 0x1F_FFFF;
+        }
     }
 
     fn gpu(&mut self, ram: &mut [u8], gpu: &mut Gpu) {

@@ -5,6 +5,7 @@ mod bus;
 mod cdrom;
 mod cop0;
 mod cpu;
+mod disc;
 mod dma;
 mod gpu;
 mod gte;
@@ -14,6 +15,7 @@ mod spu;
 mod timers;
 
 pub use bios::BiosError;
+pub use disc::DiscError;
 
 use std::path::Path;
 
@@ -46,6 +48,12 @@ impl Machine {
         };
         machine.reset();
         Ok(machine)
+    }
+
+    pub fn insert_disc(&mut self, path: impl AsRef<Path>) -> Result<(), DiscError> {
+        let disc = crate::disc::load_disc(path.as_ref())?;
+        self.bus.insert_disc(disc);
+        Ok(())
     }
 
     pub fn reset(&mut self) {
@@ -508,6 +516,57 @@ mod tests {
         assert!(
             banner > 1_000,
             "SCE text sprites must be on the display during the diamond (banner={banner} fill={fill:04X})"
+        );
+    }
+
+    fn write_america_cue(dir: &std::path::Path) -> std::path::PathBuf {
+        const SECTOR: usize = 2352;
+        let mut bin = vec![0u8; SECTOR * 24];
+        let lic = b"          Licensed  by          Sony Computer Entertainment Amer  ica";
+        bin[SECTOR * 4 + 24..SECTOR * 4 + 24 + lic.len()].copy_from_slice(lic);
+        std::fs::write(dir.join("game.bin"), &bin).unwrap();
+        let cue = dir.join("game.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"game.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        cue
+    }
+
+    #[test]
+    fn missing_disc_is_an_error() {
+        let bios = bios_with_program(&[0x3C08_0013]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        let err = m.insert_disc("/no/such/game.cue").unwrap_err();
+        assert!(matches!(err, DiscError::Io(_)));
+    }
+
+    #[test]
+    fn licensed_disc_does_not_enter_the_shell_when_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        if !path.exists() {
+            eprintln!("skipping: no local SCPH1001.BIN");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cue = write_america_cue(dir.path());
+        let mut m = Machine::from_bios_path(&path).unwrap();
+        m.insert_disc(&cue).unwrap();
+        m.run_until_vblank_count(500);
+        assert_ne!(
+            m.pc() & 0xFFFFF000,
+            0x8003_D000,
+            "licensed Disc must not drop into the Shell (pc={:08X})",
+            m.pc()
+        );
+        let area = m.display_area();
+        let black = area.pixels.iter().filter(|p| **p & 0x7FFF == 0).count();
+        assert!(
+            black > 50_000,
+            "licensed logo is on black, not the Shell (black={black} pc={:08X} gp0={})",
+            m.pc(),
+            m.gp0_count()
         );
     }
 }

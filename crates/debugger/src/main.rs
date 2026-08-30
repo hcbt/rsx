@@ -14,7 +14,7 @@ struct Debugger {
 }
 
 impl Debugger {
-    fn new(bios: Result<PathBuf, String>) -> Self {
+    fn new(bios: Result<PathBuf, String>, disc: Result<Option<PathBuf>, String>) -> Self {
         let mut d = Self {
             machine: None,
             error: None,
@@ -22,18 +22,26 @@ impl Debugger {
             log: Vec::new(),
             texture: None,
         };
-        match bios {
-            Ok(p) => d.load(p),
-            Err(e) => d.error = Some(e),
+        match (bios, disc) {
+            (Ok(bios), Ok(disc)) => d.load(bios, disc),
+            (Err(e), _) | (_, Err(e)) => d.error = Some(e),
         }
         d
     }
 
-    fn load(&mut self, path: PathBuf) {
-        match Machine::from_bios_path(&path) {
-            Ok(m) => {
+    fn load(&mut self, bios: PathBuf, disc: Option<PathBuf>) {
+        match Machine::from_bios_path(&bios) {
+            Ok(mut m) => {
                 self.log
-                    .push(format!("loaded BIOS {}", path.display()));
+                    .push(format!("loaded BIOS {}", bios.display()));
+                if let Some(p) = disc {
+                    if let Err(e) = m.insert_disc(&p) {
+                        self.machine = None;
+                        self.error = Some(e.to_string());
+                        return;
+                    }
+                    self.log.push(format!("loaded Disc {}", p.display()));
+                }
                 self.machine = Some(m);
                 self.error = None;
                 self.running = true;
@@ -139,7 +147,9 @@ fn area_to_color_image(area: &DisplayArea) -> egui::ColorImage {
 
 fn main() -> eframe::Result<()> {
     let cli = config::parse_cli(std::env::args());
-    let bios = config::resolve_bios(cli, std::path::Path::new("."));
+    let cwd = std::path::Path::new(".");
+    let bios = config::resolve_bios(cli.bios, cwd);
+    let disc = config::resolve_disc(cli.disc, cwd);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 720.0]),
         ..Default::default()
@@ -147,6 +157,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "rsx",
         options,
-        Box::new(move |_cc| Ok(Box::new(Debugger::new(bios)))),
+        Box::new(move |_cc| Ok(Box::new(Debugger::new(bios, disc)))),
     )
 }

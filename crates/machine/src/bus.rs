@@ -96,6 +96,10 @@ impl Bus {
         &self.gpu
     }
 
+    pub fn insert_disc(&mut self, disc: crate::disc::Disc) {
+        self.cdrom.insert(disc);
+    }
+
     pub fn irq(&self) -> &Irq {
         &self.irq
     }
@@ -319,6 +323,7 @@ impl Bus {
                     &mut self.ram,
                     &mut self.gpu,
                     &mut self.spu,
+                    &mut self.cdrom,
                     &mut self.irq,
                 );
             }

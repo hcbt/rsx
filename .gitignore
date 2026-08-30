@@ -3,6 +3,9 @@ SCPH1001.BIN
 SCPH*.BIN
 scph*.bin
 
+# User-supplied discs
+/roms/
+
 /target
 
 # Devenv
