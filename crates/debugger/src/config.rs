@@ -19,8 +19,9 @@ struct FileConfig {
 }
 
 fn load_toml(cwd: &Path) -> Result<FileConfig, String> {
-    let text = fs::read_to_string(cwd.join("rsx.toml"))
-        .map_err(|_| "BIOS path required: pass --bios <file> or set bios in rsx.toml".to_string())?;
+    let text = fs::read_to_string(cwd.join("rsx.toml")).map_err(|_| {
+        "BIOS path required: pass --bios <file> or set bios in rsx.toml".to_string()
+    })?;
     toml::from_str(&text).map_err(|e| format!("rsx.toml: {e}"))
 }
 
@@ -69,10 +70,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Cli {
 }
 
 fn parse_vblank_list(s: &str) -> Vec<u64> {
-    let mut v: Vec<u64> = s
-        .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
+    let mut v: Vec<u64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
     v.sort_unstable();
     v.dedup();
     v

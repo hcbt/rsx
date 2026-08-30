@@ -151,6 +151,31 @@ impl Machine {
         self.bus.gpu().display_origin()
     }
 
+    pub fn draw_env(&self) -> (i32, i32, i32, i32, i32, i32) {
+        self.bus.gpu().draw_env()
+    }
+
+    pub fn last_gouraud_tri_stats(&self) -> (u32, i32, i32, i32, i32, u32) {
+        let g = self.bus.gpu();
+        (
+            g.last_n30,
+            g.last_x0,
+            g.last_x1,
+            g.last_y0,
+            g.last_y1,
+            g.last_n30_out,
+        )
+    }
+
+    pub fn gouraud_tri_stats(&self) -> (u32, i32, i32, i32, i32) {
+        let g = self.bus.gpu();
+        (g.frame_n30, g.frame_x0, g.frame_x1, g.frame_y0, g.frame_y1)
+    }
+
+    pub fn gte_control(&self, reg: u8) -> u32 {
+        self.cpu.gte_control(reg)
+    }
+
     pub fn io_writes(&self) -> u64 {
         self.bus.io_writes
     }
@@ -332,7 +357,11 @@ mod tests {
         for _ in 0..16 {
             m.step();
         }
-        assert_eq!(m.gpr(10) & (1 << 1), 1 << 1, "JOY_STAT bit 1 (RX not empty)");
+        assert_eq!(
+            m.gpr(10) & (1 << 1),
+            1 << 1,
+            "JOY_STAT bit 1 (RX not empty)"
+        );
         assert_eq!(m.gpr(11), 0xFF, "empty port must clock 0xFF into RX");
     }
 

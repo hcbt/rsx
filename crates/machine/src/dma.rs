@@ -160,7 +160,7 @@ impl Dma {
                     let w = read32(ram, addr.wrapping_add(4 + i * 4) & 0x1F_FFFF);
                     gpu.dma_write(w);
                 }
-                if next == 0x00FF_FFFF || next & 0x800000 != 0 {
+                if next == 0x00FF_FFFF {
                     break;
                 }
                 addr = next & 0x1F_FFFF;
@@ -244,4 +244,134 @@ fn read32(ram: &[u8], addr: u32) -> u32 {
 fn write32(ram: &mut [u8], addr: u32, v: u32) {
     let a = (addr as usize) & (ram.len() - 1) & !3;
     ram[a..a + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cdrom::Cdrom;
+    use crate::gpu::Gpu;
+    use crate::irq::Irq;
+    use crate::spu::Spu;
+
+    fn xy(x: i32, y: i32) -> u32 {
+        (x as u16 as u32) | ((y as u16 as u32) << 16)
+    }
+
+    fn poke(ram: &mut [u8], addr: u32, v: u32) {
+        write32(ram, addr, v);
+    }
+
+    fn peek(ram: &[u8], addr: u32) -> u32 {
+        read32(ram, addr)
+    }
+
+    #[test]
+    fn otc_then_linked_list_delivers_far_then_near() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+
+        gpu.gp0(0xE3 << 24);
+        gpu.gp0(0xE4 << 24 | 1023 | (511 << 10));
+
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+
+        // Four-entry OT at 0x1000. MADR = last entry.
+        dma.write32(
+            0x1F80_10E0,
+            0x100C,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E4,
+            4,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E8,
+            0x1100_0002,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+
+        assert_eq!(peek(&ram, 0x1000), 0x00FF_FFFF, "OTC last written is end");
+        assert_eq!(peek(&ram, 0x1004), 0x1000);
+        assert_eq!(peek(&ram, 0x1008), 0x1004);
+        assert_eq!(peek(&ram, 0x100C), 0x1008);
+
+        // Far (OTZ=3) red triangle, then near (OTZ=1) blue overlapping it.
+        // Insert prepends: [pkt] = OT[z] | (N<<24); OT[z] = pkt.
+        poke(&mut ram, 0x2000, (4 << 24) | 0x1008);
+        poke(&mut ram, 0x2004, 0x20 << 24 | 0x0000F8);
+        poke(&mut ram, 0x2008, xy(10, 10));
+        poke(&mut ram, 0x200C, xy(40, 10));
+        poke(&mut ram, 0x2010, xy(10, 40));
+        poke(&mut ram, 0x100C, 0x2000);
+
+        poke(&mut ram, 0x2100, (4 << 24) | 0x1000);
+        poke(&mut ram, 0x2104, 0x20 << 24 | 0xF80000);
+        poke(&mut ram, 0x2108, xy(15, 12));
+        poke(&mut ram, 0x210C, xy(35, 12));
+        poke(&mut ram, 0x2110, xy(15, 32));
+        poke(&mut ram, 0x1004, 0x2100);
+
+        dma.write32(
+            0x1F80_10A0,
+            0x100C,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x0100_0401,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+
+        let overlap = gpu.vram_rect(16, 13, 8, 8);
+        let blue = overlap
+            .pixels
+            .iter()
+            .filter(|p| **p & 0x7FFF == 0x7C00)
+            .count();
+        let red = overlap
+            .pixels
+            .iter()
+            .filter(|p| **p & 0x7FFF == 0x001F)
+            .count();
+        assert!(
+            blue > 8 && red == 0,
+            "far then near: overlap must be the near (blue) primitive (blue={blue} red={red} pix={:04X?})",
+            overlap.pixels
+        );
+    }
 }

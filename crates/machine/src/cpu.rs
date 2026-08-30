@@ -81,6 +81,10 @@ impl Cpu {
         self.cop0.badvaddr
     }
 
+    pub fn gte_control(&self, reg: u8) -> u32 {
+        self.gte.read_control(reg)
+    }
+
     fn set_gpr(&mut self, i: u8, v: u32) {
         if i != 0 {
             self.gpr[i as usize] = v;
@@ -103,10 +107,8 @@ impl Cpu {
         self.branch_delay = false;
         self.current_pc = self.pc;
 
-        self.cop0
-            .set_ip_hw(bus.irq().pending_for_cop0());
-        let irq = self.cop0.iec()
-            && (self.cop0.cause & self.cop0.sr & 0xFF00) != 0;
+        self.cop0.set_ip_hw(bus.irq().pending_for_cop0());
+        let irq = self.cop0.iec() && (self.cop0.cause & self.cop0.sr & 0xFF00) != 0;
         if irq && !self.in_delay {
             self.exception(bus, cop0::EXC_INT, 0);
             return;
@@ -171,10 +173,7 @@ impl Cpu {
 
     fn exception(&mut self, _bus: &mut Bus, code: u8, ce: u8) {
         self.last_exception = Some((code, self.current_pc, self.cop0.cause));
-        if code != cop0::EXC_INT
-            && code != cop0::EXC_SYS
-            && self.exception_log.len() < 24
-        {
+        if code != cop0::EXC_INT && code != cop0::EXC_SYS && self.exception_log.len() < 24 {
             self.exception_log
                 .push((code, self.current_pc, self.gpr[31]));
         }
@@ -216,10 +215,7 @@ impl Cpu {
             0x07 => self.branch((self.gpr(rs) as i32) > 0, simm, false),
             0x08 => self.add_imm(rt, rs, simm, true),
             0x09 => self.set_gpr(rt, self.gpr(rs).wrapping_add(simm)),
-            0x0A => self.set_gpr(
-                rt,
-                u32::from((self.gpr(rs) as i32) < (simm as i32)),
-            ),
+            0x0A => self.set_gpr(rt, u32::from((self.gpr(rs) as i32) < (simm as i32))),
             0x0B => self.set_gpr(rt, u32::from(self.gpr(rs) < simm)),
             0x0C => self.set_gpr(rt, self.gpr(rs) & u32::from(imm)),
             0x0D => self.set_gpr(rt, self.gpr(rs) | u32::from(imm)),
@@ -234,10 +230,25 @@ impl Cpu {
             0x24 => self.load(bus, rt, self.gpr(rs).wrapping_add(simm), Width::Byte, false),
             0x25 => self.load(bus, rt, self.gpr(rs).wrapping_add(simm), Width::Half, false),
             0x26 => self.lwr(bus, rt, self.gpr(rs).wrapping_add(simm)),
-            0x28 => self.store(bus, self.gpr(rt), self.gpr(rs).wrapping_add(simm), Width::Byte),
-            0x29 => self.store(bus, self.gpr(rt), self.gpr(rs).wrapping_add(simm), Width::Half),
+            0x28 => self.store(
+                bus,
+                self.gpr(rt),
+                self.gpr(rs).wrapping_add(simm),
+                Width::Byte,
+            ),
+            0x29 => self.store(
+                bus,
+                self.gpr(rt),
+                self.gpr(rs).wrapping_add(simm),
+                Width::Half,
+            ),
             0x2A => self.swl(bus, rt, self.gpr(rs).wrapping_add(simm)),
-            0x2B => self.store(bus, self.gpr(rt), self.gpr(rs).wrapping_add(simm), Width::Word),
+            0x2B => self.store(
+                bus,
+                self.gpr(rt),
+                self.gpr(rs).wrapping_add(simm),
+                Width::Word,
+            ),
             0x2E => self.swr(bus, rt, self.gpr(rs).wrapping_add(simm)),
             0x32 => self.lwc2(bus, rt, self.gpr(rs).wrapping_add(simm)),
             0x3A => self.swc2(bus, rt, self.gpr(rs).wrapping_add(simm)),
@@ -252,10 +263,7 @@ impl Cpu {
             0x03 => self.set_gpr(rd, ((self.gpr(rt) as i32) >> sa) as u32),
             0x04 => self.set_gpr(rd, self.gpr(rt).wrapping_shl(self.gpr(rs) & 0x1F)),
             0x06 => self.set_gpr(rd, self.gpr(rt).wrapping_shr(self.gpr(rs) & 0x1F)),
-            0x07 => self.set_gpr(
-                rd,
-                ((self.gpr(rt) as i32) >> (self.gpr(rs) & 0x1F)) as u32,
-            ),
+            0x07 => self.set_gpr(rd, ((self.gpr(rt) as i32) >> (self.gpr(rs) & 0x1F)) as u32),
             0x08 => self.jr(self.gpr(rs), None),
             0x09 => self.jr(self.gpr(rs), Some(rd)),
             0x0C => self.exception(bus, cop0::EXC_SYS, 0),
@@ -307,10 +315,7 @@ impl Cpu {
             0x25 => self.set_gpr(rd, self.gpr(rs) | self.gpr(rt)),
             0x26 => self.set_gpr(rd, self.gpr(rs) ^ self.gpr(rt)),
             0x27 => self.set_gpr(rd, !(self.gpr(rs) | self.gpr(rt))),
-            0x2A => self.set_gpr(
-                rd,
-                u32::from((self.gpr(rs) as i32) < (self.gpr(rt) as i32)),
-            ),
+            0x2A => self.set_gpr(rd, u32::from((self.gpr(rs) as i32) < (self.gpr(rt) as i32))),
             0x2B => self.set_gpr(rd, u32::from(self.gpr(rs) < self.gpr(rt))),
             _ => self.exception(bus, cop0::EXC_RI, 0),
         }
@@ -331,7 +336,8 @@ impl Cpu {
         let b = self.gpr(rt) as i32;
         match a.checked_add(b) {
             Some(v) => self.set_gpr(rd, v as u32),
-            None if trap => { /* overflow: handled by returning without write; caller exceptions */ }
+            None if trap => { /* overflow: handled by returning without write; caller exceptions */
+            }
             None => self.set_gpr(rd, a.wrapping_add(b) as u32),
         }
     }

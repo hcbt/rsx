@@ -14,9 +14,7 @@ pub fn write_png(area: &DisplayArea, path: &Path) -> Result<(), String> {
     let mut enc = png::Encoder::new(BufWriter::new(file), area.width, area.height);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc
-        .write_header()
-        .map_err(|e| format!("png header: {e}"))?;
+    let mut writer = enc.write_header().map_err(|e| format!("png header: {e}"))?;
     writer
         .write_image_data(&area.to_rgb888())
         .map_err(|e| format!("png data: {e}"))?;
@@ -32,10 +30,26 @@ pub fn capture_at_vblanks(
     let mut written = Vec::new();
     for &n in vblanks {
         machine.run_until_vblank_count(n);
+        let area = machine.display_area();
         let path = dir.join(format!("v{n:04}.png"));
-        write_png(&machine.display_area(), &path)?;
+        write_png(&area, &path)?;
         let latest = dir.join("latest.png");
-        write_png(&machine.display_area(), &latest)?;
+        write_png(&area, &latest)?;
+        let (dx, dy, dw, dh, on) = machine.display_origin();
+        let (ox, oy, x1, y1, x2, y2) = machine.draw_env();
+        let (n30, px0, px1, py0, py1, nout) = machine.last_gouraud_tri_stats();
+        let (cn, cx0, cx1, cy0, cy1) = machine.gouraud_tri_stats();
+        eprintln!(
+            "captured {} {}x{} display=({dx},{dy}) {dw}x{dh} on={on} ofs=({ox},{oy}) clip=({x1},{y1})-({x2},{y2}) hash={:016x} last30 n={n30} out={nout} xy=({px0},{py0})-({px1},{py1}) now30 n={cn} xy=({cx0},{cy0})-({cx1},{cy1}) GTE H={:#x} OFX={:#x} OFY={:#x} ZSF3={:#x}",
+            path.display(),
+            area.width,
+            area.height,
+            machine.display_area_hash(),
+            machine.gte_control(26) & 0xFFFF,
+            machine.gte_control(24),
+            machine.gte_control(25),
+            machine.gte_control(29) & 0xFFFF,
+        );
         written.push(path);
     }
     Ok(written)

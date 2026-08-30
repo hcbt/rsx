@@ -175,10 +175,7 @@ impl Cdrom {
             0x08 | 0x09 => {
                 self.reading = false;
                 let stat = self.controller_stat();
-                (
-                    Some((2000, 3, vec![stat])),
-                    Some((10_000, 2, vec![stat])),
-                )
+                (Some((2000, 3, vec![stat])), Some((10_000, 2, vec![stat])))
             }
             0x0A => {
                 if self.disc.is_some() {
@@ -186,10 +183,7 @@ impl Cdrom {
                 }
                 self.reading = false;
                 let stat = self.controller_stat();
-                (
-                    Some((5000, 3, vec![stat])),
-                    Some((20_000, 2, vec![stat])),
-                )
+                (Some((5000, 3, vec![stat])), Some((20_000, 2, vec![stat])))
             }
             0x0C => (Some((1000, 3, vec![self.controller_stat()])), None), // Demute
             0x0E => {
@@ -202,10 +196,7 @@ impl Cdrom {
                 // SeekL
                 self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
                 let stat = self.controller_stat();
-                (
-                    Some((2000, 3, vec![stat])),
-                    Some((15_000, 2, vec![stat])),
-                )
+                (Some((2000, 3, vec![stat])), Some((15_000, 2, vec![stat])))
             }
             0x19 => {
                 let sub = self.param.first().copied().unwrap_or(0);
@@ -235,14 +226,15 @@ impl Cdrom {
             Some(disc) => {
                 let mut id = vec![stat, 0x00, 0x20, 0x00];
                 id.extend_from_slice(&disc.region);
-                (
-                    Some((4000, 3, vec![stat])),
-                    Some((50_000, 2, id)),
-                )
+                (Some((4000, 3, vec![stat])), Some((50_000, 2, id)))
             }
             None => (
                 Some((4000, 3, vec![stat])),
-                Some((30_000, 5, vec![0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
+                Some((
+                    30_000,
+                    5,
+                    vec![0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                )),
             ),
         }
     }

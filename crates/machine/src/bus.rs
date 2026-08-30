@@ -247,7 +247,9 @@ impl Bus {
             0xFFFE_0130 => self.cache_ctrl,
             0x1F80_1040 => u32::from(self.joy.read16(p)),
             0x1F80_1044 => u32::from(self.joy.stat()),
-            0x1F80_1048 => u32::from(self.joy.read16(p)) | (u32::from(self.joy.read16(p + 2)) << 16),
+            0x1F80_1048 => {
+                u32::from(self.joy.read16(p)) | (u32::from(self.joy.read16(p + 2)) << 16)
+            }
             0x1F80_1050..=0x1F80_105C => 0x0000_0005,
             _ => 0xFFFF_FFFF, // open bus-ish
         })
@@ -271,7 +273,10 @@ impl Bus {
             _ => {
                 let shift = (p & 3) * 8;
                 if let Some(cur) = self.read32(addr & !3) {
-                    self.write32(addr & !3, (cur & !(0xFF << shift)) | (u32::from(value) << shift));
+                    self.write32(
+                        addr & !3,
+                        (cur & !(0xFF << shift)) | (u32::from(value) << shift),
+                    );
                 }
             }
         }
@@ -347,7 +352,7 @@ impl Bus {
 
 fn phys(addr: u32) -> u32 {
     match addr >> 29 {
-        0 => addr,              // KUSEG
+        0 => addr,               // KUSEG
         4 => addr & 0x1FFF_FFFF, // KSEG0
         5 => addr & 0x1FFF_FFFF, // KSEG1
         _ => addr,               // KSEG2 / cache control

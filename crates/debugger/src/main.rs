@@ -39,8 +39,7 @@ impl Debugger {
     fn load(&mut self, bios: PathBuf, disc: Option<PathBuf>) {
         match Machine::from_bios_path(&bios) {
             Ok(mut m) => {
-                self.log
-                    .push(format!("loaded BIOS {}", bios.display()));
+                self.log.push(format!("loaded BIOS {}", bios.display()));
                 if let Some(p) = disc {
                     if let Err(e) = m.insert_disc(&p) {
                         self.machine = None;
@@ -102,28 +101,32 @@ impl eframe::App for Debugger {
             }
         });
 
-        egui::SidePanel::left("regs").resizable(true).show(ctx, |ui| {
-            ui.heading("CPU");
-            if let Some(m) = self.machine.as_ref() {
-                ui.monospace(format!("PC {:08X}", m.pc()));
-                ui.monospace(format!("GPUSTAT {:08X}", m.gpustat()));
-                ui.monospace(format!("vblank {}", m.vblank_count()));
-                for i in 0..32u8 {
-                    ui.monospace(format!("r{i:02} {:08X}", m.gpr(i)));
-                }
-            } else if let Some(e) = &self.error {
-                ui.colored_label(egui::Color32::RED, e);
-            }
-        });
-
-        egui::TopBottomPanel::bottom("log").resizable(true).show(ctx, |ui| {
-            ui.heading("I/O + IRQ log");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for line in &self.log {
-                    ui.monospace(line);
+        egui::SidePanel::left("regs")
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("CPU");
+                if let Some(m) = self.machine.as_ref() {
+                    ui.monospace(format!("PC {:08X}", m.pc()));
+                    ui.monospace(format!("GPUSTAT {:08X}", m.gpustat()));
+                    ui.monospace(format!("vblank {}", m.vblank_count()));
+                    for i in 0..32u8 {
+                        ui.monospace(format!("r{i:02} {:08X}", m.gpr(i)));
+                    }
+                } else if let Some(e) = &self.error {
+                    ui.colored_label(egui::Color32::RED, e);
                 }
             });
-        });
+
+        egui::TopBottomPanel::bottom("log")
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("I/O + IRQ log");
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for line in &self.log {
+                        ui.monospace(line);
+                    }
+                });
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Display area");

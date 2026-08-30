@@ -38,6 +38,18 @@ pub struct Gpu {
     pub gp1_cmds: Vec<u32>,
     odd_frame: bool,
     in_vblank: bool,
+    pub frame_n30: u32,
+    pub frame_x0: i32,
+    pub frame_x1: i32,
+    pub frame_y0: i32,
+    pub frame_y1: i32,
+    pub last_n30: u32,
+    pub last_x0: i32,
+    pub last_x1: i32,
+    pub last_y0: i32,
+    pub last_y1: i32,
+    pub last_n30_out: u32,
+    frame_n30_out: u32,
 }
 
 #[allow(dead_code)]
@@ -89,6 +101,18 @@ impl Gpu {
             gp1_cmds: Vec::new(),
             odd_frame: false,
             in_vblank: false,
+            frame_n30: 0,
+            frame_x0: i32::MAX,
+            frame_x1: i32::MIN,
+            frame_y0: i32::MAX,
+            frame_y1: i32::MIN,
+            last_n30: 0,
+            last_x0: 0,
+            last_x1: 0,
+            last_y0: 0,
+            last_y1: 0,
+            last_n30_out: 0,
+            frame_n30_out: 0,
         };
         g.update_stat();
         g
@@ -387,8 +411,7 @@ impl Gpu {
             };
             idx += 1;
             let xy = self.gp0_buf[idx];
-            let x = (xy as i16) as i32 + self.off_x;
-            let y = ((xy >> 16) as i16) as i32 + self.off_y;
+            let (x, y) = self.vertex_xy(xy);
             let mut u = 0u8;
             let mut v = 0u8;
             if textured {
@@ -409,6 +432,19 @@ impl Gpu {
             }
             verts[i] = (x, y, color, u, v);
         }
+        if (cmd >> 24) as u8 == 0x30 {
+            self.frame_n30 += 1;
+            for i in 0..nvert {
+                let (x, y) = (verts[i].0, verts[i].1);
+                self.frame_x0 = self.frame_x0.min(x);
+                self.frame_x1 = self.frame_x1.max(x);
+                self.frame_y0 = self.frame_y0.min(y);
+                self.frame_y1 = self.frame_y1.max(y);
+                if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
+                    self.frame_n30_out += 1;
+                }
+            }
+        }
         self.tri(verts[0], verts[1], verts[2], textured);
         if quad {
             self.tri(verts[1], verts[2], verts[3], textured);
@@ -428,6 +464,12 @@ impl Gpu {
         let maxy = a.1.max(b.1).max(c.1).min(self.draw_y2);
         let area = orient(a.0, a.1, b.0, b.1, c.0, c.1);
         if area == 0 {
+            return;
+        }
+        // SPX: polygons exceeding 1023 x or 511 y between vertices are not rendered.
+        let dx = a.0.max(b.0).max(c.0) - a.0.min(b.0).min(c.0);
+        let dy = a.1.max(b.1).max(c.1) - a.1.min(b.1).min(c.1);
+        if dx > 1023 || dy > 511 {
             return;
         }
         for y in miny..=maxy {
@@ -490,28 +532,37 @@ impl Gpu {
             if word & 0xF000_F000 == 0x5000_5000 {
                 break;
             }
-            let x0 = (prev as i16) as i32 + self.off_x;
-            let y0 = ((prev >> 16) as i16) as i32 + self.off_y;
-            let x1 = (word as i16) as i32 + self.off_x;
-            let y1 = ((word >> 16) as i16) as i32 + self.off_y;
-            self.draw_line(x0, y0, x1, y1, rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF));
+            let (x0, y0) = self.vertex_xy(prev);
+            let (x1, y1) = self.vertex_xy(word);
+            self.draw_line(
+                x0,
+                y0,
+                x1,
+                y1,
+                rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF),
+            );
             prev = word;
             i += 1;
         }
         if self.gp0_buf.len() == 3 {
             let a = self.gp0_buf[1];
             let b = self.gp0_buf[2];
+            let (ax, ay) = self.vertex_xy(a);
+            let (bx, by) = self.vertex_xy(b);
             self.draw_line(
-                (a as i16) as i32 + self.off_x,
-                ((a >> 16) as i16) as i32 + self.off_y,
-                (b as i16) as i32 + self.off_x,
-                ((b >> 16) as i16) as i32 + self.off_y,
+                ax,
+                ay,
+                bx,
+                by,
                 rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF),
             );
         }
     }
 
     fn draw_line(&mut self, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u16) {
+        if (x0 - x1).abs() > 1023 || (y0 - y1).abs() > 511 {
+            return;
+        }
         let dx = (x1 - x0).abs();
         let sx = if x0 < x1 { 1 } else { -1 };
         let dy = -(y1 - y0).abs();
@@ -540,8 +591,7 @@ impl Gpu {
         let textured = cmd & (1 << 26) != 0;
         let color = self.gp0_buf[0] & 0xFF_FFFF;
         let xy = self.gp0_buf[1];
-        let x = (xy as i16) as i32 + self.off_x;
-        let y = ((xy >> 16) as i16) as i32 + self.off_y;
+        let (x, y) = self.vertex_xy(xy);
         let mut idx = 2;
         let (u0, v0) = if textured {
             let uv = self.gp0_buf[idx];
@@ -613,6 +663,12 @@ impl Gpu {
             }
             _ => self.read_half(tx_base + uu, ty_base + vv),
         }
+    }
+
+    fn vertex_xy(&self, word: u32) -> (i32, i32) {
+        let x = trunc11(sign11(word & 0x7FF) + self.off_x);
+        let y = trunc11(sign11((word >> 16) & 0x7FF) + self.off_y);
+        (x, y)
     }
 
     fn plot(&mut self, x: i32, y: i32, color: u16, textured: bool) {
@@ -692,6 +748,17 @@ impl Gpu {
         )
     }
 
+    pub fn draw_env(&self) -> (i32, i32, i32, i32, i32, i32) {
+        (
+            self.off_x,
+            self.off_y,
+            self.draw_x1,
+            self.draw_y1,
+            self.draw_x2,
+            self.draw_y2,
+        )
+    }
+
     pub fn display_area(&self) -> DisplayArea {
         let w = self.display_hres.max(1).min(640);
         let h = self.display_vres.max(1).min(480);
@@ -720,6 +787,18 @@ impl Gpu {
     pub fn tick(&mut self, vblank: bool) {
         if vblank && !self.in_vblank {
             self.odd_frame = !self.odd_frame;
+            self.last_n30 = self.frame_n30;
+            self.last_x0 = self.frame_x0;
+            self.last_x1 = self.frame_x1;
+            self.last_y0 = self.frame_y0;
+            self.last_y1 = self.frame_y1;
+            self.last_n30_out = self.frame_n30_out;
+            self.frame_n30 = 0;
+            self.frame_n30_out = 0;
+            self.frame_x0 = i32::MAX;
+            self.frame_x1 = i32::MIN;
+            self.frame_y0 = i32::MAX;
+            self.frame_y1 = i32::MIN;
         }
         self.in_vblank = vblank;
         self.update_stat();
@@ -850,9 +929,175 @@ mod tests {
             "BIOS-sized 2C sprite must cover the dest rect (lit={lit} / 11520)"
         );
     }
+
+    fn xy(x: i32, y: i32) -> u32 {
+        (x as u16 as u32) | ((y as u16 as u32) << 16)
+    }
+
+    /// 11-bit X/Y with unused bits 11–15 / 27–31 set (would parse as i16 ≈ −2038).
+    fn xy_unused_junk(x: i32, y: i32) -> u32 {
+        let x11 = (x as u32) & 0x7FF;
+        let y11 = (y as u32) & 0x7FF;
+        (x11 | 0xF800) | ((y11 | 0xF800) << 16)
+    }
+
+    fn clip(gpu: &mut Gpu, x1: i32, y1: i32, x2: i32, y2: i32) {
+        gpu.gp0(0xE3 << 24 | (x1 as u32 & 0x3FF) | ((y1 as u32 & 0x1FF) << 10));
+        gpu.gp0(0xE4 << 24 | (x2 as u32 & 0x3FF) | ((y2 as u32 & 0x1FF) << 10));
+    }
+
+    fn offset(gpu: &mut Gpu, x: i32, y: i32) {
+        gpu.gp0(0xE5 << 24 | (x as u32 & 0x7FF) | ((y as u32 & 0x7FF) << 11));
+    }
+
+    fn red_count(pixels: &[u16]) -> usize {
+        pixels.iter().filter(|p| *p & 0x7FFF == 0x001F).count()
+    }
+
+    fn blue_count(pixels: &[u16]) -> usize {
+        pixels.iter().filter(|p| *p & 0x7FFF == 0x7C00).count()
+    }
+
+    #[test]
+    fn vertex_xy_ignores_unused_bits_that_would_sign_extend_as_i16() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        // GP0(20) red triangle at (10,10)-(20,10)-(10,20). Junk bits make i16 X = −2038.
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy_unused_junk(10, 10));
+        gpu.gp0(xy_unused_junk(20, 10));
+        gpu.gp0(xy_unused_junk(10, 20));
+        let pix = gpu.vram_rect(10, 10, 10, 10);
+        let lit = red_count(&pix.pixels);
+        assert!(
+            lit > 8,
+            "signed 11-bit verts must plot at (10,10), not the i16 junk (lit={lit})"
+        );
+    }
+
+    #[test]
+    fn drawing_offset_is_added_then_truncated_to_signed_11bit() {
+        // vertex −600 + offset −512 = −1112, trunc11 → 936. Without trunc the
+        // pixel is clipped (x < 0).
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, -512, 0);
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(-600, 10));
+        gpu.gp0(xy(-580, 10));
+        gpu.gp0(xy(-600, 30));
+        let pix = gpu.vram_rect(930, 10, 20, 20);
+        let lit = red_count(&pix.pixels);
+        assert!(
+            lit > 8,
+            "offset then trunc11 must land the triangle at x≈936 (lit={lit})"
+        );
+    }
+
+    #[test]
+    fn both_polygon_windings_plot() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        // CCW red.
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(20, 10));
+        gpu.gp0(xy(40, 10));
+        gpu.gp0(xy(20, 30));
+        // CW blue over the same triangle.
+        gpu.gp0(0x20 << 24 | 0xF80000);
+        gpu.gp0(xy(20, 10));
+        gpu.gp0(xy(20, 30));
+        gpu.gp0(xy(40, 10));
+        let pix = gpu.vram_rect(20, 10, 20, 20);
+        let blue = blue_count(&pix.pixels);
+        assert!(
+            blue > 8,
+            "GPU draws both windings; CW overdraw must leave blue (blue={blue})"
+        );
+    }
+
+    #[test]
+    fn quad_splits_as_vertices_1_2_3_then_2_3_4() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x28 << 24 | 0x0000F8);
+        gpu.gp0(xy(10, 10));
+        gpu.gp0(xy(20, 10));
+        gpu.gp0(xy(10, 20));
+        gpu.gp0(xy(50, 50));
+        let first = gpu.vram_rect(11, 11, 4, 4);
+        let second = gpu.vram_rect(42, 42, 8, 8);
+        let lit_first = red_count(&first.pixels);
+        let lit_second = red_count(&second.pixels);
+        assert!(
+            lit_first > 0,
+            "first tri (v0,v1,v2) must fill near (10,10) (lit={lit_first})"
+        );
+        assert!(
+            lit_second > 0,
+            "second tri (v1,v2,v3) must fill near v3 (50,50) (lit={lit_second})"
+        );
+    }
+
+    #[test]
+    fn oversized_polygon_is_not_rendered() {
+        // SPX: max vertex distance 1023 x, 511 y. A 600-px-tall tri is dropped;
+        // a 500-px-tall tri is drawn.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(20, -300));
+        gpu.gp0(xy(40, -300));
+        gpu.gp0(xy(20, 300));
+        assert_eq!(
+            red_count(&gpu.vram_rect(0, 0, 64, 64).pixels),
+            0,
+            "triangle taller than 511 must not plot"
+        );
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(80, -100));
+        gpu.gp0(xy(100, -100));
+        gpu.gp0(xy(80, 400));
+        let lit = red_count(&gpu.vram_rect(80, 0, 24, 64).pixels);
+        assert!(
+            lit > 8,
+            "triangle within 511 vertical must still plot (lit={lit})"
+        );
+    }
+
+    #[test]
+    fn gouraud_triangle_interpolates_per_vertex_rgb() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x30 << 24 | 0x0000F8); // v0 red
+        gpu.gp0(xy(0, 0));
+        gpu.gp0(0x0000F8); // v1 red (same)
+        gpu.gp0(xy(40, 0));
+        gpu.gp0(0xF80000); // v2 blue
+        gpu.gp0(xy(0, 40));
+        let pix = gpu.vram_rect(2, 20, 8, 8);
+        let mixed = pix.pixels.iter().any(|p| {
+            let r = p & 0x1F;
+            let b = (p >> 10) & 0x1F;
+            r > 2 && b > 2
+        });
+        assert!(
+            mixed,
+            "GP0(30h) must interpolate red and blue (got {:04X?})",
+            pix.pixels
+        );
+    }
 }
 
 fn sign11(v: u32) -> i32 {
-    let v = v as i32;
+    trunc11(v as i32)
+}
+
+fn trunc11(v: i32) -> i32 {
     (v << 21) >> 21
 }
