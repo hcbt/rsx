@@ -9,6 +9,7 @@ mod dma;
 mod gpu;
 mod gte;
 mod irq;
+mod joy;
 mod spu;
 mod timers;
 
@@ -168,6 +169,14 @@ impl Machine {
     pub fn exception_log(&self) -> &[(u8, u32, u32)] {
         &self.cpu.exception_log
     }
+
+    pub fn irq_stat(&self) -> u16 {
+        self.bus.irq().read16(0x1F80_1070)
+    }
+
+    pub fn irq_mask(&self) -> u16 {
+        self.bus.irq().read16(0x1F80_1074)
+    }
 }
 
 fn hash_pixels(area: &DisplayArea) -> u64 {
@@ -258,6 +267,29 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_joy_clocks_ff_into_rx() {
+        let bios = bios_with_program(&[
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_1040, // ori t0, t0, 0x1040
+            0x2409_1003, // addiu t1, zero, 0x1003  TXEN | /JOYn
+            0xA509_000A, // sh t1, 10(t0)           JOY_CTRL
+            0x2409_0001, // addiu t1, zero, 1
+            0xA109_0000, // sb t1, 0(t0)            JOY_TX
+            0x0000_0000, // nop
+            0x950A_0004, // lhu t2, 4(t0)           JOY_STAT
+            0x0000_0000, // nop
+            0x910B_0000, // lbu t3, 0(t0)           JOY_RX
+            0x0000_0000, // nop
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..16 {
+            m.step();
+        }
+        assert_eq!(m.gpr(10) & (1 << 1), 1 << 1, "JOY_STAT bit 1 (RX not empty)");
+        assert_eq!(m.gpr(11), 0xFF, "empty port must clock 0xFF into RX");
+    }
+
+    #[test]
     fn ori_combines_with_lui() {
         let bios = bios_with_program(&[
             0x3C08_0013, // lui $t0, 0x0013
@@ -303,6 +335,23 @@ mod tests {
             m.exception_log().iter().all(|e| e.0 != 9),
             "Intro hit BREAK (exc={:?})",
             m.exception_log()
+        );
+    }
+
+    #[test]
+    fn bios_leaves_joy_wait_when_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        if !path.exists() {
+            eprintln!("skipping: no local SCPH1001.BIN");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&path).unwrap();
+        m.run_until_vblank_count(450);
+        assert_ne!(
+            m.pc() & 0xFFFF,
+            0x45D0,
+            "BIOS stuck waiting for JOY RX (pc={:08X})",
+            m.pc()
         );
     }
 }

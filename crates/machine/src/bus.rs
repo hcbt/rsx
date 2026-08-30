@@ -2,6 +2,7 @@ use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::Irq;
+use crate::joy::Joy;
 use crate::spu::Spu;
 use crate::timers::Timers;
 
@@ -22,6 +23,7 @@ pub struct Bus {
     cdrom: Cdrom,
     dma: Dma,
     irq: Irq,
+    joy: Joy,
     timers: Timers,
     cycles: u64,
     scanline: u32,
@@ -59,6 +61,7 @@ impl Bus {
             cdrom: Cdrom::new(),
             dma: Dma::new(),
             irq: Irq::new(),
+            joy: Joy::new(),
             timers: Timers::new(),
             cycles: 0,
             scanline: 0,
@@ -81,6 +84,7 @@ impl Bus {
         self.cdrom.reset();
         self.dma.reset();
         self.irq.reset();
+        self.joy.reset();
         self.timers.reset();
         self.cycles = 0;
         self.scanline = 0;
@@ -176,6 +180,7 @@ impl Bus {
         match p {
             0x0000_0000..=0x007F_FFFF => Some(self.ram[(p as usize) & (RAM_SIZE - 1)]),
             0x1F80_0000..=0x1F80_03FF => Some(self.scratch[(p - 0x1F80_0000) as usize]),
+            0x1F80_1040..=0x1F80_104F => Some(self.joy.read8(p)),
             0x1F80_1800..=0x1F80_1803 => Some(self.cdrom.read8(p)),
             0x1FC0_0000..=0x1FFF_FFFF => {
                 let off = (p - 0x1FC0_0000) as usize;
@@ -194,7 +199,7 @@ impl Bus {
             0x1F80_1C00..=0x1F80_1FFF => Some(self.spu.read16(p)),
             0x1F80_1070..=0x1F80_1076 => Some(self.irq.read16(p)),
             0x1F80_1100..=0x1F80_112F => Some(self.timers.read16(p)),
-            0x1F80_1044 => Some(0x0005), // JOY_STAT: ready
+            0x1F80_1040..=0x1F80_104F => Some(self.joy.read16(p)),
             0x1F80_1054 => Some(0x0005),
             _ => self.read32(addr & !3).map(|v| {
                 if p & 2 != 0 {
@@ -230,7 +235,10 @@ impl Bus {
                 u32::from_le_bytes(self.bios[off..off + 4].try_into().unwrap_or([0; 4]))
             }
             0xFFFE_0130 => self.cache_ctrl,
-            0x1F80_1040..=0x1F80_105C => 0x0000_0005,
+            0x1F80_1040 => u32::from(self.joy.read16(p)),
+            0x1F80_1044 => u32::from(self.joy.stat()),
+            0x1F80_1048 => u32::from(self.joy.read16(p)) | (u32::from(self.joy.read16(p + 2)) << 16),
+            0x1F80_1050..=0x1F80_105C => 0x0000_0005,
             _ => 0xFFFF_FFFF, // open bus-ish
         })
     }
@@ -244,6 +252,7 @@ impl Bus {
             0x1F80_0000..=0x1F80_03FF => {
                 self.scratch[(p - 0x1F80_0000) as usize] = value;
             }
+            0x1F80_1040..=0x1F80_104F => self.joy.write8(p, value),
             0x1F80_1800..=0x1F80_1803 => {
                 self.note_io(p);
                 self.cdrom.write8(p, value, &mut self.irq);
@@ -263,6 +272,7 @@ impl Bus {
         self.note_io(p);
         match p {
             0x1F80_1C00..=0x1F80_1FFF => self.spu.write16(p, value),
+            0x1F80_1040..=0x1F80_104F => self.joy.write16(p, value),
             0x1F80_1070..=0x1F80_1076 => self.irq.write16(p, value),
             0x1F80_1100..=0x1F80_112F => self.timers.write16(p, value),
             _ => {
@@ -307,6 +317,11 @@ impl Bus {
                 );
             }
             0x1F80_1100..=0x1F80_1128 => self.timers.write16(p, value as u16),
+            0x1F80_1040 => self.joy.write16(p, value as u16),
+            0x1F80_1048 => {
+                self.joy.write16(p, value as u16);
+                self.joy.write16(p + 2, (value >> 16) as u16);
+            }
             0x1F80_1810 => self.gpu.gp0(value),
             0x1F80_1814 => self.gpu.gp1(value),
             0x1F80_1C00..=0x1F80_1FFF => {
