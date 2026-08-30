@@ -831,6 +831,15 @@ mod tests {
             diamond_lit > 50_000,
             "diamond / fade must occupy the GP1 display rectangle (lit={diamond_lit})"
         );
+        let w = diamond.width as usize;
+        let lower = diamond.pixels[240 * w..]
+            .iter()
+            .filter(|p| **p & 0x7FFF != 0)
+            .count();
+        assert!(
+            lower > 1_000,
+            "480i must latch both fields; lower half must not stay black (lower={lower})"
+        );
 
         m.run_until_vblank_count(550);
         let display = m.display_area();
@@ -931,6 +940,38 @@ mod tests {
         assert!(
             black > 200_000,
             "licensed screen is still black (black={black} pc={:08X})",
+            m.pc()
+        );
+    }
+
+    #[test]
+    fn crash_reaches_512x240_when_present() {
+        let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../roms/Crash Bandicoot (USA)/Crash Bandicoot (USA).cue");
+        if !bios.exists() || !disc.exists() {
+            eprintln!("skipping: no local BIOS or Disc");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&bios).unwrap();
+        m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(2000);
+        let (dx, dy, dw, dh, _) = m.display_origin();
+        assert_eq!(
+            (dw, dh),
+            (512, 240),
+            "Crash must leave the licensed 640×480 by vblank 2000 (pc={:08X} origin=({dx},{dy}) {dw}×{dh})",
+            m.pc()
+        );
+        let lit = m
+            .display_area()
+            .pixels
+            .iter()
+            .filter(|p| **p & 0x7FFF != 0)
+            .count();
+        assert!(
+            lit > 1_000,
+            "Crash 512×240 must not stay a blank buffer (lit={lit} pc={:08X})",
             m.pc()
         );
     }

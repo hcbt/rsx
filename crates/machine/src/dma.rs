@@ -28,7 +28,6 @@ pub struct Dma {
     dpcr: u32,
     dicr: u32,
     job: Option<Job>,
-    pending_ch: Option<usize>,
     credit: u32,
     words_done: u32,
     hyper_pause: bool,
@@ -56,7 +55,6 @@ impl Dma {
             dpcr: 0x0765_4321,
             dicr: 0,
             job: None,
-            pending_ch: None,
             credit: 0,
             words_done: 0,
             hyper_pause: false,
@@ -228,7 +226,7 @@ impl Dma {
             return;
         }
         if self.job.is_some() {
-            self.pending_ch = Some(ch);
+            // CHCR.24 stays set; pick_next runs this channel when the bus is free.
             return;
         }
         self.credit = 0;
@@ -535,10 +533,29 @@ impl Dma {
             self.dicr |= 1 << (24 + ch);
         }
         self.update_master(irq);
-        if let Some(next) = self.pending_ch.take() {
-            if self.chcr[next] & (1 << 24) != 0 {
-                self.start(next, ram);
+        self.pick_next(ram);
+    }
+
+    fn pick_next(&mut self, ram: &[u8]) {
+        if self.job.is_some() {
+            return;
+        }
+        let mut best: Option<(u8, usize)> = None;
+        for ch in 0..7 {
+            if self.chcr[ch] & (1 << 24) == 0 {
+                continue;
             }
+            if (self.dpcr >> (ch * 4 + 3)) & 1 == 0 {
+                continue;
+            }
+            let pri = ((self.dpcr >> (ch * 4)) & 7) as u8;
+            match best {
+                Some((p, _)) if pri >= p => {}
+                _ => best = Some((pri, ch)),
+            }
+        }
+        if let Some((_, ch)) = best {
+            self.start(ch, ram);
         }
     }
 
@@ -712,5 +729,148 @@ mod tests {
             "far then near: overlap must be the near (blue) primitive (blue={blue} red={red} pix={:04X?})",
             overlap.pixels
         );
+    }
+
+    #[test]
+    fn a_second_channel_does_not_drop_a_waiting_one() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+
+        gpu.gp0(0xE3 << 24);
+        gpu.gp0(0xE4 << 24 | 1023 | (511 << 10));
+
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+
+        poke(&mut ram, 0x3000, 0xDEAD_BEEF);
+        poke(&mut ram, 0x2000, (4 << 24) | 0x00FF_FFFF);
+        poke(&mut ram, 0x2004, 0x20 << 24 | 0x0000F8);
+        poke(&mut ram, 0x2008, xy(10, 10));
+        poke(&mut ram, 0x200C, xy(40, 10));
+        poke(&mut ram, 0x2010, xy(10, 40));
+
+        // OTC 64 words, then CD, then GPU — the third start used to overwrite the
+        // waiting CD channel and leave it busy forever.
+        dma.write32(
+            0x1F80_10E0,
+            0x80,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E4,
+            64,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E8,
+            0x1100_0002,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B0,
+            0x3000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B4,
+            1,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B8,
+            0x1100_0000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A0,
+            0x2000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x0100_0401,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+
+        for _ in 0..20_000 {
+            if !dma.active()
+                && dma.read32(0x1F80_10E8) & (1 << 24) == 0
+                && dma.read32(0x1F80_10B8) & (1 << 24) == 0
+                && dma.read32(0x1F80_10A8) & (1 << 24) == 0
+                && gpu.fifo_is_empty()
+                && !gpu.busy()
+            {
+                break;
+            }
+            gpu.tick(1, 0, false);
+            dma.tick(1, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        }
+
+        assert_eq!(
+            dma.read32(0x1F80_10E8) & (1 << 24),
+            0,
+            "OTC CHCR must complete"
+        );
+        assert_eq!(
+            dma.read32(0x1F80_10B8) & (1 << 24),
+            0,
+            "CD CHCR must complete, not stay queued behind GPU"
+        );
+        assert_eq!(
+            dma.read32(0x1F80_10A8) & (1 << 24),
+            0,
+            "GPU CHCR must complete"
+        );
+        assert_ne!(
+            peek(&ram, 0x3000),
+            0xDEAD_BEEF,
+            "CD DMA must still write its destination"
+        );
+        let pix = gpu.vram_rect(12, 12, 8, 8);
+        let red = pix.pixels.iter().filter(|p| **p & 0x7FFF == 0x001F).count();
+        assert!(red > 4, "GPU list must still draw (red={red})");
     }
 }

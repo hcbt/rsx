@@ -267,7 +267,8 @@ impl Gpu {
         }
         let cmd = (word >> 24) as u8;
         // SPX: GP0(E3h..E5h) do not take FIFO space; they run immediately.
-        if (0xE3..=0xE5).contains(&cmd) {
+        // A parameter of a command already being assembled is not a command.
+        if (0xE3..=0xE5).contains(&cmd) && self.gp0_cmd.is_none() && self.transfer.is_none() {
             let prev_cmd = self.gp0_cmd.take();
             let prev_buf = std::mem::take(&mut self.gp0_buf);
             self.gp0_cmd = Some(cmd);
@@ -1031,7 +1032,18 @@ impl Gpu {
                 self.crt_h = h;
                 self.crt.resize((w * h) as usize, 0);
             }
-            if line < h {
+            if h >= 480 {
+                // 480i: 240 visible lines per field into even/odd CRT rows.
+                if line < 240 {
+                    let field = u32::from(self.odd_frame);
+                    let crt_y = line * 2 + field;
+                    let vram_y = self.display_y + crt_y;
+                    let row = (crt_y * w) as usize;
+                    for x in 0..w {
+                        self.crt[row + x as usize] = self.read_half(self.display_x + x, vram_y);
+                    }
+                }
+            } else if line < h {
                 let row = (line * w) as usize;
                 for x in 0..w {
                     self.crt[row + x as usize] =
@@ -1210,6 +1222,41 @@ mod tests {
             !gpu.busy(),
             "Fill VRAM is one cycle per 16-pixel unit (16×16 = 16 cycles)"
         );
+    }
+
+    fn scan_field(gpu: &mut Gpu) {
+        for line in 0..243 {
+            gpu.tick(1, line, false);
+        }
+        for line in 243..263 {
+            gpu.tick(1, line, true);
+        }
+    }
+
+    #[test]
+    fn interlaced_480_latches_both_fields() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x08 << 24 | 7); // 640×480
+        gpu.gp1(0x05 << 24); // start (0,0)
+        gpu.gp1(0x03 << 24); // display on
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 1023 | (511 << 10));
+        gpu.gp0(0x02 << 24 | 0x0000F8);
+        gpu.gp0(400u32 << 16);
+        gpu.gp0(16 | (16 << 16));
+        settle(&mut gpu);
+        scan_field(&mut gpu);
+        let first = gpu.display_area();
+        assert_eq!((first.width, first.height), (640, 480));
+        scan_field(&mut gpu);
+        let pix = gpu.display_area();
+        let p = pix.pixels[400 * 640 + 8] & 0x7FFF;
+        assert_eq!(
+            p, 0x001F,
+            "480i must latch VRAM y=400 into the Display area after both fields (got {p:#06X})"
+        );
+        let top = pix.pixels[0] & 0x7FFF;
+        assert_eq!(top, 0, "y=0 was not filled, must stay black");
     }
 
     #[test]
