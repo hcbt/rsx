@@ -288,13 +288,18 @@ impl Gte {
     /// 44-bit MAC1/2/3 (or 32-bit MAC0): flag A1/A2/A3/A0 then sign-extend.
     fn mac(&mut self, axis: u32, v: i64) -> i64 {
         if axis == 0 {
-            if v > i64::from(i32::MAX) || v < i64::from(i32::MIN) {
+            if v > i64::from(i32::MAX) {
                 self.flag(16);
+            } else if v < i64::from(i32::MIN) {
+                self.flag(15);
             }
             (v << 32) >> 32
         } else {
-            if v > (1i64 << 43) - 1 || v < -(1i64 << 43) {
+            // SPX: bits 30/29/28 positive 43-bit overflow, 27/26/25 negative.
+            if v > (1i64 << 43) - 1 {
                 self.flag(31 - axis);
+            } else if v < -(1i64 << 43) {
+                self.flag(28 - axis);
             }
             (v << 20) >> 20
         }
@@ -1015,6 +1020,22 @@ mod tests {
         let f = g.read_control(31);
         assert_ne!(f & (1 << 28), 0, "A3 FLAG.28");
         assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
+    fn mvmva_rtv0tr_applies_translation() {
+        // PSY-Q rtv0tr: sf=1 mx=RT v=V0 cv=TR. Identity RT, TR=(10,20,30), V=0 → IR=TR.
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(5, 10);
+        g.write_control(6, 20);
+        g.write_control(7, 30);
+        g.command(0x0480_012); // rtv0tr
+        assert_eq!(g.read_data(25) as i32, 10, "MAC1");
+        assert_eq!(g.read_data(26) as i32, 20, "MAC2");
+        assert_eq!(g.read_data(27) as i32, 30, "MAC3");
     }
 
     #[test]

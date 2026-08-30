@@ -458,9 +458,10 @@ impl Gpu {
                 }
             }
         }
-        self.tri(verts[0], verts[1], verts[2], textured);
+        let blend = textured && cmd & 1 == 0;
+        self.tri(verts[0], verts[1], verts[2], textured, blend);
         if quad {
-            self.tri(verts[1], verts[2], verts[3], textured);
+            self.tri(verts[1], verts[2], verts[3], textured, blend);
         }
     }
 
@@ -470,6 +471,7 @@ impl Gpu {
         b: (i32, i32, u32, u8, u8),
         c: (i32, i32, u32, u8, u8),
         textured: bool,
+        blend: bool,
     ) {
         let minx = a.0.min(b.0).min(c.0).max(self.draw_x1);
         let maxx = a.0.max(b.0).max(c.0).min(self.draw_x2);
@@ -497,6 +499,25 @@ impl Gpu {
                 if sum == 0 {
                     continue;
                 }
+                let vr = interp(w0, w1, w2, a.2 & 0xFF, b.2 & 0xFF, c.2 & 0xFF, sum) as u32;
+                let vg = interp(
+                    w0,
+                    w1,
+                    w2,
+                    (a.2 >> 8) & 0xFF,
+                    (b.2 >> 8) & 0xFF,
+                    (c.2 >> 8) & 0xFF,
+                    sum,
+                ) as u32;
+                let vb = interp(
+                    w0,
+                    w1,
+                    w2,
+                    (a.2 >> 16) & 0xFF,
+                    (b.2 >> 16) & 0xFF,
+                    (c.2 >> 16) & 0xFF,
+                    sum,
+                ) as u32;
                 let color = if textured {
                     let u = (i64::from(w0) * i64::from(a.3)
                         + i64::from(w1) * i64::from(b.3)
@@ -506,28 +527,14 @@ impl Gpu {
                         + i64::from(w1) * i64::from(b.4)
                         + i64::from(w2) * i64::from(c.4))
                         / i64::from(sum);
-                    self.sample_tex(u as u8, v as u8)
+                    let tex = self.sample_tex(u as u8, v as u8);
+                    if blend {
+                        blend_texel(tex, vr, vg, vb)
+                    } else {
+                        tex
+                    }
                 } else {
-                    let r = interp(w0, w1, w2, a.2 & 0xFF, b.2 & 0xFF, c.2 & 0xFF, sum);
-                    let g = interp(
-                        w0,
-                        w1,
-                        w2,
-                        (a.2 >> 8) & 0xFF,
-                        (b.2 >> 8) & 0xFF,
-                        (c.2 >> 8) & 0xFF,
-                        sum,
-                    );
-                    let bl = interp(
-                        w0,
-                        w1,
-                        w2,
-                        (a.2 >> 16) & 0xFF,
-                        (b.2 >> 16) & 0xFF,
-                        (c.2 >> 16) & 0xFF,
-                        sum,
-                    );
-                    rgb888_to_555(r as u32, g as u32, bl as u32)
+                    rgb888_to_555(vr, vg, vb)
                 };
                 self.plot(x, y, color, textured);
             }
@@ -626,10 +633,16 @@ impl Gpu {
             }
         };
         let pix = rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+        let blend = textured && cmd & 1 == 0;
         for yy in 0..h {
             for xx in 0..w {
                 let color = if textured {
-                    self.sample_tex(u0.wrapping_add(xx as u8), v0.wrapping_add(yy as u8))
+                    let tex = self.sample_tex(u0.wrapping_add(xx as u8), v0.wrapping_add(yy as u8));
+                    if blend {
+                        blend_texel(tex, color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF)
+                    } else {
+                        tex
+                    }
                 } else {
                     pix
                 };
@@ -855,6 +868,19 @@ fn interp(w0: i32, w1: i32, w2: i32, a: u32, b: u32, c: u32, sum: i32) -> i32 {
 
 fn rgb888_to_555(r: u32, g: u32, b: u32) -> u16 {
     ((r >> 3) as u16) | (((g >> 3) as u16) << 5) | (((b >> 3) as u16) << 10)
+}
+
+/// SPX: texture blending is (texel*vertex)/80h per channel; 80h is 1.0, FFh is ~2×.
+fn blend_texel(tex: u16, r: u32, g: u32, b: u32) -> u16 {
+    let tr = u32::from((tex & 0x1F) << 3);
+    let tg = u32::from(((tex >> 5) & 0x1F) << 3);
+    let tb = u32::from(((tex >> 10) & 0x1F) << 3);
+    let out = rgb888_to_555(
+        (tr * r).min(0x7F80) >> 7,
+        (tg * g).min(0x7F80) >> 7,
+        (tb * b).min(0x7F80) >> 7,
+    );
+    out | (tex & 0x8000)
 }
 
 #[cfg(test)]
@@ -1104,6 +1130,49 @@ mod tests {
         assert!(
             mixed,
             "GP0(30h) must interpolate red and blue (got {:04X?})",
+            pix.pixels
+        );
+    }
+
+    #[test]
+    fn textured_gouraud_blends_texel_by_vertex_rgb() {
+        // SPX: blended textured polys multiply texel by vertex colour / 80h.
+        // White CLUT texel * 40h must land near half brightness, not stay 7FFF.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x7FFF;
+        upload_clut(&mut gpu, 0, 0, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(64); // page 1 at x=64
+        gpu.gp0(2 | (8 << 16));
+        for _ in 0..8 {
+            gpu.gp0(0x1111_1111);
+        }
+        gpu.gp0(0x34 << 24 | 0x00404040);
+        gpu.gp0(xy(10, 10));
+        gpu.gp0(0x0000); // uv 0,0 clut (0,0)
+        gpu.gp0(0x00404040);
+        gpu.gp0(xy(26, 10));
+        gpu.gp0((1 << 16) | 0x0008); // tpage 1, uv 8,0
+        gpu.gp0(0x00404040);
+        gpu.gp0(xy(10, 26));
+        gpu.gp0(0x0008_00);
+        let pix = gpu.vram_rect(12, 12, 8, 8);
+        let half = pix
+            .pixels
+            .iter()
+            .filter(|p| {
+                let r = *p & 0x1F;
+                let g = (*p >> 5) & 0x1F;
+                let b = (*p >> 10) & 0x1F;
+                r > 4 && r < 0x1C && g > 4 && g < 0x1C && b > 4 && b < 0x1C
+            })
+            .count();
+        assert!(
+            half > 4,
+            "GP0(34h) 40h blend must dim a white texel (got {:04X?})",
             pix.pixels
         );
     }
