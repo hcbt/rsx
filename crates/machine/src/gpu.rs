@@ -188,6 +188,10 @@ impl Gpu {
         self.fifo.is_empty()
     }
 
+    pub fn fifo_space(&self) -> u32 {
+        (FIFO_WORDS.saturating_sub(self.fifo.len())) as u32
+    }
+
     pub fn draw_remaining(&self) -> u32 {
         self.draw_busy
     }
@@ -1052,18 +1056,9 @@ impl Gpu {
                 self.crt_h = h;
                 self.crt.resize((w * h) as usize, 0);
             }
-            if h >= 480 {
-                // 480i: 240 visible lines per field into even/odd CRT rows.
-                if line < 240 {
-                    let field = u32::from(self.odd_frame);
-                    let crt_y = line * 2 + field;
-                    let vram_y = self.display_y + crt_y;
-                    let row = (crt_y * w) as usize;
-                    for x in 0..w {
-                        self.crt[row + x as usize] = self.read_half(self.display_x + x, vram_y);
-                    }
-                }
-            } else if line < h {
+            // 480i is latched whole at vblank. Line-by-line even/odd weave of two
+            // poses is what the live Display area was showing as combing.
+            if h < 480 && line < h {
                 let row = (line * w) as usize;
                 for x in 0..w {
                     self.crt[row + x as usize] =

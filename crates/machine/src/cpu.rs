@@ -190,7 +190,7 @@ impl Cpu {
 
     fn wait_ram_ready(&mut self, bus: &mut Bus) {
         while bus.ram_blocked() || bus.write_pending() {
-            bus.tick(1);
+            bus.tick(bus.skip_hint());
         }
     }
 
@@ -643,18 +643,18 @@ impl Cpu {
         }
         if Self::is_ram(addr) {
             while bus.write_queue_full() {
-                bus.tick(1);
+                bus.tick(bus.skip_hint());
             }
         }
         let p = addr & 0x1FFF_FFFF & !3;
         if p == 0x1F80_1810 {
             while bus.gpu_fifo_full() {
-                bus.tick(1);
+                bus.tick(bus.skip_hint());
             }
         }
         if (0x1F80_1080..=0x1F80_10FC).contains(&p) {
             while bus.write_pending() {
-                bus.tick(1);
+                bus.tick(bus.skip_hint());
             }
         }
         match width {

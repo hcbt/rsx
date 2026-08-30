@@ -156,11 +156,7 @@ impl Dma {
     ) {
         while cycles > 0 {
             let Some(ch) = self.ready_ch(gpu) else {
-                cycles -= 1;
-                if !self.active() {
-                    break;
-                }
-                continue;
+                break;
             };
             if self.hyper[ch] {
                 self.hyper[ch] = false;

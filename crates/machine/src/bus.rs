@@ -227,6 +227,10 @@ impl Bus {
         }
     }
 
+    pub fn skip_hint(&self) -> u32 {
+        self.step_size(4096).max(1)
+    }
+
     pub fn tick(&mut self, mut cycles: u32) {
         while cycles > 0 {
             let to_line = (CYCLES_PER_LINE - (self.cycles % CYCLES_PER_LINE)) as u32;
@@ -240,33 +244,36 @@ impl Bus {
         if max == 0 {
             return 1;
         }
-        let dma = self.dma.active();
-        let gpu_wait = self.dma.waiting_on_gpu(&self.gpu);
         let draw = self.gpu.draw_remaining();
-        let fifo_work = !self.gpu.fifo_is_empty() || self.gpu.assembling();
-        if dma && !gpu_wait {
+        // While rasterizing the GPU does not pop the FIFO, so a run of draw
+        // cycles (and DMA fills into free FIFO slots) is identical to 1,1,1.
+        if draw > 0 {
+            if self.dma.gpu_from_ram() && !self.dma.waiting_on_gpu(&self.gpu) {
+                return max.min(draw).min(self.gpu.fifo_space().max(1));
+            }
+            let other = self.dma.burst_cycles(&self.gpu);
+            if other > 1 {
+                return max.min(draw).min(other);
+            }
+            return max.min(draw);
+        }
+        if self.dma.active() {
+            if self.dma.waiting_on_gpu(&self.gpu) {
+                let other = self.dma.burst_cycles(&self.gpu);
+                if other > 1 {
+                    return max.min(other);
+                }
+                return 1;
+            }
             if self.dma.gpu_from_ram() {
                 return 1;
             }
             return max.min(self.dma.burst_cycles(&self.gpu));
         }
-        if gpu_wait {
-            let other = self.dma.burst_cycles(&self.gpu);
-            if other > 1 {
-                return max.min(other);
-            }
-            if draw > 0 {
-                return max.min(draw);
-            }
-            return 1;
-        }
         if !self.write_q.is_empty() {
             return max.min(self.write_q.len() as u32).max(1);
         }
-        if draw > 0 && !fifo_work {
-            return max.min(draw);
-        }
-        if fifo_work {
+        if !self.gpu.fifo_is_empty() || self.gpu.assembling() {
             return 1;
         }
         max
