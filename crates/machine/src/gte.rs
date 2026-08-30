@@ -485,10 +485,9 @@ impl Gte {
         let sum = i64::from(self.data[17] as u16)
             + i64::from(self.data[18] as u16)
             + i64::from(self.data[19] as u16);
-        let mac0 = zsf3 * sum;
+        let mac0 = self.mac(0, zsf3 * sum);
         self.data[24] = mac0 as u32;
-        let otz = (mac0 >> 12).clamp(0, 0xFFFF);
-        self.data[7] = otz as u32;
+        self.set_otz(mac0 >> 12);
     }
 
     fn avsz4(&mut self) {
@@ -497,10 +496,17 @@ impl Gte {
             + i64::from(self.data[17] as u16)
             + i64::from(self.data[18] as u16)
             + i64::from(self.data[19] as u16);
-        let mac0 = zsf4 * sum;
+        let mac0 = self.mac(0, zsf4 * sum);
         self.data[24] = mac0 as u32;
-        let otz = (mac0 >> 12).clamp(0, 0xFFFF);
-        self.data[7] = otz as u32;
+        self.set_otz(mac0 >> 12);
+    }
+
+    /// OTZ is SZ/OTZ saturated 0..FFFFh; FLAG.18 on either limit (SPX/DuckStation).
+    fn set_otz(&mut self, v: i64) {
+        if !(0..=0xFFFF).contains(&v) {
+            self.flag(18);
+        }
+        self.data[7] = v.clamp(0, 0xFFFF) as u32;
     }
 
     fn sqr(&mut self, sf: u32) {
@@ -664,17 +670,12 @@ impl Gte {
         let g = ((rgb >> 8) & 0xFF) as i64;
         let b = ((rgb >> 16) & 0xFF) as i64;
         let ir = self.ir_vec();
-        let mut mac = [
+        let mac = [
             (r * i64::from(ir.0)) << 4,
             (g * i64::from(ir.1)) << 4,
             (b * i64::from(ir.2)) << 4,
         ];
-        self.depth_cue(&mut mac, sf);
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
-            self.data[25 + i] = shifted as u32;
-            self.set_ir(i, shifted, lm);
-        }
+        self.interpolate_color(mac, sf, lm);
         self.push_color(lm);
     }
 
@@ -718,17 +719,12 @@ impl Gte {
         self.lcm_ir_bk(sf, lm);
         let rgb = self.data[6];
         let ir = self.ir_vec();
-        let mut mac = [
+        let mac = [
             ((rgb & 0xFF) as i64 * i64::from(ir.0)) << 4,
             (((rgb >> 8) & 0xFF) as i64 * i64::from(ir.1)) << 4,
             (((rgb >> 16) & 0xFF) as i64 * i64::from(ir.2)) << 4,
         ];
-        self.depth_cue(&mut mac, sf);
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
-            self.data[25 + i] = shifted as u32;
-            self.set_ir(i, shifted, lm);
-        }
+        self.interpolate_color(mac, sf, lm);
         self.push_color(lm);
     }
 
@@ -749,78 +745,69 @@ impl Gte {
         self.push_color(lm);
     }
 
-    fn depth_cue(&mut self, mac: &mut [i64; 3], sf: u32) {
+    /// SPX InterpolateColor (DuckStation): 44-bit MAC on (FC<<12 - in), IR sat
+    /// with lm=0, then MAC = in + IR*IR0, shift, IR with the command's lm.
+    fn interpolate_color(&mut self, mac_in: [i64; 3], sf: u32, lm: bool) {
+        let shift = sf * 12;
         let ir0 = self.data[8] as i16 as i64;
         for i in 0..3 {
             let fc = self.ctrl[21 + i] as i32 as i64;
-            let tmp = ((fc << 12) - mac[i]) >> (sf * 12);
-            let tmp = tmp.clamp(-0x8000, 0x7FFF);
-            mac[i] += tmp * ir0;
+            let acc = self.mac((i as u32) + 1, (fc << 12) - mac_in[i]);
+            let shifted = acc >> shift;
+            self.data[25 + i] = shifted as u32;
+            self.set_ir(i, shifted, false);
+        }
+        for i in 0..3 {
+            let ir = self.data[9 + i] as i16 as i64;
+            let acc = self.mac((i as u32) + 1, mac_in[i] + ir * ir0);
+            let shifted = acc >> shift;
+            self.data[25 + i] = shifted as u32;
+            self.set_ir(i, shifted, lm);
         }
     }
 
     fn dpcs(&mut self, sf: u32, lm: bool) {
         let rgb = self.data[6];
-        let mut mac = [
+        let mac = [
             ((rgb & 0xFF) as i64) << 16,
             (((rgb >> 8) & 0xFF) as i64) << 16,
             (((rgb >> 16) & 0xFF) as i64) << 16,
         ];
-        self.depth_cue(&mut mac, sf);
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
-            self.data[25 + i] = shifted as u32;
-            self.set_ir(i, shifted, lm);
-        }
+        self.interpolate_color(mac, sf, lm);
         self.push_color(lm);
     }
 
     fn dpct_once(&mut self, sf: u32, lm: bool) {
         let rgb = self.data[20];
-        let mut mac = [
+        let mac = [
             ((rgb & 0xFF) as i64) << 16,
             (((rgb >> 8) & 0xFF) as i64) << 16,
             (((rgb >> 16) & 0xFF) as i64) << 16,
         ];
-        self.depth_cue(&mut mac, sf);
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
-            self.data[25 + i] = shifted as u32;
-            self.set_ir(i, shifted, lm);
-        }
+        self.interpolate_color(mac, sf, lm);
         self.push_color(lm);
     }
 
     fn intpl(&mut self, sf: u32, lm: bool) {
         let ir = self.ir_vec();
-        let mut mac = [
+        let mac = [
             i64::from(ir.0) << 12,
             i64::from(ir.1) << 12,
             i64::from(ir.2) << 12,
         ];
-        self.depth_cue(&mut mac, sf);
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
-            self.data[25 + i] = shifted as u32;
-            self.set_ir(i, shifted, lm);
-        }
+        self.interpolate_color(mac, sf, lm);
         self.push_color(lm);
     }
 
     fn dcpl(&mut self, sf: u32, lm: bool) {
         let rgb = self.data[6];
         let ir = self.ir_vec();
-        let mut mac = [
+        let mac = [
             ((rgb & 0xFF) as i64 * i64::from(ir.0)) << 4,
             (((rgb >> 8) & 0xFF) as i64 * i64::from(ir.1)) << 4,
             (((rgb >> 16) & 0xFF) as i64 * i64::from(ir.2)) << 4,
         ];
-        self.depth_cue(&mut mac, sf);
-        for i in 0..3 {
-            let shifted = mac[i] >> (sf * 12);
-            self.data[25 + i] = shifted as u32;
-            self.set_ir(i, shifted, lm);
-        }
+        self.interpolate_color(mac, sf, lm);
         self.push_color(lm);
     }
 
@@ -1147,6 +1134,56 @@ mod tests {
         let f = g.read_control(31);
         assert_ne!(f & (1 << 16), 0, "FLAG.16 MAC0+ {f:#010X}");
         assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
+    fn avsz3_otz_overflow_sets_flag_18() {
+        let mut g = Gte::new();
+        g.write_control(29, 0x7FFF); // ZSF3
+        g.write_data(17, 0xFFFF);
+        g.write_data(18, 0xFFFF);
+        g.write_data(19, 0xFFFF);
+        g.command(0x2D);
+        let f = g.read_control(31);
+        assert_eq!(g.read_data(7) & 0xFFFF, 0xFFFF);
+        assert_ne!(f & (1 << 18), 0, "FLAG.18 OTZ sat {f:#010X}");
+        assert_ne!(f & (1 << 31), 0, "error FLAG.31");
+    }
+
+    #[test]
+    fn intpl_ir0_zero_keeps_ir_in_color_fifo() {
+        // IR=0x800, IR0=0, FC=0, sf=1: color = (IR<<12 >> 12) >> 4 = 0x80.
+        let mut g = Gte::new();
+        g.write_data(9, 0x800);
+        g.write_data(10, 0x800);
+        g.write_data(11, 0x800);
+        g.write_data(8, 0);
+        g.write_control(21, 0);
+        g.write_control(22, 0);
+        g.write_control(23, 0);
+        g.write_data(6, 0x30 << 24);
+        g.command(0x11 | (1 << 19));
+        let rgb = g.read_data(22);
+        assert_eq!(rgb & 0xFF, 0x80, "R {rgb:#010X}");
+        assert_eq!((rgb >> 8) & 0xFF, 0x80, "G");
+        assert_eq!((rgb >> 16) & 0xFF, 0x80, "B");
+    }
+
+    #[test]
+    fn intpl_far_from_ir_saturates_ir1_flag_24() {
+        // IR1 = -0x8000, FC=0, sf=1: (0 - (IR<<12))>>12 = +0x8000 → FLAG.24.
+        // Stage 2 with IR0=0 writes IR1 back to -8000h, but the sat flag stays.
+        let mut g = Gte::new();
+        g.write_data(9, (-0x8000i16) as u16 as u32);
+        g.write_data(10, 0);
+        g.write_data(11, 0);
+        g.write_data(8, 0);
+        g.write_control(21, 0);
+        g.write_control(22, 0);
+        g.write_control(23, 0);
+        g.command(0x11 | (1 << 19));
+        let f = g.read_control(31);
+        assert_ne!(f & (1 << 24), 0, "FLAG.24 IR1 sat {f:#010X}");
     }
 
     #[test]

@@ -53,6 +53,13 @@ pub struct Gpu {
     pub last_y_bins: [u32; 16],
     frame_y_bins: [u32; 16],
     pub last_hi_y_word: u32,
+    /// Occupancy of GP0(30) verts, 512×240 (x wrapped into one buffer).
+    pub last_scatter: Vec<u8>,
+    frame_scatter: Vec<u8>,
+    pub last_long30: u32,
+    frame_long30: u32,
+    pub last_max_dy: i32,
+    frame_max_dy: i32,
 }
 
 #[allow(dead_code)]
@@ -119,6 +126,12 @@ impl Gpu {
             last_y_bins: [0; 16],
             frame_y_bins: [0; 16],
             last_hi_y_word: 0,
+            last_scatter: vec![0; 512 * 240],
+            frame_scatter: vec![0; 512 * 240],
+            last_long30: 0,
+            frame_long30: 0,
+            last_max_dy: 0,
+            frame_max_dy: 0,
         };
         g.update_stat();
         g
@@ -442,8 +455,12 @@ impl Gpu {
         }
         if (cmd >> 24) as u8 == 0x30 {
             self.frame_n30 += 1;
+            let mut miny = i32::MAX;
+            let mut maxy = i32::MIN;
             for i in 0..nvert {
                 let (x, y) = (verts[i].0, verts[i].1);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
                 self.frame_x0 = self.frame_x0.min(x);
                 self.frame_x1 = self.frame_x1.max(x);
                 self.frame_y0 = self.frame_y0.min(y);
@@ -456,6 +473,17 @@ impl Gpu {
                 if y > 300 {
                     self.last_hi_y_word = raw_xy[i];
                 }
+                let px = ((x % 512 + 512) % 512) as usize;
+                let py = y.clamp(0, 239) as usize;
+                let si = py * 512 + px;
+                self.frame_scatter[si] = self.frame_scatter[si].saturating_add(1);
+            }
+            let dy = maxy - miny;
+            if dy > self.frame_max_dy {
+                self.frame_max_dy = dy;
+            }
+            if dy > 80 {
+                self.frame_long30 += 1;
             }
         }
         let blend = textured && cmd & 1 == 0;
@@ -820,8 +848,14 @@ impl Gpu {
             self.last_y1 = self.frame_y1;
             self.last_n30_out = self.frame_n30_out;
             self.last_y_bins = self.frame_y_bins;
+            self.last_long30 = self.frame_long30;
+            self.last_max_dy = self.frame_max_dy;
+            std::mem::swap(&mut self.last_scatter, &mut self.frame_scatter);
+            self.frame_scatter.fill(0);
             self.frame_n30 = 0;
             self.frame_n30_out = 0;
+            self.frame_long30 = 0;
+            self.frame_max_dy = 0;
             self.frame_y_bins = [0; 16];
             self.frame_x0 = i32::MAX;
             self.frame_x1 = i32::MIN;

@@ -221,6 +221,35 @@ impl Machine {
         self.bus.gpu().last_hi_y_word
     }
 
+    pub fn last_long30(&self) -> u32 {
+        self.bus.gpu().last_long30
+    }
+
+    pub fn last_max_dy(&self) -> i32 {
+        self.bus.gpu().last_max_dy
+    }
+
+    /// 512×240 occupancy of last-frame GP0(30) vertices, x wrapped per buffer.
+    pub fn last_gouraud_scatter(&self) -> DisplayArea {
+        let s = &self.bus.gpu().last_scatter;
+        let mut pixels = Vec::with_capacity(512 * 240);
+        for &n in s {
+            let p = if n == 0 {
+                0
+            } else if n == 1 {
+                0x7FFF // white
+            } else {
+                0x001F // red: stacked verts
+            };
+            pixels.push(p);
+        }
+        DisplayArea {
+            width: 512,
+            height: 240,
+            pixels,
+        }
+    }
+
     pub fn dma_list_stats(&self) -> (u32, u32, u32, u32, u32, u32, u32) {
         let d = self.bus.dma();
         (
