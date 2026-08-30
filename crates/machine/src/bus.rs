@@ -248,12 +248,16 @@ impl Bus {
             if self.dma.gpu_from_ram() {
                 return 1;
             }
-            return max.min(self.dma.burst_cycles());
-        }
-        if gpu_wait && draw > 0 {
-            return max.min(draw);
+            return max.min(self.dma.burst_cycles(&self.gpu));
         }
         if gpu_wait {
+            let other = self.dma.burst_cycles(&self.gpu);
+            if other > 1 {
+                return max.min(other);
+            }
+            if draw > 0 {
+                return max.min(draw);
+            }
             return 1;
         }
         if !self.write_q.is_empty() {

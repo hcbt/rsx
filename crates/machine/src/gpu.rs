@@ -1005,6 +1005,26 @@ impl Gpu {
         self.gp0(word);
     }
 
+    fn latch_frame(&mut self) {
+        if !self.display_enabled {
+            return;
+        }
+        let w = self.display_hres.max(1).min(640);
+        let h = self.display_vres.max(1).min(480);
+        if self.crt_w != w || self.crt_h != h {
+            self.crt_w = w;
+            self.crt_h = h;
+            self.crt.resize((w * h) as usize, 0);
+        }
+        for y in 0..h {
+            let row = (y * w) as usize;
+            for x in 0..w {
+                self.crt[row + x as usize] = self.read_half(self.display_x + x, self.display_y + y);
+            }
+        }
+        self.crt_line = u32::MAX;
+    }
+
     pub fn tick(&mut self, cycles: u32, line: u32, vblank: bool) {
         let mut left = cycles;
         while left > 0 {
@@ -1054,6 +1074,7 @@ impl Gpu {
         }
         if vblank && !self.in_vblank {
             self.odd_frame = !self.odd_frame;
+            self.latch_frame();
             self.last_n30 = self.frame_n30;
             self.last_x0 = self.frame_x0;
             self.last_x1 = self.frame_x1;

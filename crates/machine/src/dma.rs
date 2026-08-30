@@ -27,10 +27,10 @@ pub struct Dma {
     chcr: [u32; 7],
     dpcr: u32,
     dicr: u32,
-    job: Option<Job>,
-    credit: u32,
-    words_done: u32,
-    hyper_pause: bool,
+    jobs: [Option<Job>; 7],
+    credit: [u32; 7],
+    words_done: [u32; 7],
+    hyper: [bool; 7],
     list_empty: u32,
     list_pkts: u32,
     list_min: u32,
@@ -54,10 +54,10 @@ impl Dma {
             chcr: [0; 7],
             dpcr: 0x0765_4321,
             dicr: 0,
-            job: None,
-            credit: 0,
-            words_done: 0,
-            hyper_pause: false,
+            jobs: [None, None, None, None, None, None, None],
+            credit: [0; 7],
+            words_done: [0; 7],
+            hyper: [false; 7],
             list_empty: 0,
             list_pkts: 0,
             list_min: u32::MAX,
@@ -79,43 +79,68 @@ impl Dma {
     }
 
     pub fn active(&self) -> bool {
-        self.job.is_some()
+        self.jobs.iter().any(|j| j.is_some())
     }
 
     pub fn gpu_from_ram(&self) -> bool {
-        match self.job {
+        match &self.jobs[2] {
             Some(Job::List { .. }) => true,
-            Some(Job::Block { ch: 2, dir: 1, .. }) => true,
+            Some(Job::Block { dir: 1, .. }) => true,
+            _ => false,
+        }
+    }
+
+    fn gpu_blocked(&self, gpu: &Gpu) -> bool {
+        if !gpu.fifo_full() {
+            return false;
+        }
+        match &self.jobs[2] {
+            Some(Job::List { pkt_left, .. }) if *pkt_left > 0 => true,
+            Some(Job::Block {
+                dir: 1, remaining, ..
+            }) if *remaining > 0 => true,
             _ => false,
         }
     }
 
     pub fn waiting_on_gpu(&self, gpu: &Gpu) -> bool {
-        if !gpu.fifo_full() {
-            return false;
+        self.gpu_blocked(gpu)
+    }
+
+    fn ready_ch(&self, gpu: &Gpu) -> Option<usize> {
+        let mut best: Option<(u8, usize)> = None;
+        for ch in 0..7 {
+            if self.jobs[ch].is_none() {
+                continue;
+            }
+            if ch == 2 && self.gpu_blocked(gpu) {
+                continue;
+            }
+            let pri = ((self.dpcr >> (ch * 4)) & 7) as u8;
+            match best {
+                Some((p, _)) if pri >= p => {}
+                _ => best = Some((pri, ch)),
+            }
         }
-        match self.job {
-            Some(Job::List { pkt_left, .. }) if pkt_left > 0 => true,
-            Some(Job::Block {
-                ch: 2,
-                dir: 1,
-                remaining,
-                ..
-            }) if remaining > 0 => true,
-            _ => false,
-        }
+        best.map(|(_, ch)| ch)
     }
 
     pub fn occupies_ram(&self, gpu: &Gpu) -> bool {
-        self.job.is_some() && !self.waiting_on_gpu(gpu)
+        self.ready_ch(gpu).is_some()
     }
 
-    pub fn burst_cycles(&self) -> u32 {
-        match self.job {
-            Some(Job::Block { remaining, ch, .. }) if ch != 2 => remaining
-                .saturating_mul(Self::clocks_per_word(ch as usize))
-                .saturating_add((remaining + 15) / 16)
-                .max(1),
+    pub fn burst_cycles(&self, gpu: &Gpu) -> u32 {
+        match self.ready_ch(gpu) {
+            Some(ch) if ch != 2 => {
+                if let Some(Job::Block { remaining, .. }) = self.jobs[ch] {
+                    remaining
+                        .saturating_mul(Self::clocks_per_word(ch))
+                        .saturating_add((remaining + 15) / 16)
+                        .max(1)
+                } else {
+                    1
+                }
+            }
             _ => 1,
         }
     }
@@ -129,31 +154,30 @@ impl Dma {
         cdrom: &mut Cdrom,
         irq: &mut Irq,
     ) {
-        while cycles > 0 && self.job.is_some() {
-            if self.waiting_on_gpu(gpu) {
+        while cycles > 0 {
+            let Some(ch) = self.ready_ch(gpu) else {
                 cycles -= 1;
-                continue;
-            }
-            if self.hyper_pause {
-                self.hyper_pause = false;
-                cycles -= 1;
-                continue;
-            }
-            let ch = self.job_ch();
-            let rate = Self::clocks_per_word(ch as usize);
-            if self.credit + 1 < rate {
-                self.credit += 1;
-                cycles -= 1;
-                continue;
-            }
-            self.credit = 0;
-            self.transfer_one(ram, gpu, spu, cdrom);
-            cycles -= 1;
-            if self.job.is_none() {
-                self.finish(ch as usize, ram, irq);
-                if self.job.is_none() {
+                if !self.active() {
                     break;
                 }
+                continue;
+            };
+            if self.hyper[ch] {
+                self.hyper[ch] = false;
+                cycles -= 1;
+                continue;
+            }
+            let rate = Self::clocks_per_word(ch);
+            if self.credit[ch] + 1 < rate {
+                self.credit[ch] += 1;
+                cycles -= 1;
+                continue;
+            }
+            self.credit[ch] = 0;
+            self.transfer_one(ch, ram, gpu, spu, cdrom);
+            cycles -= 1;
+            if self.jobs[ch].is_none() {
+                self.finish(ch, irq);
             }
         }
     }
@@ -225,14 +249,10 @@ impl Dma {
             self.chcr[ch] &= !(1 << 24);
             return;
         }
-        if self.job.is_some() {
-            // CHCR.24 stays set; pick_next runs this channel when the bus is free.
-            return;
-        }
-        self.credit = 0;
-        self.words_done = 0;
-        self.hyper_pause = false;
-        self.job = match ch {
+        self.credit[ch] = 0;
+        self.words_done[ch] = 0;
+        self.hyper[ch] = false;
+        self.jobs[ch] = match ch {
             2 => self.start_gpu(ram),
             3 => Some(Job::Block {
                 ch: 3,
@@ -263,7 +283,7 @@ impl Dma {
             }
             _ => None,
         };
-        if self.job.is_none() {
+        if self.jobs[ch].is_none() {
             self.chcr[ch] &= !(1 << 24);
         }
     }
@@ -309,27 +329,31 @@ impl Dma {
         }
     }
 
-    fn job_ch(&self) -> u8 {
-        match self.job {
+    fn transfer_one(
+        &mut self,
+        ch: usize,
+        ram: &mut [u8],
+        gpu: &mut Gpu,
+        spu: &mut Spu,
+        cdrom: &mut Cdrom,
+    ) {
+        let kind = match &self.jobs[ch] {
             Some(Job::List { .. }) => 2,
-            Some(Job::Block { ch, .. }) => ch,
-            None => 0,
+            Some(Job::Block { ch: b, .. }) => *b as usize,
+            None => return,
+        };
+        match kind {
+            2 if matches!(self.jobs[2], Some(Job::List { .. })) => self.list_word(ram, gpu),
+            6 => self.otc_word(ram),
+            3 => self.cd_word(ram, cdrom),
+            4 => self.spu_word(ram, spu),
+            2 => self.gpu_block_word(ram, gpu),
+            _ => self.jobs[ch] = None,
         }
-    }
-
-    fn transfer_one(&mut self, ram: &mut [u8], gpu: &mut Gpu, spu: &mut Spu, cdrom: &mut Cdrom) {
-        match self.job {
-            Some(Job::List { .. }) => self.list_word(ram, gpu),
-            Some(Job::Block { ch: 6, .. }) => self.otc_word(ram),
-            Some(Job::Block { ch: 3, .. }) => self.cd_word(ram, cdrom),
-            Some(Job::Block { ch: 4, .. }) => self.spu_word(ram, spu),
-            Some(Job::Block { ch: 2, .. }) => self.gpu_block_word(ram, gpu),
-            _ => self.job = None,
-        }
-        if self.job.is_some() {
-            self.words_done += 1;
-            if self.words_done % 16 == 0 {
-                self.hyper_pause = true;
+        if self.jobs[ch].is_some() {
+            self.words_done[ch] += 1;
+            if self.words_done[ch] % 16 == 0 {
+                self.hyper[ch] = true;
             }
         }
     }
@@ -340,7 +364,7 @@ impl Dma {
             pkt_left,
             nodes,
             ..
-        }) = &self.job
+        }) = &self.jobs[2]
         else {
             return;
         };
@@ -350,7 +374,7 @@ impl Dma {
         if pkt_left == 0 {
             if addr == 0x00FF_FFFF || addr > 0x1F_FFFF || nodes >= 1_000_000 {
                 self.finish_list_stats();
-                self.job = None;
+                self.jobs[2] = None;
                 return;
             }
             self.list_min = self.list_min.min(addr);
@@ -365,7 +389,7 @@ impl Dma {
                 }
                 if next == 0x00FF_FFFF {
                     self.finish_list_stats();
-                    self.job = None;
+                    self.jobs[2] = None;
                     return;
                 }
                 if let Some(Job::List {
@@ -373,7 +397,7 @@ impl Dma {
                     nodes,
                     next: n,
                     ..
-                }) = self.job.as_mut()
+                }) = self.jobs[2].as_mut()
                 {
                     *addr = next & 0x1F_FFFF;
                     *nodes += 1;
@@ -388,7 +412,7 @@ impl Dma {
                 pkt_left,
                 next: n,
                 nodes,
-            }) = self.job.as_mut()
+            }) = self.jobs[2].as_mut()
             {
                 *pkt_left = words;
                 *addr = addr.wrapping_add(4) & 0x1F_FFFF;
@@ -404,7 +428,7 @@ impl Dma {
                 pkt_left,
                 next,
                 ..
-            }) = self.job.as_mut()
+            }) = self.jobs[2].as_mut()
             else {
                 return;
             };
@@ -423,7 +447,7 @@ impl Dma {
         };
         if ended {
             self.finish_list_stats();
-            self.job = None;
+            self.jobs[2] = None;
         }
     }
 
@@ -444,7 +468,7 @@ impl Dma {
                 remaining,
                 step,
                 ..
-            }) = self.job.as_mut()
+            }) = self.jobs[6].as_mut()
             else {
                 return;
             };
@@ -459,7 +483,7 @@ impl Dma {
             *remaining == 0
         };
         if done {
-            self.job = None;
+            self.jobs[6] = None;
         }
     }
 
@@ -467,7 +491,7 @@ impl Dma {
         let done = {
             let Some(Job::Block {
                 addr, remaining, ..
-            }) = self.job.as_mut()
+            }) = self.jobs[3].as_mut()
             else {
                 return;
             };
@@ -477,7 +501,7 @@ impl Dma {
             *remaining == 0
         };
         if done {
-            self.job = None;
+            self.jobs[3] = None;
         }
     }
 
@@ -488,7 +512,7 @@ impl Dma {
                 remaining,
                 dir,
                 ..
-            }) = self.job.as_mut()
+            }) = self.jobs[4].as_mut()
             else {
                 return;
             };
@@ -502,7 +526,7 @@ impl Dma {
             *remaining == 0
         };
         if done {
-            self.job = None;
+            self.jobs[4] = None;
         }
     }
 
@@ -510,7 +534,7 @@ impl Dma {
         let done = {
             let Some(Job::Block {
                 addr, remaining, ..
-            }) = self.job.as_mut()
+            }) = self.jobs[2].as_mut()
             else {
                 return;
             };
@@ -520,43 +544,19 @@ impl Dma {
             *remaining == 0
         };
         if done {
-            self.job = None;
+            self.jobs[2] = None;
         }
     }
 
-    fn finish(&mut self, ch: usize, ram: &[u8], irq: &mut Irq) {
-        self.job = None;
-        self.hyper_pause = false;
-        self.credit = 0;
+    fn finish(&mut self, ch: usize, irq: &mut Irq) {
+        self.jobs[ch] = None;
+        self.hyper[ch] = false;
+        self.credit[ch] = 0;
         self.chcr[ch] &= !(1 << 24);
         if self.dicr & (1 << 23) != 0 && self.dicr & (1 << (16 + ch)) != 0 {
             self.dicr |= 1 << (24 + ch);
         }
         self.update_master(irq);
-        self.pick_next(ram);
-    }
-
-    fn pick_next(&mut self, ram: &[u8]) {
-        if self.job.is_some() {
-            return;
-        }
-        let mut best: Option<(u8, usize)> = None;
-        for ch in 0..7 {
-            if self.chcr[ch] & (1 << 24) == 0 {
-                continue;
-            }
-            if (self.dpcr >> (ch * 4 + 3)) & 1 == 0 {
-                continue;
-            }
-            let pri = ((self.dpcr >> (ch * 4)) & 7) as u8;
-            match best {
-                Some((p, _)) if pri >= p => {}
-                _ => best = Some((pri, ch)),
-            }
-        }
-        if let Some((_, ch)) = best {
-            self.start(ch, ram);
-        }
     }
 
     fn update_master(&mut self, irq: &mut Irq) {
@@ -872,5 +872,104 @@ mod tests {
         let pix = gpu.vram_rect(12, 12, 8, 8);
         let red = pix.pixels.iter().filter(|p| **p & 0x7FFF == 0x001F).count();
         assert!(red > 4, "GPU list must still draw (red={red})");
+    }
+
+    #[test]
+    fn cd_runs_while_gpu_dma_waits_on_a_full_fifo() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+
+        gpu.gp0(0xE3 << 24);
+        gpu.gp0(0xE4 << 24 | 1023 | (511 << 10));
+        gpu.gp0(0x02 << 24);
+        gpu.gp0(0);
+        gpu.gp0(256 | (256 << 16));
+        gpu.tick(3, 0, false);
+        assert!(gpu.busy(), "256×256 fill must still be drawing");
+        for _ in 0..16 {
+            gpu.gp0(0xE1 << 24);
+        }
+        assert!(gpu.fifo_full());
+
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        poke(&mut ram, 0x3000, 0xDEAD_BEEF);
+        dma.write32(
+            0x1F80_10A0,
+            0x4000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A4,
+            0x0001_0020,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x0100_0201,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B0,
+            0x3000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B4,
+            1,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B8,
+            0x1100_0000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+
+        for _ in 0..64 {
+            gpu.tick(1, 0, false);
+            dma.tick(1, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        }
+        assert!(gpu.busy(), "fill must still occupy the GPU");
+        assert_eq!(
+            dma.read32(0x1F80_10B8) & (1 << 24),
+            0,
+            "CD must complete while GPU DMA is stalled on a full FIFO"
+        );
+        assert_ne!(peek(&ram, 0x3000), 0xDEAD_BEEF);
     }
 }
