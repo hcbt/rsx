@@ -281,8 +281,16 @@ fn dump_title_ram(machine: &Machine) {
         );
         dump_anim(machine, anim_seq, anim_frame);
         // USA EXE TransformSvtx @ 0x80034684
-        eprint!("  ram TransformSvtx");
-        for i in 0..12u32 {
+        eprint!("  ram TransformSvtx cop2");
+        for i in 0..160u32 {
+            let w = machine.ram_word(0x8003_4684 + i * 4);
+            if w >> 26 == 0x12 && w & (1 << 25) != 0 {
+                eprint!(" +{i}={w:08X}");
+            }
+        }
+        eprintln!();
+        eprint!("  ram TransformSvtx nclip");
+        for i in 67u32..90 {
             eprint!(" {:08X}", machine.ram_word(0x8003_4684 + i * 4));
         }
         eprintln!();
