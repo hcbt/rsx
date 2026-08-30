@@ -593,8 +593,7 @@ impl Gte {
             } else {
                 let mut acc = self.mac(axis, (t << 12) + i64::from(m[r][0]) * i64::from(vec.0));
                 acc = self.mac(axis, acc + i64::from(m[r][1]) * i64::from(vec.1));
-                acc += i64::from(m[r][2]) * i64::from(vec.2);
-                self.mac(axis, acc);
+                acc = self.mac(axis, acc + i64::from(m[r][2]) * i64::from(vec.2));
                 let shifted = acc >> shift;
                 self.data[25 + r] = shifted as u32;
                 self.set_ir(r, shifted, lm);
@@ -651,8 +650,7 @@ impl Gte {
             let axis = (r as u32) + 1;
             let mut acc = self.mac(axis, (t << 12) + i64::from(self.mx_el(mx, r, 0)) * i64::from(vec.0));
             acc = self.mac(axis, acc + i64::from(self.mx_el(mx, r, 1)) * i64::from(vec.1));
-            acc += i64::from(self.mx_el(mx, r, 2)) * i64::from(vec.2);
-            self.mac(axis, acc);
+            acc = self.mac(axis, acc + i64::from(self.mx_el(mx, r, 2)) * i64::from(vec.2));
             let shifted = acc >> shift;
             self.data[25 + r] = shifted as u32;
             self.set_ir(r, shifted, lm);
@@ -691,8 +689,7 @@ impl Gte {
             let mut acc =
                 self.mac(axis, (bk << 12) + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0));
             acc = self.mac(axis, acc + i64::from(self.mx_el(2, r, 1)) * i64::from(ir.1));
-            acc += i64::from(self.mx_el(2, r, 2)) * i64::from(ir.2);
-            self.mac(axis, acc);
+            acc = self.mac(axis, acc + i64::from(self.mx_el(2, r, 2)) * i64::from(ir.2));
             let shifted = acc >> (sf * 12);
             self.data[25 + r] = shifted as u32;
             self.set_ir(r, shifted, lm);
@@ -914,6 +911,31 @@ mod tests {
         let cmd = 0x01 | if sf { 1 << 19 } else { 0 };
         g.command(cmd);
         g
+    }
+
+    #[test]
+    fn rtpt_sxy_fifo_is_v0_then_v1_then_v2() {
+        // After RTPT, SXY0/1/2 are the three projected verts in order (SPX FIFO).
+        let mut g = Gte::new();
+        g.write_control(0, 0x1000);
+        g.write_control(2, 0x1000);
+        g.write_control(4, 0x1000);
+        g.write_control(7, 500);
+        g.write_control(26, 500);
+        g.write_data(0, 10); // V0 X=10
+        g.write_data(1, 0);
+        g.write_data(2, 20 | (30u32 << 16)); // V1
+        g.write_data(3, 0);
+        g.write_data(4, 40); // V2 X=40
+        g.write_data(5, 0);
+        g.command(0x30 | (1 << 19));
+        let sxy0 = g.read_data(12) as i16;
+        let sxy1 = g.read_data(13) as i16;
+        let sxy2 = g.read_data(14) as i16;
+        assert!(
+            (sxy0 - 10).abs() <= 1 && (sxy1 - 20).abs() <= 1 && (sxy2 - 40).abs() <= 1,
+            "RTPT SXY FIFO V0,V1,V2 got {sxy0},{sxy1},{sxy2}"
+        );
     }
 
     #[test]

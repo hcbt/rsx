@@ -497,9 +497,10 @@ impl Gpu {
             self.frame_poly_op[op] += 1;
         }
         let blend = textured && cmd & (1 << 24) == 0;
-        self.tri(verts[0], verts[1], verts[2], textured, blend);
+        let semi = cmd & (1 << 25) != 0;
+        self.tri(verts[0], verts[1], verts[2], textured, blend, semi);
         if quad {
-            self.tri(verts[1], verts[2], verts[3], textured, blend);
+            self.tri(verts[1], verts[2], verts[3], textured, blend, semi);
         }
     }
 
@@ -510,6 +511,7 @@ impl Gpu {
         c: (i32, i32, u32, u8, u8),
         textured: bool,
         blend: bool,
+        semi: bool,
     ) {
         let minx = a.0.min(b.0).min(c.0).max(self.draw_x1);
         let maxx = a.0.max(b.0).max(c.0).min(self.draw_x2);
@@ -584,7 +586,7 @@ impl Gpu {
                 } else {
                     rgb888_to_555(vr, vg, vb)
                 };
-                self.plot(x, y, color, textured);
+                self.plot(x, y, color, textured, semi);
             }
         }
     }
@@ -637,7 +639,7 @@ impl Gpu {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
         loop {
-            self.plot(x0, y0, color, false);
+            self.plot(x0, y0, color, false, false);
             if x0 == x1 && y0 == y1 {
                 break;
             }
@@ -682,6 +684,7 @@ impl Gpu {
         };
         let pix = rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
         let blend = textured && cmd & (1 << 24) == 0;
+        let semi = cmd & (1 << 25) != 0;
         for yy in 0..h {
             for xx in 0..w {
                 let color = if textured {
@@ -694,7 +697,7 @@ impl Gpu {
                 } else {
                     pix
                 };
-                self.plot(x + xx, y + yy, color, textured);
+                self.plot(x + xx, y + yy, color, textured, semi);
             }
         }
     }
@@ -745,14 +748,20 @@ impl Gpu {
         (x, y)
     }
 
-    fn plot(&mut self, x: i32, y: i32, color: u16, textured: bool) {
+    fn plot(&mut self, x: i32, y: i32, color: u16, textured: bool, semi: bool) {
         if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
             return;
         }
         if textured && color & 0x7FFF == 0 {
             return;
         }
+        // SPX: textured semi-trans blends only when the texel STP (bit15) is set.
+        let do_semi = semi && (!textured || color & 0x8000 != 0);
         let mut c = color & 0x7FFF;
+        if do_semi {
+            let dst = self.read_half(x as u32, y as u32);
+            c = blend_semi(dst, c, (self.tex_page >> 5) & 3);
+        }
         if self.mask_set {
             c |= 0x8000;
         }
@@ -924,6 +933,22 @@ fn interp(w0: i32, w1: i32, w2: i32, a: u32, b: u32, c: u32, sum: i32) -> i32 {
 
 fn rgb888_to_555(r: u32, g: u32, b: u32) -> u16 {
     ((r >> 3) as u16) | (((g >> 3) as u16) << 5) | (((b >> 3) as u16) << 10)
+}
+
+/// SPX semi-transparency modes from texpage bits 5–6, per 5-bit channel.
+fn blend_semi(back: u16, fwd: u16, mode: u32) -> u16 {
+    let ch = |p: u16, s: u32| (p >> s) & 0x1F;
+    let mix = |b: u16, f: u16| -> u16 {
+        match mode & 3 {
+            0 => (b + f) / 2,
+            1 => (b + f).min(0x1F),
+            2 => b.saturating_sub(f),
+            _ => (b + f / 4).min(0x1F),
+        }
+    };
+    mix(ch(back, 0), ch(fwd, 0))
+        | (mix(ch(back, 5), ch(fwd, 5)) << 5)
+        | (mix(ch(back, 10), ch(fwd, 10)) << 10)
 }
 
 /// SPX: texture blending is (texel*vertex)/80h per channel; 80h is 1.0, FFh is ~2×.
@@ -1289,6 +1314,59 @@ mod tests {
         assert_eq!(right, 0, "x=max vertex must not plot");
         assert_eq!(bottom, 0, "y=max vertex must not plot");
         assert!(interior > 0, "interior of the triangle must still plot");
+    }
+
+    #[test]
+    fn semi_trans_mode0_averages_back_and_forward() {
+        // SPX mode 0: 0.5×B + 0.5×F per 5-bit channel.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0xE1 << 24); // texpage, semi mode 0
+        gpu.gp0(0x02 << 24 | 0xF80000); // fill blue
+        gpu.gp0(0);
+        gpu.gp0(32 | (32 << 16));
+        gpu.gp0(0x22 << 24 | 0x0000F8); // semi-trans red tri
+        gpu.gp0(xy(2, 2));
+        gpu.gp0(xy(20, 2));
+        gpu.gp0(xy(2, 20));
+        let p = gpu.vram_rect(4, 4, 1, 1).pixels[0] & 0x7FFF;
+        let r = p & 0x1F;
+        let b = (p >> 10) & 0x1F;
+        assert!(
+            r > 8 && r < 24 && b > 8 && b < 24,
+            "mode 0 must mix red and blue (got {p:#06X})"
+        );
+    }
+
+    #[test]
+    fn textured_semi_without_stp_stays_opaque() {
+        // SPX: textured semi-trans with texel bit15=0 is opaque, not averaged.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0xE1 << 24);
+        gpu.gp0(0x02 << 24 | 0xF80000);
+        gpu.gp0(0);
+        gpu.gp0(32 | (32 << 16));
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F; // red, STP=0
+        upload_clut(&mut gpu, 0, 0, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(64);
+        gpu.gp0(2 | (8 << 16));
+        for _ in 0..8 {
+            gpu.gp0(0x1111_1111);
+        }
+        gpu.gp0(0x26 << 24 | 0x808080); // textured semi tri, blended
+        gpu.gp0(xy(2, 2));
+        gpu.gp0(0x0000);
+        gpu.gp0(xy(18, 2));
+        gpu.gp0((1 << 16) | 0x0008);
+        gpu.gp0(xy(2, 18));
+        gpu.gp0(0x0008_00);
+        let p = gpu.vram_rect(4, 4, 1, 1).pixels[0] & 0x7FFF;
+        assert_eq!(p, 0x001F, "STP=0 texel must stay opaque red, not mix ({p:#06X})");
     }
 }
 
