@@ -116,6 +116,10 @@ impl Bus {
         self.vblanks
     }
 
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
+
     pub fn take_audio(&mut self) -> Vec<i16> {
         self.spu.take_samples()
     }

@@ -1,7 +1,4 @@
-//! Host playback of Machine PCM. The Machine does not know about this.
-//!
-//! Emulation is clocked to this buffer: if the queue is full, the Debugger
-//! waits instead of dropping samples (which desynced L/R and sounded like noise).
+//! Host DAC for Machine PCM. Not the guest clock — that is CPU_HZ vs wall time.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -9,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample};
 
-/// Keep ~100 ms queued so the callback rarely underruns without adding lag.
-pub const WATERMARK: usize = 4410;
+/// Emergency cap (1 s). The Debugger must not use this as a speed control.
 const MAX_FRAMES: usize = 44_100;
 
 struct PcmBuf {
@@ -20,7 +16,7 @@ struct PcmBuf {
 impl PcmBuf {
     fn new() -> Self {
         Self {
-            q: VecDeque::with_capacity(WATERMARK * 2),
+            q: VecDeque::with_capacity(2048),
         }
     }
 
@@ -83,10 +79,6 @@ impl Output {
 
     pub fn push(&self, pcm: &[i16]) {
         self.buf.lock().expect("audio mutex").push_interleaved(pcm);
-    }
-
-    pub fn queued_frames(&self) -> usize {
-        self.buf.lock().expect("audio mutex").len()
     }
 }
 
@@ -155,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn push_keeps_stereo_pairs_and_drops_newest() {
+    fn push_keeps_stereo_pairs() {
         let mut b = PcmBuf::new();
         b.push_interleaved(&[1, 2, 3, 4, 5]);
         assert_eq!(b.len(), 2);
@@ -165,13 +157,11 @@ mod tests {
     }
 
     #[test]
-    fn full_buffer_does_not_drop_already_queued_frames() {
+    fn full_buffer_keeps_the_oldest_queued_frame() {
         let mut b = PcmBuf::new();
-        let frame = [7i16, 8];
         let many = vec![7, 8].repeat(MAX_FRAMES + 10);
         b.push_interleaved(&many);
         assert_eq!(b.len(), MAX_FRAMES);
         assert_eq!(b.pop(), (7, 8));
-        let _ = frame;
     }
 }

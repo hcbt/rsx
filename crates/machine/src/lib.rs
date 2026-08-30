@@ -45,6 +45,9 @@ impl DisplayArea {
     }
 }
 
+/// SCPH-1001 NTSC master crystal. Vblank (263×2160) and SPU 44100 (÷768) derive from this.
+pub const CPU_HZ: u64 = 33_868_800;
+
 pub struct Machine {
     cpu: Cpu,
     bus: Bus,
@@ -95,6 +98,10 @@ impl Machine {
     /// Interleaved stereo i16 at 44100 Hz, drained since the last take.
     pub fn take_audio(&mut self) -> Vec<i16> {
         self.bus.take_audio()
+    }
+
+    pub fn cycles(&self) -> u64 {
+        self.bus.cycles()
     }
 
     pub fn pc(&self) -> u32 {
@@ -564,6 +571,21 @@ mod tests {
         m.step();
         m.step();
         assert_eq!(m.gpr(8), 0x0013_243F);
+    }
+
+    #[test]
+    fn each_instruction_advances_the_master_clock() {
+        let bios = bios_with_program(&[
+            0x3C08_0013, // lui $t0, 0x0013
+            0x3508_243F, // ori $t0, $t0, 0x243f
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        let c0 = m.cycles();
+        m.step();
+        assert_eq!(m.cycles() - c0, 2, "CPU currently accounts 2 clocks per insn");
+        m.step();
+        assert_eq!(m.cycles() - c0, 4);
+        assert_eq!(CPU_HZ % 768, 0, "SPU 44100 must divide the master crystal");
     }
 
     #[test]

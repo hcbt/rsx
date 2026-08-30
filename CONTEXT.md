@@ -52,8 +52,12 @@ _Avoid_: screen, framebuffer when you mean this rectangle
 A host PNG of the Display area, taken by the Debugger (`--capture-at`, or the Capture display control). This is how the picture is inspected without sitting in the window.
 _Avoid_: screenshot, dump, framebuffer grab as the canonical name
 
+**Clock**:
+The SCPH-1001 master crystal at 33.8688 MHz. CPU steps, GPU vblank (263 lines × 2160 cycles), and SPU samples (768 cycles) all count this. Host realtime compares wall time to this counter. The audio device is a speaker, not the clock.
+_Avoid_: audio buffer as master clock, vsync as the guest clock
+
 **SPU**:
-The PlayStation sound processor, with its own 512 KiB RAM. It mixes 24 ADPCM voices to 44100 Hz stereo PCM. The Debugger plays that and `--capture-at` writes `audio.wav`. CD-XA and reverb are not implemented.
+The PlayStation sound processor, with its own 512 KiB RAM. It mixes 24 ADPCM voices to 44100 Hz stereo PCM (one pair per 768 master cycles). The Debugger plays that and `--capture-at` writes `audio.wav`. CD-XA and reverb are not implemented.
 _Avoid_: audio, mixer
 
 **CD-ROM**:

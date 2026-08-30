@@ -3,9 +3,10 @@ mod capture;
 mod config;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
-use rsx_machine::{DisplayArea, Machine};
+use rsx_machine::{DisplayArea, Machine, CPU_HZ};
 
 struct Debugger {
     machine: Option<Machine>,
@@ -15,6 +16,9 @@ struct Debugger {
     texture: Option<egui::TextureHandle>,
     capture_dir: PathBuf,
     audio: Option<audio::Output>,
+    /// Wall time and guest cycle count at last Run. Guest realtime is
+    /// (cycles - origin_cycles) / CPU_HZ versus this Instant.
+    clock: Option<(Instant, u64)>,
 }
 
 impl Debugger {
@@ -31,6 +35,7 @@ impl Debugger {
             texture: None,
             capture_dir,
             audio: None,
+            clock: None,
         };
         match audio::Output::start() {
             Ok(o) => d.audio = Some(o),
@@ -70,41 +75,47 @@ impl Debugger {
 impl eframe::App for Debugger {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.running {
-            let queued = self.audio.as_ref().map(|a| a.queued_frames());
-            // Clock the guest to the host DAC. Running every egui repaint
-            // produced samples faster than 44100 Hz, then dropped them and
-            // desynced L/R — that was the glitchy noise.
-            let run = queued.map(|q| q < audio::WATERMARK).unwrap_or(true);
-            if run {
-                if let Some(m) = self.machine.as_mut() {
+            if let Some(m) = self.machine.as_mut() {
+                if self.clock.is_none() {
+                    self.clock = Some((Instant::now(), m.cycles()));
+                }
+                let (t0, c0) = self.clock.unwrap();
+                let guest = (m.cycles() - c0) as f64 / CPU_HZ as f64;
+                let wall = t0.elapsed().as_secs_f64();
+                if guest <= wall {
                     let target = m.vblank_count() + 1;
                     m.run_until_vblank_count(target);
                     let pcm = m.take_audio();
                     if let Some(a) = self.audio.as_ref() {
                         a.push(&pcm);
                     }
+                    ctx.request_repaint();
+                } else {
+                    let wait = Duration::from_secs_f64(guest - wall);
+                    ctx.request_repaint_after(wait);
                 }
-                ctx.request_repaint();
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(4));
             }
         }
 
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             if ui.button("Run").clicked() {
                 self.running = true;
+                self.clock = None;
             }
             if ui.button("Pause").clicked() {
                 self.running = false;
+                self.clock = None;
             }
             if ui.button("Step instruction").clicked() {
                 self.running = false;
+                self.clock = None;
                 if let Some(m) = self.machine.as_mut() {
                     m.step();
                 }
             }
             if ui.button("Step frame").clicked() {
                 self.running = false;
+                self.clock = None;
                 if let Some(m) = self.machine.as_mut() {
                     let n = m.vblank_count() + 1;
                     m.run_until_vblank_count(n);
