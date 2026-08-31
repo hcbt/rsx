@@ -260,6 +260,8 @@ impl Dma {
             self.chcr[ch] &= !(1 << 24);
             return;
         }
+        // SPX: Start/Trigger (bit 28) clears when the transfer begins.
+        self.chcr[ch] &= !(1 << 28);
         self.credit[ch] = 0;
         self.words_done[ch] = 0;
         self.hyper[ch] = false;
@@ -982,5 +984,69 @@ mod tests {
             "CD must complete while GPU DMA is stalled on a full FIFO"
         );
         assert_ne!(peek(&ram, 0x3000), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn chcr_bit28_clears_when_transfer_begins_bit24_when_it_completes() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E0,
+            0x100C,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E4,
+            4,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10E8,
+            0x1100_0002,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        let chcr = dma.read32(0x1F80_10E8);
+        assert_eq!(
+            chcr & (1 << 28),
+            0,
+            "CHCR bit 28 (force start without DREQ) clears when the transfer begins"
+        );
+        assert_ne!(
+            chcr & (1 << 24),
+            0,
+            "CHCR bit 24 stays set until the transfer completes"
+        );
+        dma.tick(64, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        assert_eq!(
+            dma.read32(0x1F80_10E8) & (1 << 24),
+            0,
+            "CHCR bit 24 clears when the transfer completes"
+        );
     }
 }

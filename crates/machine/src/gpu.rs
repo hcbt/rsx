@@ -80,6 +80,7 @@ pub struct Gpu {
     plot_cost: u32,
     plotting: bool,
     block28: bool,
+    scanline: u32,
 }
 
 #[allow(dead_code)]
@@ -167,6 +168,7 @@ impl Gpu {
             plot_cost: 1,
             plotting: false,
             block28: false,
+            scanline: 0,
         };
         g.update_stat();
         g
@@ -213,8 +215,10 @@ impl Gpu {
         let need_params = self.gp0_cmd.is_some();
         let drawing = self.draw_busy > 0;
         if let Some(t) = self.transfer.as_ref() {
-            s &= !(1 << 26);
-            if !t.to_vram {
+            if t.to_vram {
+                // SPX / CPU-to-VRAM: still wants GP0 words → GPUSTAT.26 stays set.
+            } else {
+                s &= !(1 << 26);
                 s &= !(1 << 28);
                 s |= 1 << 27;
             }
@@ -247,8 +251,20 @@ impl Gpu {
             s |= 1 << 12;
         }
         s |= 1 << 13;
-        if self.display_vres >= 480 && self.odd_frame && !self.in_vblank {
-            s |= 1 << 31;
+        if !self.in_vblank {
+            if self.display_vres >= 480 {
+                if self.odd_frame {
+                    s |= 1 << 31;
+                }
+            } else if self.scanline & 1 != 0 {
+                s |= 1 << 31;
+            }
+        }
+        match self.dma_dir {
+            1 if self.fifo.len() <= FIFO_WORDS / 2 => s |= 1 << 25,
+            2 if s & (1 << 28) != 0 => s |= 1 << 25,
+            3 if s & (1 << 27) != 0 => s |= 1 << 25,
+            _ => {}
         }
         s |= match self.display_hres {
             256 => 0,
@@ -1104,6 +1120,7 @@ impl Gpu {
             self.frame_y1 = i32::MIN;
         }
         self.in_vblank = vblank;
+        self.scanline = line;
         self.update_stat();
     }
 }
@@ -1893,6 +1910,87 @@ mod tests {
             p, 0x001F,
             "E2 offset without mask must not remap UV 0 (got {p:#06X})"
         );
+    }
+
+    #[test]
+    fn gpustat_25_follows_gp1_04h_dma_direction() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x04 << 24);
+        assert_eq!(
+            gpu.stat() & (1 << 25),
+            0,
+            "GP1(04h)=0: GPUSTAT.25 is always 0"
+        );
+        gpu.gp1(0x04 << 24 | 1);
+        assert_ne!(
+            gpu.stat() & (1 << 25),
+            0,
+            "GP1(04h)=1: FIFO half-empty DRQ when FIFO is empty"
+        );
+        for _ in 0..9 {
+            gpu.gp0(0x01 << 24);
+        }
+        assert_eq!(
+            gpu.stat() & (1 << 25),
+            0,
+            "GP1(04h)=1: DRQ clear when FIFO is more than half full"
+        );
+        gpu.gp1(0x01 << 24);
+        gpu.gp1(0x04 << 24 | 2);
+        assert_eq!(
+            (gpu.stat() >> 25) & 1,
+            (gpu.stat() >> 28) & 1,
+            "GP1(04h)=2: GPUSTAT.25 same as FIFO empty (bit 28)"
+        );
+        gpu.gp1(0x04 << 24 | 3);
+        assert_eq!(
+            (gpu.stat() >> 25) & 1,
+            (gpu.stat() >> 27) & 1,
+            "GP1(04h)=3: GPUSTAT.25 same as VRAM-to-CPU ready (bit 27)"
+        );
+    }
+
+    #[test]
+    fn gp0_a0_keeps_gpustat_26_while_it_still_wants_gp0_words() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(4 | (4 << 16));
+        gpu.tick(16, 0, false);
+        assert_ne!(
+            gpu.stat() & (1 << 26),
+            0,
+            "GPUSTAT.26 stays set while GP0(A0) still wants GP0 words"
+        );
+        gpu.gp0(0);
+        gpu.tick(4, 0, false);
+        assert_ne!(
+            gpu.stat() & (1 << 26),
+            0,
+            "GPUSTAT.26 stays set after a partial A0 payload"
+        );
+    }
+
+    #[test]
+    fn gpustat_31_toggles_per_scanline_in_240_per_frame_in_480_zero_in_vblank() {
+        let mut gpu = Gpu::new();
+        gpu.tick(1, 0, false);
+        assert_eq!(gpu.stat() >> 31, 0, "240-line even scanline: GPUSTAT.31=0");
+        gpu.tick(1, 1, false);
+        assert_eq!(gpu.stat() >> 31, 1, "240-line odd scanline: GPUSTAT.31=1");
+        gpu.tick(1, 243, true);
+        assert_eq!(gpu.stat() >> 31, 0, "GPUSTAT.31 is 0 in vblank");
+
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x08 << 24 | 4);
+        gpu.tick(1, 0, false);
+        assert_eq!(gpu.stat() >> 31, 0, "480-line first field even");
+        gpu.tick(1, 1, false);
+        assert_eq!(gpu.stat() >> 31, 0, "480-line does not toggle per scanline");
+        gpu.tick(1, 243, true);
+        assert_eq!(gpu.stat() >> 31, 0, "480-line vblank: GPUSTAT.31=0");
+        gpu.tick(1, 0, false);
+        assert_eq!(gpu.stat() >> 31, 1, "480-line next field: GPUSTAT.31=1");
     }
 }
 
