@@ -3,6 +3,17 @@ use std::collections::VecDeque;
 use crate::disc::Disc;
 use crate::irq::{self, Irq};
 
+/// One Setloc/ReadN/Pause/Seek as seen by the controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CdCmdEvent {
+    pub cmd: u8,
+    pub loc_lba: u32,
+    pub lba: u32,
+    pub setloc_pending: bool,
+    pub reading: bool,
+    pub held: bool,
+}
+
 /// Inspectable CD-ROM controller state. The Debugger prints this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CdromView {
@@ -11,6 +22,9 @@ pub struct CdromView {
     pub reading: bool,
     pub motor: bool,
     pub lba: u32,
+    pub loc_lba: u32,
+    pub last_lba: u32,
+    pub setloc_pending: bool,
     pub pending_cycles: Option<u32>,
     pub fifo_bytes: u32,
     pub mode: u8,
@@ -80,6 +94,7 @@ pub struct Cdrom {
     play_ready: bool,
     play_sectors: u32,
     session_fail: u8,
+    cmd_events: Vec<CdCmdEvent>,
 }
 
 enum PendingWhat {
@@ -152,6 +167,7 @@ impl Cdrom {
             play_ready: false,
             play_sectors: 0,
             session_fail: 0,
+            cmd_events: Vec::new(),
         }
     }
 
@@ -410,6 +426,31 @@ impl Cdrom {
         }
     }
 
+    fn loc_lba_now(&self) -> u32 {
+        msf_to_lba(self.loc.0, self.loc.1, self.loc.2)
+    }
+
+    fn log_cmd(&mut self, cmd: u8, held: bool) {
+        if !matches!(cmd, 0x02 | 0x06 | 0x09 | 0x15 | 0x16 | 0x1B) {
+            return;
+        }
+        if self.cmd_events.len() >= 64 {
+            self.cmd_events.remove(0);
+        }
+        self.cmd_events.push(CdCmdEvent {
+            cmd,
+            loc_lba: self.loc_lba_now(),
+            lba: self.lba,
+            setloc_pending: self.setloc_pending,
+            reading: self.reading,
+            held,
+        });
+    }
+
+    pub fn cmd_events(&self) -> &[CdCmdEvent] {
+        &self.cmd_events
+    }
+
     fn command(&mut self, cmd: u8, irq: &mut Irq) {
         self.last_cmd = cmd;
         let i = (self.recent_n as usize) % 16;
@@ -420,11 +461,20 @@ impl Cdrom {
                 self.param.clear();
                 return;
             }
+            // SPX: Setloc is unprocessed until Seek/Read/Play, but the loc
+            // registers latch when the command is written. A later ReadN that
+            // replaces the sitting command still seeks to that loc.
+            if cmd == 0x02 && self.param.len() >= 3 {
+                self.loc = (self.param[0], self.param[1], self.param[2]);
+                self.setloc_pending = true;
+            }
+            self.log_cmd(cmd, true);
             self.held_cmd = Some(cmd);
             self.held_param = std::mem::take(&mut self.param);
             return;
         }
         self.execute(cmd, irq);
+        self.log_cmd(cmd, false);
     }
 
     fn execute(&mut self, cmd: u8, _irq: &mut Irq) {
@@ -684,6 +734,9 @@ impl Cdrom {
             reading: self.reading,
             motor: self.motor,
             lba: self.lba,
+            loc_lba: self.loc_lba_now(),
+            last_lba: self.last_lba,
+            setloc_pending: self.setloc_pending,
             pending_cycles: self.pending.as_ref().map(|p| p.cycles),
             fifo_bytes: self.fifo.len().saturating_sub(self.fifo_i) as u32,
             mode: self.mode,
@@ -1748,10 +1801,16 @@ mod tests {
             1,
             "Pause must drop the queued INT1, not deliver it on INT3 ack"
         );
+        irq.write16(0x1F80_1070, !(1 << 2));
         pump(&mut cd, &mut irq, 0x0021_181C);
         let kind = hintsts(&mut cd, &mut irq);
         assert_ne!(kind, 1, "Pause must drop queued INT1 (got INT{kind})");
         assert_eq!(kind, 2, "Pause INT2");
+        assert_ne!(
+            irq.read16(0x1F80_1070) & (1 << 2),
+            0,
+            "SPX: HINTSTS 0→INT2 after Pause INT3 ack must edge I_STAT.CD"
+        );
     }
 
     #[test]
@@ -1831,6 +1890,66 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&second).contains("NEXT"),
             "seek must land on the new Setloc ({second:?})"
+        );
+    }
+
+    #[test]
+    fn setloc_while_hintsts_still_latches_loc_for_a_replacing_readn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        let lic = b"          Licensed  by          Sony Computer Entertainment Amer  ica";
+        bin[SECTOR_LEN * 4 + 24..SECTOR_LEN * 4 + 24 + lic.len()].copy_from_slice(lic);
+        bin[SECTOR_LEN * 5 + 24..SECTOR_LEN * 5 + 24 + 4].copy_from_slice(b"SEQ!");
+        bin[SECTOR_LEN * 8 + 24..SECTOR_LEN * 8 + 24 + 4].copy_from_slice(b"NEXT");
+        std::fs::write(dir.path().join("game.bin"), &bin).unwrap();
+        let cue = dir.path().join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        let disc = load_disc(&cue).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x80]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        want_data(&mut cd, &mut irq);
+        drain_data(&mut cd, &mut irq);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x09, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 0x0021_181C);
+        assert_eq!(hintsts(&mut cd, &mut irq), 2, "Pause INT2");
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x08]);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        want_data(&mut cd, &mut irq);
+        let mut body = Vec::new();
+        for _ in 0..8 {
+            body.push(cd.read8(2));
+        }
+        assert!(
+            String::from_utf8_lossy(&body).contains("NEXT"),
+            "Setloc while HINTSTS must still latch loc so replacing ReadN seeks (got {body:?})"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("SEQ!"),
+            "must not continue sequentially after the old loc"
         );
     }
 

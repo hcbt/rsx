@@ -38,6 +38,8 @@ pub struct Gpu {
     display_enabled: bool,
     dma_dir: u8,
     interlace: bool,
+    pal: bool,
+    reverse: bool,
     disp_24: bool,
     gpu_irq: bool,
     range_x1: u32,
@@ -139,6 +141,8 @@ impl Gpu {
             display_enabled: false,
             dma_dir: 0,
             interlace: false,
+            pal: false,
+            reverse: false,
             disp_24: false,
             gpu_irq: false,
             range_x1: 0x200,
@@ -288,6 +292,9 @@ impl Gpu {
         if !self.interlace || self.odd_frame {
             s |= 1 << 13;
         }
+        if self.reverse {
+            s |= 1 << 14;
+        }
         if !self.in_vblank {
             if self.display_vres >= 480 {
                 if self.odd_frame {
@@ -314,11 +321,17 @@ impl Gpu {
         if self.display_vres >= 480 {
             s |= 1 << 19;
         }
-        if !self.display_enabled {
-            s |= 1 << 23;
+        if self.pal {
+            s |= 1 << 20;
         }
         if self.disp_24 {
             s |= 1 << 21;
+        }
+        if self.interlace {
+            s |= 1 << 22;
+        }
+        if !self.display_enabled {
+            s |= 1 << 23;
         }
         if self.gpu_irq {
             s |= 1 << 24;
@@ -582,8 +595,10 @@ impl Gpu {
                     };
                 }
                 self.display_vres = if p & 4 != 0 { 480 } else { 240 };
-                self.interlace = p & (1 << 5) != 0;
+                self.pal = p & (1 << 3) != 0;
                 self.disp_24 = p & (1 << 4) != 0;
+                self.interlace = p & (1 << 5) != 0;
+                self.reverse = p & (1 << 7) != 0;
                 self.update_stat();
             }
             0x06 => {
@@ -2185,6 +2200,23 @@ mod tests {
             gpu.stat() & (1 << 13),
             0,
             "GPUSTAT.13 follows the interlace field when GP1(08h).5 is on"
+        );
+        assert_ne!(
+            gpu.stat() & (1 << 22),
+            0,
+            "GPUSTAT.22 is GP1(08h) vertical interlace"
+        );
+        assert_ne!(
+            gpu.stat() & (1 << 19),
+            0,
+            "GPUSTAT.19 is 480-line when GP1(08h).2 is set"
+        );
+        gpu.gp1(0x08 << 24 | (1 << 3));
+        assert_ne!(gpu.stat() & (1 << 20), 0, "GPUSTAT.20 is GP1(08h) PAL");
+        assert_eq!(
+            gpu.stat() & (1 << 22),
+            0,
+            "GP1(08h) without bit 5 clears GPUSTAT.22"
         );
     }
 

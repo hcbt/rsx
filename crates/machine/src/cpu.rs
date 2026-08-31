@@ -33,6 +33,8 @@ pub struct Cpu {
     pub trans_y_write: Option<(u32, u32, i32)>,
     /// Up to 16 (mips_pc, ra, gool_pc, y) stores of Crash trans.y.
     pub trans_y_writes: Vec<(u32, u32, u32, i32)>,
+    pub nsf_134c8: u32,
+    pub nsf_13b30: u32,
 }
 
 impl Cpu {
@@ -55,6 +57,8 @@ impl Cpu {
             exception_log: Vec::new(),
             trans_y_write: None,
             trans_y_writes: Vec::new(),
+            nsf_134c8: 0,
+            nsf_13b30: 0,
             data_cycles: 0,
             muldiv_busy: 0,
             icache: (0..ICACHE_LINES)
@@ -208,6 +212,12 @@ impl Cpu {
         self.in_delay = self.branch_delay;
         self.branch_delay = false;
         self.current_pc = self.pc;
+        if self.current_pc == 0x8001_34C8 {
+            self.nsf_134c8 = self.nsf_134c8.saturating_add(1);
+        }
+        if self.current_pc == 0x8001_3B30 {
+            self.nsf_13b30 = self.nsf_13b30.saturating_add(1);
+        }
 
         self.cop0.set_ip_hw(bus.irq().pending_for_cop0());
         let irq = self.cop0.iec() && (self.cop0.cause & self.cop0.sr & 0xFF00) != 0;

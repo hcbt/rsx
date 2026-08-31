@@ -15,7 +15,7 @@ mod spu;
 mod timers;
 
 pub use bios::BiosError;
-pub use cdrom::CdromView;
+pub use cdrom::{CdCmdEvent, CdromView};
 pub use disc::DiscError;
 
 use std::path::Path;
@@ -179,6 +179,10 @@ impl Machine {
 
     pub fn cd_view(&self) -> CdromView {
         self.bus.cdrom().view()
+    }
+
+    pub fn cd_cmd_events(&self) -> Vec<cdrom::CdCmdEvent> {
+        self.bus.cdrom().cmd_events().to_vec()
     }
 
     pub fn display_area(&self) -> DisplayArea {
@@ -387,6 +391,10 @@ impl Machine {
 
     pub fn trans_y_writes(&self) -> Vec<(u32, u32, u32, i32)> {
         self.cpu.trans_y_writes().to_vec()
+    }
+
+    pub fn nsf_reloc_hits(&self) -> (u32, u32) {
+        (self.cpu.nsf_134c8, self.cpu.nsf_13b30)
     }
 
     pub fn sr(&self) -> u32 {
@@ -1085,7 +1093,7 @@ mod tests {
             }
         }
         eprintln!(
-            "nsf {tag} v={} pc={:08X} clip=({x1},{y1})-({x2},{y2}) ofs=({ox},{oy}) chcr3={:08X} cd lba={} read={} fifo={} mode={:02X} last={:02X} pend={:?} 587C={:08X} dest={:08X} bcrw={:08X} remain={:08X} 589C={:08X} CFA8={:08X} CFAC={:08X} desc={:08X} type={:08X} DCE08={:08X} 12CE08={:08X} 12CE18={:08X} pages={pages:08X} tagged={tagged} kseg={kseg} p0..7={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} 55C0={:08X} 58C8={:08X} 58D0={:08X} 58D4={:08X} 58D8={:08X} dma3madr={:08X}",
+            "nsf {tag} v={} pc={:08X} clip=({x1},{y1})-({x2},{y2}) ofs=({ox},{oy}) chcr3={:08X} cd lba={} read={} fifo={} mode={:02X} last={:02X} loc_lba={} last_lba={} setloc={} pend={:?} 587C={:08X} dest={:08X} bcrw={:08X} remain={:08X} 589C={:08X} CFA8={:08X} CFAC={:08X} desc={:08X} type={:08X} DCE08={:08X} 12CE08={:08X} 12CE18={:08X} pages={pages:08X} tagged={tagged} kseg={kseg} p0..7={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} 55C0={:08X} 58C8={:08X} 58D0={:08X} 58D4={:08X} 58D8={:08X} dma3madr={:08X}",
             m.vblank_count(),
             m.pc(),
             m.dma_chcr(3),
@@ -1094,6 +1102,9 @@ mod tests {
             cd.fifo_bytes,
             cd.mode,
             cd.last_cmd,
+            cd.loc_lba,
+            cd.last_lba,
+            u8::from(cd.setloc_pending),
             cd.pending_cycles,
             m.ram_word(0x8005_587C),
             m.ram_word(0x8005_588C),
@@ -1148,6 +1159,56 @@ mod tests {
             }
             eprintln!();
         }
+        let gp = m.gpr(28);
+        eprintln!(
+            "  gp={gp:08X} gp20={:08X} C540={:08X} C548={:08X} CFB8={:08X} 55A0={:08X} 55A4={:08X} vec80={:08X} {:08X} {:08X} {:08X} 61E98={:08X} {:08X} {:08X} {:08X}",
+            m.ram_word(gp.wrapping_add(20)),
+            m.ram_word(0x8005_C540),
+            m.ram_word(0x8005_C548),
+            m.ram_word(0x8005_CFB8),
+            m.ram_word(0x8005_55A0),
+            m.ram_word(0x8005_55A4),
+            m.ram_word(0x8000_0080),
+            m.ram_word(0x8000_0084),
+            m.ram_word(0x8000_0088),
+            m.ram_word(0x8000_008C),
+            m.ram_word(0x8006_1E98),
+            m.ram_word(0x8006_1E9C),
+            m.ram_word(0x8006_1EA0),
+            m.ram_word(0x8006_1EA4),
+        );
+        let (n134, n13b) = m.nsf_reloc_hits();
+        eprintln!("  nsf_134c8={n134} nsf_13b30={n13b}");
+        let table = m.ram_word(0x8005_C540);
+        eprintln!(
+            "  table={table:08X} +418={:08X} +41C={:08X} +420={:08X} +424={:08X} 9CE08={:08X} ACE08={:08X} BCE08={:08X} CCE08={:08X}",
+            m.ram_word(table.wrapping_add(0x418)),
+            m.ram_word(table.wrapping_add(0x41C)),
+            m.ram_word(table.wrapping_add(0x420)),
+            m.ram_word(table.wrapping_add(0x424)),
+            m.ram_word(0x8009_CE08),
+            m.ram_word(0x800A_CE08),
+            m.ram_word(0x800B_CE08),
+            m.ram_word(0x800C_CE08),
+        );
+        eprint!("  cdcmd");
+        for e in m.cd_cmd_events() {
+            eprint!(
+                " {:02X}:loc={}@{} p={} r={} h={}",
+                e.cmd,
+                e.loc_lba,
+                e.lba,
+                u8::from(e.setloc_pending),
+                u8::from(e.reading),
+                u8::from(e.held)
+            );
+        }
+        eprintln!();
+        eprint!("  k0c80");
+        for i in 0..8u32 {
+            eprint!(" {:08X}", m.ram_word(0x0000_0C80 + i * 4));
+        }
+        eprintln!();
     }
 
     #[test]
