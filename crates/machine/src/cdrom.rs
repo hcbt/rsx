@@ -54,6 +54,11 @@ pub struct Cdrom {
     header: [u8; 8],
     header_valid: bool,
     last_lba: u32,
+    data_sector: Vec<u8>,
+    pad_byte: u8,
+    filter_file: u8,
+    filter_channel: u8,
+    want_data: bool,
 }
 
 enum PendingWhat {
@@ -99,6 +104,11 @@ impl Cdrom {
             header: [0; 8],
             header_valid: false,
             last_lba: 0,
+            data_sector: Vec::new(),
+            pad_byte: 0,
+            filter_file: 0,
+            filter_channel: 0,
+            want_data: false,
         }
     }
 
@@ -167,7 +177,10 @@ impl Cdrom {
         self.status |= 1 << 5; // result ready
         self.status &= !(1 << 7); // not busy
         if irqn == 1 {
-            self.fill_fifo();
+            self.capture_data_sector();
+            if self.want_data {
+                self.load_data_fifo();
+            }
         }
         self.update_irq_line(irq);
     }
@@ -237,6 +250,16 @@ impl Cdrom {
                 self.irq_enable = value & 0x1F;
                 self.update_irq_line(irq);
             }
+            (3, 0) => {
+                self.want_data = value & 0x80 != 0;
+                if self.want_data {
+                    self.load_data_fifo();
+                } else {
+                    self.fifo.clear();
+                    self.fifo_i = 0;
+                    self.status &= !(1 << 6);
+                }
+            }
             (3, 1) => {
                 self.irq_flag &= !(value & 0x1F);
                 if value & 0x40 != 0 {
@@ -280,8 +303,11 @@ impl Cdrom {
     fn execute(&mut self, cmd: u8, _irq: &mut Irq) {
         self.last_executed = cmd;
         self.status |= 1 << 7; // busy
-        let keep_pending =
-            self.pending.is_some() && matches!(cmd, 0x01 | 0x02 | 0x0C | 0x0E | 0x10 | 0x19);
+        let keep_pending = self.pending.is_some()
+            && matches!(
+                cmd,
+                0x01 | 0x02 | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F | 0x10 | 0x11 | 0x13 | 0x14 | 0x19
+            );
         let (first, second) = match cmd {
             0x01 => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
             0x02 => {
@@ -291,7 +317,37 @@ impl Cdrom {
                 self.setloc_pending = true;
                 (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
             }
+            0x03 => {
+                self.motor = true;
+                if self.setloc_pending {
+                    self.setloc_pending = false;
+                    self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
+                    self.last_lba = self.lba;
+                }
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
             0x06 | 0x1B => self.read_n(),
+            0x07 => {
+                if self.motor {
+                    (
+                        Some((0xC4E1, 5, vec![self.controller_stat() | 1, 0x20])),
+                        None,
+                    )
+                } else {
+                    self.motor = true;
+                    let stat = self.controller_stat();
+                    (
+                        Some((0xC4E1, 3, vec![stat])),
+                        Some((
+                            0xC4E1,
+                            PendingWhat::Irq {
+                                irq: 2,
+                                result: vec![stat],
+                            },
+                        )),
+                    )
+                }
+            }
             0x08 => {
                 self.drop_int1();
                 self.reading = false;
@@ -345,14 +401,39 @@ impl Cdrom {
                     )),
                 )
             }
+            0x0B => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
             0x0C => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
+            0x0D => {
+                if self.param.len() >= 2 {
+                    self.filter_file = self.param[0];
+                    self.filter_channel = self.param[1];
+                }
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
             0x0E => {
                 if let Some(&m) = self.param.first() {
                     self.mode = m;
                 }
                 (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
             }
+            0x0F => (
+                Some((
+                    0xC4E1,
+                    3,
+                    vec![
+                        self.controller_stat(),
+                        self.mode,
+                        0,
+                        self.filter_file,
+                        self.filter_channel,
+                    ],
+                )),
+                None,
+            ),
             0x10 => self.getloc_l(),
+            0x11 => self.getloc_p(),
+            0x13 => self.get_tn(),
+            0x14 => self.get_td(),
             0x15 => self.seek_l(),
             0x19 => {
                 let sub = self.param.first().copied().unwrap_or(0);
@@ -459,6 +540,57 @@ impl Cdrom {
         s
     }
 
+    fn getloc_p(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let lba = if self.seeking {
+            msf_to_lba(self.loc.0, self.loc.1, self.loc.2)
+        } else {
+            self.last_lba
+        };
+        let abs = frames_to_msf(lba + 150);
+        let rel = frames_to_msf(lba);
+        (
+            Some((
+                0xC4E1,
+                3,
+                vec![0x01, 0x01, rel.0, rel.1, rel.2, abs.0, abs.1, abs.2],
+            )),
+            None,
+        )
+    }
+
+    fn get_tn(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        (
+            Some((0xC4E1, 3, vec![self.controller_stat(), 0x01, 0x01])),
+            None,
+        )
+    }
+
+    fn get_td(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let track = self.param.first().copied().unwrap_or(0);
+        if track > 0x01 {
+            (
+                Some((0xC4E1, 5, vec![self.controller_stat() | 1, 0x10])),
+                None,
+            )
+        } else {
+            let (mm, ss) = if track == 0 {
+                let abs = frames_to_msf(
+                    self.disc
+                        .as_ref()
+                        .map(|d| d.sector_count() + 150)
+                        .unwrap_or(150),
+                );
+                (abs.0, abs.1)
+            } else {
+                (0x00, 0x02)
+            };
+            (
+                Some((0xC4E1, 3, vec![self.controller_stat(), mm, ss])),
+                None,
+            )
+        }
+    }
+
     fn getloc_l(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
         if self.seeking || !self.header_valid {
             (
@@ -533,17 +665,20 @@ impl Cdrom {
         }
     }
 
-    fn fill_fifo(&mut self) {
+    fn capture_data_sector(&mut self) {
         let Some(disc) = self.disc.as_ref() else {
             self.reading = false;
+            self.data_sector.clear();
             return;
         };
         if self.lba >= disc.sector_count() {
             self.reading = false;
+            self.data_sector.clear();
             return;
         }
         let Some(raw) = disc.sector(self.lba) else {
             self.reading = false;
+            self.data_sector.clear();
             return;
         };
         if raw.len() >= 20 {
@@ -556,12 +691,27 @@ impl Cdrom {
             (24, 0x800)
         };
         let end = (start + len).min(raw.len());
-        self.fifo.clear();
-        self.fifo.extend_from_slice(&raw[start..end]);
-        self.fifo_i = 0;
-        self.status |= 1 << 6;
+        self.data_sector.clear();
+        self.data_sector.extend_from_slice(&raw[start..end]);
+        let pad_i = if self.mode & 0x20 != 0 {
+            0x924 - 4
+        } else {
+            0x800 - 8
+        };
+        self.pad_byte = self.data_sector.get(pad_i).copied().unwrap_or(0);
         self.last_lba = self.lba;
         self.lba += 1;
+    }
+
+    fn load_data_fifo(&mut self) {
+        self.fifo.clear();
+        self.fifo.extend_from_slice(&self.data_sector);
+        self.fifo_i = 0;
+        if !self.fifo.is_empty() {
+            self.status |= 1 << 6;
+        } else {
+            self.status &= !(1 << 6);
+        }
     }
 
     fn capture_header(&mut self) {
@@ -596,6 +746,8 @@ impl Cdrom {
                 }
             }
             b
+        } else if !self.data_sector.is_empty() {
+            self.pad_byte
         } else {
             0
         }
@@ -618,6 +770,18 @@ fn msf_to_lba(mm: u8, ss: u8, ff: u8) -> u32 {
     let s = bcd(ss);
     let f = bcd(ff);
     (m * 60 + s) * 75 + f - 150
+}
+
+fn to_bcd(v: u32) -> u8 {
+    ((((v / 10) % 10) << 4) | (v % 10)) as u8
+}
+
+fn frames_to_msf(frames: u32) -> (u8, u8, u8) {
+    (
+        to_bcd(frames / 75 / 60),
+        to_bcd((frames / 75) % 60),
+        to_bcd(frames % 75),
+    )
 }
 
 #[cfg(test)]
@@ -704,6 +868,7 @@ mod tests {
         cd.write8(3, 0x1F, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(cd.irq_flag & 7, 1, "INT1");
+        want_data(&mut cd, &mut irq);
         let mut bytes = Vec::new();
         for _ in 0..64 {
             bytes.push(cd.pop_fifo());
@@ -741,6 +906,7 @@ mod tests {
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(cd.irq_flag & 7, 1);
         pump(&mut cd, &mut irq, 300_000);
+        want_data(&mut cd, &mut irq);
         let mut first = Vec::new();
         for _ in 0..16 {
             first.push(cd.pop_fifo());
@@ -804,6 +970,11 @@ mod tests {
             }
             let _ = cd.read8(2);
         }
+    }
+
+    fn want_data(cd: &mut Cdrom, irq: &mut Irq) {
+        cd.write8(0, 0, irq);
+        cd.write8(3, 0x80, irq);
     }
 
     #[test]
@@ -877,6 +1048,7 @@ mod tests {
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1, "first INT1");
+        want_data(&mut cd, &mut irq);
         drain_data(&mut cd, &mut irq);
         assert_eq!(
             hintsts(&mut cd, &mut irq),
@@ -934,6 +1106,7 @@ mod tests {
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        want_data(&mut cd, &mut irq);
         let mut first = Vec::new();
         for _ in 0..64 {
             first.push(cd.read8(2));
@@ -973,6 +1146,7 @@ mod tests {
         );
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        want_data(&mut cd, &mut irq);
         let mut second = Vec::new();
         for _ in 0..8 {
             second.push(cd.read8(2));
@@ -1008,14 +1182,11 @@ mod tests {
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1);
         ack_irq(&mut cd, &mut irq);
-        loop {
-            if cd.read8(0) & (1 << 6) == 0 {
-                break;
-            }
-            let _ = cd.read8(2);
-        }
+        want_data(&mut cd, &mut irq);
+        drain_data(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1, "second sector INT1");
+        want_data(&mut cd, &mut irq);
         let mut last = Vec::new();
         for _ in 0..8 {
             last.push(cd.read8(2));
@@ -1046,6 +1217,7 @@ mod tests {
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        want_data(&mut cd, &mut irq);
         let mut again = Vec::new();
         for _ in 0..8 {
             again.push(cd.read8(2));
@@ -1067,6 +1239,7 @@ mod tests {
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
         assert_eq!(hintsts(&mut cd, &mut irq), 1, "ReadS INT1");
+        want_data(&mut cd, &mut irq);
         let mut bytes = Vec::new();
         for _ in 0..64 {
             bytes.push(cd.read8(2));
@@ -1190,6 +1363,150 @@ mod tests {
             irq.read16(0x1F80_1070) & (1 << 2),
             0,
             "new HINTSTS false→true sets I_STAT.CD"
+        );
+    }
+
+    #[test]
+    fn int1_data_loads_only_when_want_data_is_set() {
+        let (_dir, mut cd) = load_licensed();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        set_2x_and_loc(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        cd.write8(0, 0, &mut irq);
+        assert_eq!(
+            cd.read8(0) & (1 << 6),
+            0,
+            "without Want Data the data FIFO stays empty"
+        );
+        want_data(&mut cd, &mut irq);
+        cd.write8(0, 0, &mut irq);
+        assert_ne!(cd.read8(0) & (1 << 6), 0, "BFRD loads the data FIFO");
+        let mut bytes = Vec::new();
+        for _ in 0..32 {
+            bytes.push(cd.read8(2));
+        }
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("Licens"),
+            "Want Data must load the INT1 sector"
+        );
+    }
+
+    #[test]
+    fn motor_on_mute_setfilter_getparam_play_use_command_summary() {
+        let (_dir, mut cd) = load_licensed();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x07, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "MotorOn INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 2, "MotorOn INT2");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x07, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            5,
+            "MotorOn while spinning is INT5"
+        );
+        assert_eq!(result_bytes(&mut cd, 2)[1], 0x20);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0B, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Mute INT3");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0D, &[0x01, 0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Setfilter INT3");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x80]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0F, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Getparam INT3");
+        let gp = result_bytes(&mut cd, 5);
+        assert_eq!(&gp[1..], &[0x80, 0x00, 0x01, 0x02]);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x03, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Play INT3");
+    }
+
+    #[test]
+    fn getlocp_gettn_gettd_and_response_fifo_ack() {
+        let (_dir, mut cd) = load_licensed();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x15, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x11, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "GetlocP INT3");
+        assert_eq!(
+            result_bytes(&mut cd, 8),
+            vec![0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x02, 0x04]
+        );
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x13, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "GetTN INT3");
+        let tn = result_bytes(&mut cd, 3);
+        assert_eq!(&tn[1..], &[0x01, 0x01], "single-track disc first=last=01h");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x14, &[0x01]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "GetTD INT3");
+        assert_eq!(&result_bytes(&mut cd, 3)[1..], &[0x00, 0x02]);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x01, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        let _ = cd.read8(1);
+        ack_irq(&mut cd, &mut irq);
+        assert_eq!(cd.read8(1), 0, "response FIFO is emptied on IRQ ack");
+    }
+
+    #[test]
+    fn data_fifo_repeats_spx_padding_byte_past_800h() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        bin[SECTOR_LEN * 4 + 24 + 0x7F8] = 0xA5;
+        std::fs::write(dir.path().join("game.bin"), &bin).unwrap();
+        let cue = dir.path().join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        let disc = load_disc(&cue).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        set_2x_and_loc(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        want_data(&mut cd, &mut irq);
+        for _ in 0..0x800 {
+            let _ = cd.read8(2);
+        }
+        assert_eq!(
+            cd.read8(2),
+            0xA5,
+            "past 800h the data FIFO repeats the byte at 800h-8"
         );
     }
 }

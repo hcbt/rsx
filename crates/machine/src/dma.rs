@@ -320,12 +320,20 @@ impl Dma {
                 next: 0,
                 nodes: 0,
             })
-        } else if mode == 1 && dir == 1 {
+        } else if dir == 1 && (mode == 0 || mode == 1) {
             Some(Job::Block {
                 ch: 2,
                 addr,
-                remaining: block_words(self.bcr[2], 0x1_0000),
+                remaining: block_words(self.bcr[2], if mode == 0 { 1 } else { 0x1_0000 }),
                 dir: 1,
+                step: 4,
+            })
+        } else if dir == 0 && (mode == 0 || mode == 1) {
+            Some(Job::Block {
+                ch: 2,
+                addr,
+                remaining: block_words(self.bcr[2], 1),
+                dir: 0,
                 step: 4,
             })
         } else {
@@ -543,15 +551,22 @@ impl Dma {
         }
     }
 
-    fn gpu_block_word(&mut self, ram: &[u8], gpu: &mut Gpu) {
+    fn gpu_block_word(&mut self, ram: &mut [u8], gpu: &mut Gpu) {
         let done = {
             let Some(Job::Block {
-                addr, remaining, ..
+                addr,
+                remaining,
+                dir,
+                ..
             }) = self.jobs[2].as_mut()
             else {
                 return;
             };
-            gpu.dma_write(read32(ram, *addr));
+            if *dir == 1 {
+                gpu.dma_write(read32(ram, *addr));
+            } else {
+                write32(ram, *addr, gpu.dma_read());
+            }
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
             *remaining == 0
@@ -1047,6 +1062,141 @@ mod tests {
             dma.read32(0x1F80_10E8) & (1 << 24),
             0,
             "CHCR bit 24 clears when the transfer completes"
+        );
+    }
+
+    #[test]
+    fn dma2_burst_copies_ram_to_gp0() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        poke(&mut ram, 0x1000, 0xE1 << 24 | 0x3);
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        gpu.gp1(0x04 << 24 | 2);
+        dma.write32(
+            0x1F80_10A0,
+            0x1000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A4,
+            1,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x1100_0001,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        assert_eq!(
+            dma.read32(0x1F80_10A8) & (1 << 28),
+            0,
+            "CHCR bit 28 clears when DMA2 burst begins"
+        );
+        for _ in 0..64 {
+            gpu.tick(1, 0, false);
+            dma.tick(1, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        }
+        assert_eq!(
+            dma.read32(0x1F80_10A8) & (1 << 24),
+            0,
+            "CHCR bit 24 clears when DMA2 burst completes"
+        );
+        assert_eq!(
+            gpu.stat() & 0xF,
+            3,
+            "DMA2 sync mode 0 must copy RAM→GP0 (E1 texpage X)"
+        );
+    }
+
+    #[test]
+    fn dma2_from_gpu_copies_gpuread_to_ram() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x1234 | (0x5678 << 16));
+        gpu.tick(16, 0, false);
+        gpu.gp0(0xC0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.tick(16, 0, false);
+        gpu.gp1(0x04 << 24 | 3);
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A0,
+            0x2000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A4,
+            1,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x1100_0000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.tick(64, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        gpu.tick(16, 0, false);
+        assert_eq!(
+            dma.read32(0x1F80_10A8) & (1 << 24),
+            0,
+            "CHCR bit 24 clears when GPU→RAM DMA completes"
+        );
+        assert_eq!(
+            peek(&ram, 0x2000) & 0xFFFF,
+            0x1234,
+            "DMA2 from GPU (GP1(04h)=3) copies GPUREAD→RAM"
         );
     }
 }

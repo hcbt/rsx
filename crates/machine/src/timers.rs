@@ -73,7 +73,8 @@ impl Timers {
             if self.value[i] == 0 {
                 self.mode[i] |= 1 << 12;
                 if self.mode[i] & (1 << 5) != 0 {
-                    irq.raise(irq::IRQ_TMR0 + i as u8);
+                    irq.set_level(irq::IRQ_TMR0 + i as u8, true);
+                    irq.set_level(irq::IRQ_TMR0 + i as u8, false);
                 }
             }
             // SPX: bit 4 IRQs when the counter equals target, whether or not
@@ -81,7 +82,8 @@ impl Timers {
             if self.value[i] == self.target[i] {
                 self.mode[i] |= 1 << 11;
                 if self.mode[i] & (1 << 4) != 0 {
-                    irq.raise(irq::IRQ_TMR0 + i as u8);
+                    irq.set_level(irq::IRQ_TMR0 + i as u8, true);
+                    irq.set_level(irq::IRQ_TMR0 + i as u8, false);
                 }
                 if self.mode[i] & 8 != 0 {
                     self.value[i] = 0;
@@ -161,6 +163,23 @@ mod tests {
             t2_pending(&irq),
             "Timer 2 must IRQ when a large tick crosses the target (val={:04X})",
             t.value(2)
+        );
+    }
+
+    #[test]
+    fn timer_i_stat_is_edge_not_re_raised_every_tick() {
+        let mut t = Timers::new();
+        let mut irq = Irq::new();
+        t.write16(T2_TGT, 0x1000);
+        t.write16(T2_MODE, (1 << 4) | (2 << 8));
+        t.tick(0x1000 * 8, &mut irq);
+        assert!(t2_pending(&irq), "first target sets I_STAT.TMR2");
+        irq.write16(0x1F80_1070, !(1 << 6));
+        assert!(!t2_pending(&irq), "I_STAT.TMR2 acked");
+        t.tick(8, &mut irq);
+        assert!(
+            !t2_pending(&irq),
+            "timer I_STAT must not re-raise every tick while the IRQ line stays high"
         );
     }
 }

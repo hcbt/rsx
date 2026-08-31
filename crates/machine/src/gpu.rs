@@ -37,6 +37,7 @@ pub struct Gpu {
     display_vres: u32,
     display_enabled: bool,
     dma_dir: u8,
+    interlace: bool,
     transfer: Option<Transfer>,
     pub gp0_count: u64,
     pub gp1_count: u64,
@@ -124,10 +125,11 @@ impl Gpu {
             tex_win_off_y: 0,
             display_x: 0,
             display_y: 0,
-            display_hres: 320,
+            display_hres: 256,
             display_vres: 240,
             display_enabled: false,
             dma_dir: 0,
+            interlace: false,
             transfer: None,
             gp0_count: 0,
             gp1_count: 0,
@@ -211,7 +213,7 @@ impl Gpu {
     }
 
     fn update_stat(&mut self) {
-        let mut s = 0x1C00_0000; // ready bits 26,27,28
+        let mut s = 0x1400_0000; // ready bits 26 and 28; bit 27 only for VRAM-to-CPU
         let need_params = self.gp0_cmd.is_some();
         let drawing = self.draw_busy > 0;
         if let Some(t) = self.transfer.as_ref() {
@@ -250,7 +252,9 @@ impl Gpu {
         if self.mask_check {
             s |= 1 << 12;
         }
-        s |= 1 << 13;
+        if !self.interlace || self.odd_frame {
+            s |= 1 << 13;
+        }
         if !self.in_vblank {
             if self.display_vres >= 480 {
                 if self.odd_frame {
@@ -421,7 +425,7 @@ impl Gpu {
             0x40..=0x5F => self.line(),
             0x60..=0x7F => self.rectangle(),
             0x80 => self.vram_copy(),
-            0xA0 => {
+            0xA0 | 0xC0 => {
                 let xy = self.gp0_buf[1];
                 let wh = self.gp0_buf[2];
                 let x = xy & 0x3FF;
@@ -435,7 +439,7 @@ impl Gpu {
                     w,
                     h,
                     remaining: words,
-                    to_vram: true,
+                    to_vram: cmd == 0xA0,
                     cur_x: x,
                     cur_y: y,
                 });
@@ -523,6 +527,7 @@ impl Gpu {
                     };
                 }
                 self.display_vres = if p & 4 != 0 { 480 } else { 240 };
+                self.interlace = p & (1 << 5) != 0;
                 self.update_stat();
             }
             0x10 => {
@@ -540,7 +545,40 @@ impl Gpu {
     }
 
     pub fn read_gpuread(&mut self) -> u32 {
-        self.gpuread
+        if self.transfer.as_ref().is_some_and(|t| !t.to_vram) {
+            let (mut x, mut y, w, base_x) = {
+                let t = self.transfer.as_ref().unwrap();
+                (t.cur_x, t.cur_y, t.w, t.x)
+            };
+            let lo = self.read_half(x, y);
+            x += 1;
+            if x >= base_x + w {
+                x = base_x;
+                y += 1;
+            }
+            let hi = self.read_half(x, y);
+            x += 1;
+            if x >= base_x + w {
+                x = base_x;
+                y += 1;
+            }
+            if let Some(t) = self.transfer.as_mut() {
+                t.cur_x = x;
+                t.cur_y = y;
+                t.remaining = t.remaining.saturating_sub(1);
+                if t.remaining == 0 {
+                    self.transfer = None;
+                }
+            }
+            self.update_stat();
+            u32::from(lo) | (u32::from(hi) << 16)
+        } else {
+            self.gpuread
+        }
+    }
+
+    pub fn dma_read(&mut self) -> u32 {
+        self.read_gpuread()
     }
 
     fn fill(&mut self) {
@@ -1991,6 +2029,37 @@ mod tests {
         assert_eq!(gpu.stat() >> 31, 0, "480-line vblank: GPUSTAT.31=0");
         gpu.tick(1, 0, false);
         assert_eq!(gpu.stat() >> 31, 1, "480-line next field: GPUSTAT.31=1");
+    }
+
+    #[test]
+    fn gp1_00h_reset_gpustat_is_14802000h() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x08 << 24 | 7);
+        gpu.gp1(0x04 << 24 | 2);
+        gpu.gp1(0);
+        assert_eq!(
+            gpu.stat(),
+            0x1480_2000,
+            "GP1(00h) must restore GPUSTAT 14802000h (got {:08X})",
+            gpu.stat()
+        );
+    }
+
+    #[test]
+    fn gpustat_bit13_is_one_when_vertical_interlace_is_off() {
+        let mut gpu = Gpu::new();
+        assert_ne!(
+            gpu.stat() & (1 << 13),
+            0,
+            "GPUSTAT.13 is 1 when GP1(08h) interlace is off"
+        );
+        gpu.gp1(0x08 << 24 | (1 << 5) | 4);
+        gpu.tick(1, 0, false);
+        assert_eq!(
+            gpu.stat() & (1 << 13),
+            0,
+            "GPUSTAT.13 follows the interlace field when GP1(08h).5 is on"
+        );
     }
 }
 
