@@ -796,6 +796,16 @@ mod tests {
         ack_irq(cd, irq);
     }
 
+    fn drain_data(cd: &mut Cdrom, irq: &mut Irq) {
+        loop {
+            cd.write8(0, 0, irq);
+            if cd.read8(0) & (1 << 6) == 0 {
+                break;
+            }
+            let _ = cd.read8(2);
+        }
+    }
+
     #[test]
     fn command_written_while_hintsts_sits_until_ack() {
         let mut cd = Cdrom::new();
@@ -866,14 +876,30 @@ mod tests {
         pump(&mut cd, &mut irq, 0xC4E1);
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
-        assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1, "first INT1");
+        drain_data(&mut cd, &mut irq);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            1,
+            "draining the data FIFO must not ack INT1"
+        );
         pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            1,
+            "second INT1 is queued behind the unacked first"
+        );
         send(&mut cd, &mut irq, 0x09, &[]);
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 0xC4E1);
         assert_eq!(hintsts(&mut cd, &mut irq), 3, "Pause INT3");
         ack_irq(&mut cd, &mut irq);
-        pump(&mut cd, &mut irq, 0x00D3_8ACA);
+        assert_ne!(
+            hintsts(&mut cd, &mut irq),
+            1,
+            "Pause must drop the queued INT1, not deliver it on INT3 ack"
+        );
+        pump(&mut cd, &mut irq, 0x0021_181C);
         let kind = hintsts(&mut cd, &mut irq);
         assert_ne!(kind, 1, "Pause must drop queued INT1 (got INT{kind})");
         assert_eq!(kind, 2, "Pause INT2");
