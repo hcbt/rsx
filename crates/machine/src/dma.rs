@@ -46,6 +46,7 @@ pub struct Dma {
     pub last_list_start: u32,
     pub last_list_start_n: u32,
     pub last_empty_before: u32,
+    list_seen: Vec<u32>,
     mdec_in: VecDeque<u32>,
     mdec_out: VecDeque<u32>,
     exp: Vec<u8>,
@@ -76,6 +77,7 @@ impl Dma {
             last_list_start: 0,
             last_list_start_n: 0,
             last_empty_before: 0,
+            list_seen: Vec::new(),
             mdec_in: VecDeque::new(),
             mdec_out: VecDeque::new(),
             exp: vec![0; 0x1_0000],
@@ -335,6 +337,7 @@ impl Dma {
             self.list_max = 0;
             self.list_empty_before = 0;
             self.list_seen_pkt = false;
+            self.list_seen.clear();
             self.last_list_start = addr;
             self.last_list_start_n = read32(ram, addr) >> 24;
             Some(Job::List {
@@ -419,11 +422,16 @@ impl Dma {
         let pkt_left = *pkt_left;
         let nodes = *nodes;
         if pkt_left == 0 {
-            if addr == 0x00FF_FFFF || addr > 0x1F_FFFF || nodes >= 1_000_000 {
+            if addr == 0x00FF_FFFF
+                || addr > 0x1F_FFFF
+                || nodes >= 1_000_000
+                || self.list_seen.contains(&addr)
+            {
                 self.finish_list_stats();
                 self.jobs[2] = None;
                 return;
             }
+            self.list_seen.push(addr);
             self.list_min = self.list_min.min(addr);
             self.list_max = self.list_max.max(addr);
             let header = read32(ram, addr);
@@ -848,6 +856,59 @@ mod tests {
             blue > 8 && red == 0,
             "far then near: overlap must be the near (blue) primitive (blue={blue} red={red} pix={:04X?})",
             overlap.pixels
+        );
+    }
+
+    #[test]
+    fn gpu_linked_list_that_repeats_a_node_clears_chcr() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        gpu.gp0(0xE3 << 24);
+        gpu.gp0(0xE4 << 24 | 1023 | (511 << 10));
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        // A → B → A. A repeating node ends the chain (DrawSync waits on CHCR.24).
+        poke(&mut ram, 0x2000, (1 << 24) | 0x2010);
+        poke(&mut ram, 0x2004, 0xE1 << 24);
+        poke(&mut ram, 0x2010, (1 << 24) | 0x2000);
+        poke(&mut ram, 0x2014, 0xE1 << 24);
+        dma.write32(
+            0x1F80_10A0,
+            0x2000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x0100_0401,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        for _ in 0..256 {
+            gpu.tick(1, 0, false);
+            dma.tick(1, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        }
+        assert_eq!(
+            dma.chcr(2) & (1 << 24),
+            0,
+            "a repeating GPU DMA node must clear CHCR.24 so DrawSync can return"
         );
     }
 
