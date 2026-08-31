@@ -289,6 +289,8 @@ impl Bus {
         }
         self.timers.tick(n, &mut self.irq);
         self.cdrom.tick(n, &mut self.irq);
+        let (cl, cr) = self.cdrom.take_analog();
+        self.spu.feed_cd(cl, cr);
         self.spu.tick(n);
         if self.spu.take_irq() {
             self.irq.raise(crate::irq::IRQ_SPU);
@@ -499,8 +501,14 @@ impl Bus {
                 self.joy.write16(p, value as u16);
                 self.joy.write16(p + 2, (value >> 16) as u16);
             }
-            0x1F80_1810 => self.gpu.gp0(value),
-            0x1F80_1814 => self.gpu.gp1(value),
+            0x1F80_1810 => {
+                self.gpu.gp0(value);
+                self.irq.set_level(crate::irq::IRQ_GPU, self.gpu.irq_line());
+            }
+            0x1F80_1814 => {
+                self.gpu.gp1(value);
+                self.irq.set_level(crate::irq::IRQ_GPU, self.gpu.irq_line());
+            }
             0x1F80_1C00..=0x1F80_1FFF => {
                 self.spu.write16(p, value as u16);
                 self.spu.write16(p + 2, (value >> 16) as u16);

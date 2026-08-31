@@ -73,6 +73,10 @@ pub struct Spu {
     main_sweep: [i32; 2],
     main_sweep_ctr: [u32; 2],
     irq_pending: bool,
+    cd_in: (i16, i16),
+    ext_in: (i16, i16),
+    reverb_addr: u32,
+    capture_i: usize,
 }
 
 impl Spu {
@@ -91,6 +95,10 @@ impl Spu {
             main_sweep: [0; 2],
             main_sweep_ctr: [0; 2],
             irq_pending: false,
+            cd_in: (0, 0),
+            ext_in: (0, 0),
+            reverb_addr: 0,
+            capture_i: 0,
         }
     }
 
@@ -123,6 +131,11 @@ impl Spu {
 
     pub fn take_samples(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.samples)
+    }
+
+    pub fn ram16(&self, addr: u32) -> u16 {
+        let a = (addr as usize) & (SPU_RAM - 1) & !1;
+        u16::from_le_bytes([self.ram[a], self.ram[a + 1]])
     }
 
     pub fn take_irq(&mut self) -> bool {
@@ -258,20 +271,68 @@ impl Spu {
         }
     }
 
+    pub fn feed_cd(&mut self, l: i16, r: i16) {
+        self.cd_in = (l, r);
+    }
+
+    pub fn feed_ext(&mut self, l: i16, r: i16) {
+        self.ext_in = (l, r);
+    }
+
     fn mix_sample(&mut self) {
         let cnt = self.spucnt();
         let enabled = cnt & (1 << 15) != 0;
         let mute = cnt & (1 << 14) == 0;
         let mut left = 0i32;
         let mut right = 0i32;
+        let mut rev_l = 0i32;
+        let mut rev_r = 0i32;
+        let mut v1 = 0i16;
+        let mut v3 = 0i16;
         if enabled {
+            let rev_voices = u32::from(self.regs[0xCC]) | (u32::from(self.regs[0xCD]) << 16);
             for i in 0..VOICES {
                 let s = self.voice_sample(i);
+                if i == 1 {
+                    v1 = s.clamp(-0x8000, 0x7FFF) as i16;
+                }
+                if i == 3 {
+                    v3 = s.clamp(-0x8000, 0x7FFF) as i16;
+                }
                 let vol_l = self.volume(self.regs[i * 8], Some(i));
                 let vol_r = self.volume(self.regs[i * 8 + 1], Some(i));
-                left += (s * vol_l) >> 15;
-                right += (s * vol_r) >> 15;
+                let vl = (s * vol_l) >> 15;
+                let vr = (s * vol_r) >> 15;
+                left += vl;
+                right += vr;
+                if rev_voices & (1 << i) != 0 {
+                    rev_l += vl;
+                    rev_r += vr;
+                }
             }
+            if cnt & 1 != 0 {
+                let cl = i32::from(self.cd_in.0) * i32::from(self.regs[0xD8] as i16);
+                let cr = i32::from(self.cd_in.1) * i32::from(self.regs[0xD9] as i16);
+                left += cl >> 15;
+                right += cr >> 15;
+                if cnt & 4 != 0 {
+                    rev_l += cl >> 15;
+                    rev_r += cr >> 15;
+                }
+            }
+            if cnt & 2 != 0 {
+                let el = i32::from(self.ext_in.0) * i32::from(self.regs[0xDA] as i16);
+                let er = i32::from(self.ext_in.1) * i32::from(self.regs[0xDB] as i16);
+                left += el >> 15;
+                right += er >> 15;
+                if cnt & 8 != 0 {
+                    rev_l += el >> 15;
+                    rev_r += er >> 15;
+                }
+            }
+            let (rl, rr) = self.reverb_mix(rev_l, rev_r, cnt & (1 << 7) != 0);
+            left += rl;
+            right += rr;
         }
         if mute || !enabled {
             left = 0;
@@ -280,8 +341,118 @@ impl Spu {
             left = (left * self.volume(self.regs[0xC0], None)) >> 15;
             right = (right * self.volume(self.regs[0xC1], None)) >> 15;
         }
-        self.samples.push(left.clamp(-0x8000, 0x7FFF) as i16);
-        self.samples.push(right.clamp(-0x8000, 0x7FFF) as i16);
+        let ol = left.clamp(-0x8000, 0x7FFF) as i16;
+        let or = right.clamp(-0x8000, 0x7FFF) as i16;
+        self.samples.push(ol);
+        self.samples.push(or);
+        let ci = self.capture_i;
+        let off = |base: usize| (base + (ci * 2) % 0x400) & (SPU_RAM - 1);
+        self.ram[off(0x000)..off(0x000) + 2].copy_from_slice(&self.cd_in.0.to_le_bytes());
+        self.ram[off(0x400)..off(0x400) + 2].copy_from_slice(&self.cd_in.1.to_le_bytes());
+        self.ram[off(0x800)..off(0x800) + 2].copy_from_slice(&v1.to_le_bytes());
+        self.ram[off(0xC00)..off(0xC00) + 2].copy_from_slice(&v3.to_le_bytes());
+        self.capture_i = (self.capture_i + 1) % 0x200;
+    }
+
+    fn ram_i16(&self, addr: u32) -> i32 {
+        i32::from(self.ram16(addr) as i16)
+    }
+
+    fn poke_i16(&mut self, addr: u32, v: i32) {
+        let a = (addr as usize) & (SPU_RAM - 1) & !1;
+        let s = v.clamp(-0x8000, 0x7FFF) as i16;
+        self.ram[a..a + 2].copy_from_slice(&s.to_le_bytes());
+    }
+
+    fn rev_rel(&self, reg: u16) -> u32 {
+        let base = u32::from(self.regs[0xD1]) << 3;
+        let area = 0x8_0000u32.saturating_sub(base).max(8);
+        let off = (u32::from(reg) << 3).wrapping_add(self.reverb_addr);
+        (base.wrapping_add(off % area)) & (SPU_RAM as u32 - 1) & !1
+    }
+
+    fn reverb_mix(&mut self, input_l: i32, input_r: i32, write: bool) -> (i32, i32) {
+        let mul = |a: i32, b: i32| (a * b) >> 15;
+        let viir = i32::from(self.regs[0xE2] as i16);
+        let vwall = i32::from(self.regs[0xE7] as i16);
+        let vlin = i32::from(self.regs[0xFE] as i16);
+        let vrin = i32::from(self.regs[0xFF] as i16);
+        let vcomb1 = i32::from(self.regs[0xE3] as i16);
+        let vcomb2 = i32::from(self.regs[0xE4] as i16);
+        let vcomb3 = i32::from(self.regs[0xE5] as i16);
+        let vcomb4 = i32::from(self.regs[0xE6] as i16);
+        let vapf1 = i32::from(self.regs[0xE8] as i16);
+        let vapf2 = i32::from(self.regs[0xE9] as i16);
+        let vlout = i32::from(self.regs[0xC2] as i16);
+        let vrout = i32::from(self.regs[0xC3] as i16);
+        let mlsame_a = self.regs[0xEA];
+        let mrsame_a = self.regs[0xEB];
+        let dlsame = self.regs[0xF0];
+        let drsame = self.regs[0xF1];
+        let mldiff_a = self.regs[0xF2];
+        let mrdiff_a = self.regs[0xF3];
+        let dldiff = self.regs[0xF8];
+        let drdiff = self.regs[0xF9];
+        let mlc1 = self.regs[0xEC];
+        let mrc1 = self.regs[0xED];
+        let mlc2 = self.regs[0xEE];
+        let mrc2 = self.regs[0xEF];
+        let mlc3 = self.regs[0xF4];
+        let mrc3 = self.regs[0xF5];
+        let mlc4 = self.regs[0xF6];
+        let mrc4 = self.regs[0xF7];
+        let mlapf1 = self.regs[0xFA];
+        let mrapf1 = self.regs[0xFB];
+        let mlapf2 = self.regs[0xFC];
+        let mrapf2 = self.regs[0xFD];
+        let dapf1 = self.regs[0xE0];
+        let dapf2 = self.regs[0xE1];
+        let lin = mul(vlin, input_l);
+        let rin = mul(vrin, input_r);
+        let reflect = |this: &Spu, input: i32, m: u16, d: u16| -> i32 {
+            let dst = this.rev_rel(m);
+            let src = this.rev_rel(d);
+            let prev = this.ram_i16(dst.wrapping_sub(2));
+            mul(input + mul(this.ram_i16(src), vwall) - prev, viir) + prev
+        };
+        let mlsame = reflect(self, lin, mlsame_a, dlsame);
+        let mrsame = reflect(self, rin, mrsame_a, drsame);
+        let mldiff = reflect(self, lin, mldiff_a, drdiff);
+        let mrdiff = reflect(self, rin, mrdiff_a, dldiff);
+        if write {
+            self.poke_i16(self.rev_rel(mlsame_a), mlsame);
+            self.poke_i16(self.rev_rel(mrsame_a), mrsame);
+            self.poke_i16(self.rev_rel(mldiff_a), mldiff);
+            self.poke_i16(self.rev_rel(mrdiff_a), mrdiff);
+        }
+        let mut lout = mul(vcomb1, self.ram_i16(self.rev_rel(mlc1)))
+            + mul(vcomb2, self.ram_i16(self.rev_rel(mlc2)))
+            + mul(vcomb3, self.ram_i16(self.rev_rel(mlc3)))
+            + mul(vcomb4, self.ram_i16(self.rev_rel(mlc4)));
+        let mut rout = mul(vcomb1, self.ram_i16(self.rev_rel(mrc1)))
+            + mul(vcomb2, self.ram_i16(self.rev_rel(mrc2)))
+            + mul(vcomb3, self.ram_i16(self.rev_rel(mrc3)))
+            + mul(vcomb4, self.ram_i16(self.rev_rel(mrc4)));
+        let apf = |this: &mut Spu, mut out: i32, m: u16, d: u16, vapf: i32| -> i32 {
+            let dst = this.rev_rel(m);
+            let src = this.rev_rel(m.wrapping_sub(d));
+            let delayed = this.ram_i16(src);
+            out -= mul(vapf, delayed);
+            if write {
+                this.poke_i16(dst, out);
+            }
+            mul(out, vapf) + delayed
+        };
+        lout = apf(self, lout, mlapf1, dapf1, vapf1);
+        rout = apf(self, rout, mrapf1, dapf1, vapf1);
+        lout = apf(self, lout, mlapf2, dapf2, vapf2);
+        rout = apf(self, rout, mrapf2, dapf2, vapf2);
+        let base = u32::from(self.regs[0xD1]) << 3;
+        self.reverb_addr = self.reverb_addr.wrapping_add(2);
+        if self.reverb_addr < base || self.reverb_addr > 0x7FFFE {
+            self.reverb_addr = base;
+        }
+        (mul(lout, vlout), mul(rout, vrout))
     }
 
     fn voice_sample(&mut self, i: usize) -> i32 {
@@ -639,5 +810,120 @@ mod tests {
                 + i32::from(GAUSS[i]);
             assert!((sum - 0x7F80).abs() <= 2, "gauss taps at {i} sum {sum:#X}");
         }
+    }
+
+    #[test]
+    fn cd_and_ext_input_mix_when_spucnt_bits_set() {
+        let mut s = Spu::new();
+        s.regs[0xD5] = 0xC000;
+        s.regs[0xC0] = 0x3FFF;
+        s.regs[0xC1] = 0x3FFF;
+        s.regs[0xD8] = 0x3FFF;
+        s.regs[0xD9] = 0x3FFF;
+        s.feed_cd(0x4000, -0x4000);
+        s.tick(CYCLES_PER_SAMPLE);
+        assert!(
+            s.take_samples().iter().all(|&x| x == 0),
+            "CD input is silent while SPUCNT.0 is off"
+        );
+        s.regs[0xD5] = 0xC001;
+        s.feed_cd(0x4000, -0x4000);
+        s.tick(CYCLES_PER_SAMPLE);
+        let pcm = s.take_samples();
+        assert!(pcm[0] > 1000, "SPUCNT.0 mixes CD left ({})", pcm[0]);
+        assert!(pcm[1] < -1000, "SPUCNT.0 mixes CD right ({})", pcm[1]);
+        s.regs[0xD5] = 0xC002;
+        s.regs[0xDA] = 0x3FFF;
+        s.regs[0xDB] = 0x3FFF;
+        s.feed_ext(-0x2000, 0x2000);
+        s.tick(CYCLES_PER_SAMPLE);
+        let pcm = s.take_samples();
+        assert!(pcm[0] < -500, "SPUCNT.1 mixes external left");
+        assert!(pcm[1] > 500, "SPUCNT.1 mixes external right");
+    }
+
+    #[test]
+    fn reverb_work_area_mix_irq_address_and_capture() {
+        let mut s = Spu::new();
+        s.regs[0xD5] = 0xC080;
+        s.regs[0xC0] = 0x3FFF;
+        s.regs[0xC1] = 0x3FFF;
+        s.regs[0xC2] = 0x3FFF;
+        s.regs[0xC3] = 0x3FFF;
+        s.regs[0xD1] = (0x10000 / 8) as u16;
+        s.regs[0xE2] = 0x4000;
+        s.regs[0xEA] = 0x0020;
+        s.regs[0xEB] = 0x0022;
+        s.regs[0xF2] = 0x0024;
+        s.regs[0xF3] = 0x0026;
+        s.regs[0xFA] = 0x0040;
+        s.regs[0xFB] = 0x0042;
+        s.regs[0xFC] = 0x0060;
+        s.regs[0xFD] = 0x0062;
+        s.regs[0xFE] = 0x3FFF;
+        s.regs[0xFF] = 0x3FFF;
+        s.regs[0] = 0x3FFF;
+        s.regs[1] = 0x3FFF;
+        s.regs[2] = 0x1000;
+        s.regs[3] = 0x1000 / 8;
+        s.regs[4] = 0x80FF;
+        s.regs[5] = 0x1F00;
+        s.regs[0xCC] = 1;
+        s.ram[0x1000..0x1010].copy_from_slice(&tone_block(0, 7));
+        s.key_on(1);
+        s.tick(CYCLES_PER_SAMPLE * 64);
+        let pcm = s.take_samples();
+        let peak = pcm.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
+        assert!(
+            peak > 100,
+            "reverb input voice must be audible (peak={peak})"
+        );
+        let work = (0..0x200).any(|i| s.ram16(0x10000 + i * 2) != 0);
+        assert!(work, "reverb master enable writes the work area");
+
+        let mut s = Spu::new();
+        s.regs[0xD5] = 0xC040;
+        s.regs[0xD2] = 0x1000 / 8;
+        s.ram[0x1000..0x1010].copy_from_slice(&tone_block(0, 7));
+        s.regs[2] = 0x1000;
+        s.regs[3] = 0x1000 / 8;
+        s.regs[4] = 0x80FF;
+        s.key_on(1);
+        s.tick(CYCLES_PER_SAMPLE * 8);
+        assert!(s.take_irq(), "voice read of IRQ address raises IRQ9");
+
+        let mut s = Spu::new();
+        s.regs[0xD5] = 0xC000;
+        s.regs[0xC0] = 0x3FFF;
+        s.regs[0xC1] = 0x3FFF;
+        s.ram[0x2000..0x2010].copy_from_slice(&tone_block(0, 7));
+        s.regs[1 * 8] = 0x3FFF;
+        s.regs[1 * 8 + 1] = 0x3FFF;
+        s.regs[1 * 8 + 2] = 0x1000;
+        s.regs[1 * 8 + 3] = 0x2000 / 8;
+        s.regs[1 * 8 + 4] = 0x80FF;
+        s.ram[0x3000..0x3010].copy_from_slice(&tone_block(0, 6));
+        s.regs[3 * 8] = 0x3FFF;
+        s.regs[3 * 8 + 1] = 0x3FFF;
+        s.regs[3 * 8 + 2] = 0x1000;
+        s.regs[3 * 8 + 3] = 0x3000 / 8;
+        s.regs[3 * 8 + 4] = 0x80FF;
+        s.key_on((1 << 1) | (1 << 3));
+        s.tick(CYCLES_PER_SAMPLE * 8);
+        assert_ne!(s.ram16(0x800), 0, "voice 1 writes capture at 800h");
+        assert_ne!(s.ram16(0xC00), 0, "voice 3 writes capture at C00h");
+        s.regs[0xD5] = 0xC001;
+        s.regs[0xD8] = 0x3FFF;
+        s.regs[0xD9] = 0x3FFF;
+        s.feed_cd(0x1234, -0x2345);
+        s.tick(CYCLES_PER_SAMPLE);
+        assert!(
+            (0..0x200).any(|i| s.ram16(i * 2) == 0x1234),
+            "CD left capture at 000h"
+        );
+        assert!(
+            (0..0x200).any(|i| s.ram16(0x400 + i * 2) == (-0x2345i16) as u16),
+            "CD right capture at 400h"
+        );
     }
 }

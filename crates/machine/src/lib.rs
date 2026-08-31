@@ -31,6 +31,8 @@ pub struct DisplayArea {
     pub height: u32,
     /// RGB555 pixels, row-major.
     pub pixels: Vec<u16>,
+    /// SPX: GP1(08h) bit 4 Display Area Color Depth.
+    pub bpp24: bool,
 }
 
 impl DisplayArea {
@@ -322,6 +324,7 @@ impl Machine {
             width: 512,
             height: 240,
             pixels,
+            bpp24: false,
         }
     }
 
@@ -452,6 +455,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![0x001F],
+            bpp24: false,
         };
         assert_eq!(area.to_rgb888(), vec![0xF8, 0, 0]);
     }

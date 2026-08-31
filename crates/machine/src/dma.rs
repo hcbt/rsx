@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::cdrom::Cdrom;
 use crate::gpu::Gpu;
 use crate::irq::{self, Irq};
@@ -44,6 +46,9 @@ pub struct Dma {
     pub last_list_start: u32,
     pub last_list_start_n: u32,
     pub last_empty_before: u32,
+    mdec_in: VecDeque<u32>,
+    mdec_out: VecDeque<u32>,
+    exp: Vec<u8>,
 }
 
 impl Dma {
@@ -71,6 +76,9 @@ impl Dma {
             last_list_start: 0,
             last_list_start_n: 0,
             last_empty_before: 0,
+            mdec_in: VecDeque::new(),
+            mdec_out: VecDeque::new(),
+            exp: vec![0; 0x1_0000],
         }
     }
 
@@ -266,6 +274,13 @@ impl Dma {
         self.words_done[ch] = 0;
         self.hyper[ch] = false;
         self.jobs[ch] = match ch {
+            0 | 1 | 5 => Some(Job::Block {
+                ch: ch as u8,
+                addr: self.madr[ch] & 0x1F_FFFF,
+                remaining: block_words(self.bcr[ch], 1),
+                dir: (self.chcr[ch] & 1) as u8,
+                step: 4,
+            }),
             2 => self.start_gpu(ram),
             3 => Some(Job::Block {
                 ch: 3,
@@ -369,6 +384,9 @@ impl Dma {
             3 => self.cd_word(ram, cdrom),
             4 => self.spu_word(ram, spu),
             2 => self.gpu_block_word(ram, gpu),
+            0 => self.mdec_in_word(ram),
+            1 => self.mdec_out_word(ram),
+            5 => self.pio_word(ram),
             _ => self.jobs[ch] = None,
         }
         if self.jobs[ch].is_some() {
@@ -505,6 +523,73 @@ impl Dma {
         };
         if done {
             self.jobs[6] = None;
+        }
+    }
+
+    fn mdec_in_word(&mut self, ram: &[u8]) {
+        let done = {
+            let Some(Job::Block {
+                addr, remaining, ..
+            }) = self.jobs[0].as_mut()
+            else {
+                return;
+            };
+            let w = read32(ram, *addr);
+            self.mdec_in.push_back(w);
+            self.mdec_out.push_back(w);
+            *addr = addr.wrapping_add(4) & 0x1F_FFFF;
+            *remaining -= 1;
+            *remaining == 0
+        };
+        if done {
+            self.jobs[0] = None;
+        }
+    }
+
+    fn mdec_out_word(&mut self, ram: &mut [u8]) {
+        let done = {
+            let Some(Job::Block {
+                addr, remaining, ..
+            }) = self.jobs[1].as_mut()
+            else {
+                return;
+            };
+            let w = self.mdec_out.pop_front().unwrap_or(0);
+            write32(ram, *addr, w);
+            *addr = addr.wrapping_add(4) & 0x1F_FFFF;
+            *remaining -= 1;
+            *remaining == 0
+        };
+        if done {
+            self.jobs[1] = None;
+        }
+    }
+
+    fn pio_word(&mut self, ram: &mut [u8]) {
+        let done = {
+            let Some(Job::Block {
+                addr,
+                remaining,
+                dir,
+                ..
+            }) = self.jobs[5].as_mut()
+            else {
+                return;
+            };
+            let e = (*addr as usize) & (self.exp.len() - 1) & !3;
+            if *dir == 1 {
+                let w = read32(ram, *addr);
+                self.exp[e..e + 4].copy_from_slice(&w.to_le_bytes());
+            } else {
+                let w = u32::from_le_bytes(self.exp[e..e + 4].try_into().unwrap());
+                write32(ram, *addr, w);
+            }
+            *addr = addr.wrapping_add(4) & 0x1F_FFFF;
+            *remaining -= 1;
+            *remaining == 0
+        };
+        if done {
+            self.jobs[5] = None;
         }
     }
 
@@ -1197,6 +1282,126 @@ mod tests {
             peek(&ram, 0x2000) & 0xFFFF,
             0x1234,
             "DMA2 from GPU (GP1(04h)=3) copies GPUREAD→RAM"
+        );
+    }
+
+    fn poke_ram(ram: &mut [u8], addr: u32, v: u32) {
+        let a = addr as usize;
+        ram[a..a + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn run_ch(
+        dma: &mut Dma,
+        ch: usize,
+        madr: u32,
+        bcr: u32,
+        chcr: u32,
+        ram: &mut [u8],
+        gpu: &mut Gpu,
+        spu: &mut Spu,
+        cdrom: &mut Cdrom,
+        irq: &mut Irq,
+    ) {
+        dma.write32(0x1F80_10F0, 0xFFFF_FFFF, ram, gpu, spu, cdrom, irq);
+        let base = 0x1F80_1080 + (ch as u32) * 0x10;
+        dma.write32(base, madr, ram, gpu, spu, cdrom, irq);
+        dma.write32(base + 4, bcr, ram, gpu, spu, cdrom, irq);
+        dma.write32(base + 8, chcr, ram, gpu, spu, cdrom, irq);
+        dma.tick(64, ram, gpu, spu, cdrom, irq);
+    }
+
+    #[test]
+    fn dma0_copies_ram_into_mdec_in_fifo_dma1_copies_out() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        poke_ram(&mut ram, 0x1000, 0xAABB_CCDD);
+        poke_ram(&mut ram, 0x1004, 0x1122_3344);
+        run_ch(
+            &mut dma,
+            0,
+            0x1000,
+            2,
+            0x1100_0201,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        assert_eq!(
+            dma.read32(0x1F80_1088) & (1 << 24),
+            0,
+            "DMA0 CHCR bit 24 clears on completion"
+        );
+        assert_eq!(
+            dma.read32(0x1F80_1088) & (1 << 28),
+            0,
+            "DMA0 CHCR bit 28 clears when the transfer begins"
+        );
+        run_ch(
+            &mut dma,
+            1,
+            0x2000,
+            2,
+            0x1100_0200,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        assert_eq!(
+            dma.read32(0x1F80_1098) & (1 << 24),
+            0,
+            "DMA1 CHCR bit 24 clears on completion"
+        );
+        assert_eq!(peek(&ram, 0x2000), 0xAABB_CCDD);
+        assert_eq!(peek(&ram, 0x2004), 0x1122_3344);
+    }
+
+    #[test]
+    fn dma5_copies_to_and_from_expansion_ram() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        poke_ram(&mut ram, 0x3000, 0x5566_7788);
+        run_ch(
+            &mut dma,
+            5,
+            0x3000,
+            1,
+            0x1100_0201,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        assert_eq!(dma.read32(0x1F80_10D8) & (1 << 24), 0);
+        poke_ram(&mut ram, 0x3000, 0);
+        run_ch(
+            &mut dma,
+            5,
+            0x3000,
+            1,
+            0x1100_0200,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        assert_eq!(
+            peek(&ram, 0x3000),
+            0x5566_7788,
+            "DMA5 PIO expansion RAM round-trip"
         );
     }
 }

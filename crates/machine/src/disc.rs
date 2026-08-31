@@ -21,9 +21,18 @@ impl std::fmt::Display for DiscError {
 
 impl std::error::Error for DiscError {}
 
+#[derive(Clone, Copy, Debug)]
+pub struct Track {
+    pub number: u8,
+    pub start_lba: u32,
+    pub audio: bool,
+}
+
 pub struct Disc {
     data: Vec<u8>,
     pub region: [u8; 4],
+    pub tracks: Vec<Track>,
+    pub licensed: bool,
 }
 
 impl Disc {
@@ -52,7 +61,80 @@ pub fn load_disc(path: &Path) -> Result<Disc, DiscError> {
         return Err(DiscError::Cue("image is shorter than one sector".into()));
     }
     let region = region_from_license(&data);
-    Ok(Disc { data, region })
+    let licensed = probe_licensed(&data);
+    let tracks = if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+    {
+        tracks_from_cue(path)?
+    } else {
+        vec![Track {
+            number: 1,
+            start_lba: 0,
+            audio: false,
+        }]
+    };
+    Ok(Disc {
+        data,
+        region,
+        tracks,
+        licensed,
+    })
+}
+
+fn probe_licensed(data: &[u8]) -> bool {
+    let probe = if data.len() >= SECTOR_LEN * 5 {
+        &data[SECTOR_LEN * 4..SECTOR_LEN * 5]
+    } else {
+        data
+    };
+    String::from_utf8_lossy(probe).contains("Licensed")
+}
+
+fn tracks_from_cue(cue_path: &Path) -> Result<Vec<Track>, DiscError> {
+    let text = fs::read_to_string(cue_path).map_err(DiscError::Io)?;
+    let mut tracks = Vec::new();
+    let mut cur: Option<Track> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("TRACK ") {
+            if let Some(t) = cur.take() {
+                tracks.push(t);
+            }
+            let mut sp = rest.split_whitespace();
+            let num: u8 = sp.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let kind = sp.next().unwrap_or("");
+            cur = Some(Track {
+                number: num,
+                start_lba: 0,
+                audio: kind.eq_ignore_ascii_case("AUDIO"),
+            });
+        } else if let Some(rest) = line.strip_prefix("INDEX 01 ") {
+            if let Some(t) = cur.as_mut() {
+                t.start_lba = msf_index_to_lba(rest.trim());
+            }
+        }
+    }
+    if let Some(t) = cur {
+        tracks.push(t);
+    }
+    if tracks.is_empty() {
+        tracks.push(Track {
+            number: 1,
+            start_lba: 0,
+            audio: false,
+        });
+    }
+    Ok(tracks)
+}
+
+fn msf_index_to_lba(msf: &str) -> u32 {
+    let p: Vec<u32> = msf.split(':').filter_map(|s| s.parse().ok()).collect();
+    if p.len() != 3 {
+        return 0;
+    }
+    p[0] * 75 * 60 + p[1] * 75 + p[2]
 }
 
 fn bin_path_from_cue(cue_path: &Path) -> Result<PathBuf, DiscError> {
@@ -63,13 +145,16 @@ fn bin_path_from_cue(cue_path: &Path) -> Result<PathBuf, DiscError> {
         let line = raw.trim();
         if let Some(rest) = line.strip_prefix("FILE ") {
             file = Some(parse_cue_file(rest)?);
-        } else if line.contains("MODE2/2352") || line.contains("MODE1/2352") {
+        } else if line.contains("MODE2/2352")
+            || line.contains("MODE1/2352")
+            || line.contains("AUDIO")
+        {
             mode_ok = true;
         }
     }
     if !mode_ok {
         return Err(DiscError::Cue(
-            "need a MODE2/2352 or MODE1/2352 track".into(),
+            "need a MODE2/2352, MODE1/2352, or AUDIO track".into(),
         ));
     }
     let name = file.ok_or_else(|| DiscError::Cue("no FILE".into()))?;

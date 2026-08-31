@@ -60,11 +60,31 @@ pub struct Cdrom {
     filter_file: u8,
     filter_channel: u8,
     want_data: bool,
+    playing: bool,
+    muted: bool,
+    smen: bool,
+    shell_open: bool,
+    scex_unlocked: bool,
+    secret_step: u8,
+    vol: [u8; 4],
+    vol_applied: [u8; 4],
+    sound_map: Vec<u8>,
+    sound_map_coding: u8,
+    analog: (i16, i16),
+    session: u8,
+    scex_total: u8,
+    scex_ok: u8,
+    read_s: bool,
+    retries: u8,
+    skip: i32,
+    play_ready: bool,
+    play_sectors: u32,
 }
 
 enum PendingWhat {
     Irq { irq: u8, result: Vec<u8> },
     SeekDone { then_read: bool },
+    PlayTick,
 }
 
 struct Pending {
@@ -111,6 +131,25 @@ impl Cdrom {
             filter_file: 0,
             filter_channel: 0,
             want_data: false,
+            playing: false,
+            muted: false,
+            smen: false,
+            shell_open: false,
+            scex_unlocked: false,
+            secret_step: 0,
+            vol: [0x80, 0, 0x80, 0],
+            vol_applied: [0x80, 0, 0x80, 0],
+            sound_map: Vec::new(),
+            sound_map_coding: 0,
+            analog: (0, 0),
+            session: 1,
+            scex_total: 0,
+            scex_ok: 0,
+            read_s: false,
+            retries: 0,
+            skip: 0,
+            play_ready: false,
+            play_sectors: 0,
         }
     }
 
@@ -124,43 +163,94 @@ impl Cdrom {
         self.disc = Some(disc);
     }
 
-    pub fn tick(&mut self, cycles: u32, irq: &mut Irq) {
-        if let Some((delay, _, _)) = self.cmd_delay.as_mut() {
-            *delay = delay.saturating_sub(cycles);
-        }
-        if let Some(p) = self.pending.as_mut() {
-            p.cycles = p.cycles.saturating_sub(cycles);
-        }
-        if self.cmd_delay.as_ref().is_some_and(|(d, _, _)| *d == 0) {
-            let (_, irqn, result) = self.cmd_delay.take().unwrap();
-            self.push_or_deliver(irqn, result, irq);
-        }
-        if self.pending.as_ref().is_some_and(|p| p.cycles == 0) {
-            let p = self.pending.take().unwrap();
-            self.finish_pending(p.what, irq);
-            if let Some((delay, what)) = p.second {
-                self.pending = Some(Pending {
-                    cycles: delay,
-                    what,
-                    second: None,
-                });
+    pub fn tick(&mut self, mut cycles: u32, irq: &mut Irq) {
+        while cycles > 0 {
+            let next = self
+                .cmd_delay
+                .as_ref()
+                .map(|(d, _, _)| *d)
+                .into_iter()
+                .chain(self.pending.as_ref().map(|p| p.cycles))
+                .min();
+            let Some(next) = next else {
+                return;
+            };
+            if next == 0 {
+                if self.cmd_delay.as_ref().is_some_and(|(d, _, _)| *d == 0) {
+                    let (_, irqn, result) = self.cmd_delay.take().unwrap();
+                    self.push_or_deliver(irqn, result, irq);
+                }
+                if self.pending.as_ref().is_some_and(|p| p.cycles == 0) {
+                    let p = self.pending.take().unwrap();
+                    self.finish_pending(p.what, irq);
+                    if self.pending.is_none() {
+                        if let Some((delay, what)) = p.second {
+                            self.pending = Some(Pending {
+                                cycles: delay,
+                                what,
+                                second: None,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+            if next > cycles {
+                if let Some((delay, _, _)) = self.cmd_delay.as_mut() {
+                    *delay -= cycles;
+                }
+                if let Some(p) = self.pending.as_mut() {
+                    p.cycles -= cycles;
+                }
+                return;
+            }
+            cycles -= next;
+            if let Some((delay, _, _)) = self.cmd_delay.as_mut() {
+                *delay -= next;
+            }
+            if let Some(p) = self.pending.as_mut() {
+                p.cycles -= next;
+            }
+            if self.cmd_delay.as_ref().is_some_and(|(d, _, _)| *d == 0) {
+                let (_, irqn, result) = self.cmd_delay.take().unwrap();
+                self.push_or_deliver(irqn, result, irq);
+            }
+            if self.pending.as_ref().is_some_and(|p| p.cycles == 0) {
+                let p = self.pending.take().unwrap();
+                self.finish_pending(p.what, irq);
+                if self.pending.is_none() {
+                    if let Some((delay, what)) = p.second {
+                        self.pending = Some(Pending {
+                            cycles: delay,
+                            what,
+                            second: None,
+                        });
+                    }
+                }
             }
         }
     }
 
     fn finish_pending(&mut self, what: PendingWhat, irq: &mut Irq) {
         match what {
-            PendingWhat::Irq { irq: irqn, result } => self.push_or_deliver(irqn, result, irq),
+            PendingWhat::Irq { irq: irqn, result } => {
+                if irqn == 1 && self.reading && !self.playing {
+                    self.try_read_sector(irq);
+                } else {
+                    self.push_or_deliver(irqn, result, irq);
+                }
+            }
             PendingWhat::SeekDone { then_read } => {
                 self.seeking = false;
                 self.capture_header();
                 if then_read {
                     self.reading = true;
-                    self.push_or_deliver(1, vec![self.controller_stat()], irq);
+                    self.try_read_sector(irq);
                 } else {
                     self.push_or_deliver(2, vec![self.controller_stat()], irq);
                 }
             }
+            PendingWhat::PlayTick => self.play_tick(irq),
         }
     }
 
@@ -176,9 +266,13 @@ impl Cdrom {
         self.result = result;
         self.result_i = 0;
         self.irq_flag = (self.irq_flag & !7) | (irqn & 7);
+        if self.smen && irqn == 3 {
+            self.irq_flag |= 0x10;
+            self.smen = false;
+        }
         self.status |= 1 << 5; // result ready
         self.status &= !(1 << 7); // not busy
-        if irqn == 1 {
+        if irqn == 1 && !self.playing {
             self.capture_data_sector();
             if self.want_data {
                 self.load_data_fifo();
@@ -243,16 +337,32 @@ impl Cdrom {
         match (addr & 3, self.index & 3) {
             (0, _) => self.index = value & 3,
             (1, 0) => self.command(value, irq),
+            (1, 1) => {
+                if self.sound_map.len() < 0x900 {
+                    self.sound_map.push(value);
+                    if self.sound_map.len() == 0x900 {
+                        self.analog = sound_map_peak(&self.sound_map);
+                    }
+                }
+            }
+            (1, 2) => self.sound_map_coding = value,
             (2, 0) => {
                 if self.param.len() < 16 {
                     self.param.push(value);
                 }
             }
+            (2, 2) => self.vol[0] = value,
+            (3, 2) => self.vol[1] = value,
+            (1, 3) => self.vol[2] = value,
+            (2, 3) => self.vol[3] = value,
             (2, 1) => {
                 self.irq_enable = value & 0x1F;
                 self.update_irq_line(irq);
             }
             (3, 0) => {
+                if value & 0x20 != 0 {
+                    self.smen = true;
+                }
                 self.want_data = value & 0x80 != 0;
                 if self.want_data {
                     self.load_data_fifo();
@@ -261,6 +371,11 @@ impl Cdrom {
                     self.fifo_i = 0;
                     self.fifo_loaded = false;
                     self.status &= !(1 << 6);
+                }
+            }
+            (3, 3) => {
+                if value & 0x20 != 0 {
+                    self.vol_applied = self.vol;
                 }
             }
             (3, 1) => {
@@ -311,6 +426,18 @@ impl Cdrom {
                 cmd,
                 0x01 | 0x02 | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F | 0x10 | 0x11 | 0x13 | 0x14 | 0x19
             );
+        if cmd == 0x01 && !self.param.is_empty() {
+            self.param.clear();
+            self.pending = Some(Pending {
+                cycles: 0xC4E1,
+                what: PendingWhat::Irq {
+                    irq: 5,
+                    result: vec![self.controller_stat() | 1, 0x20],
+                },
+                second: None,
+            });
+            return;
+        }
         let (first, second) = match cmd {
             0x01 => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
             0x02 => {
@@ -320,16 +447,11 @@ impl Cdrom {
                 self.setloc_pending = true;
                 (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
             }
-            0x03 => {
-                self.motor = true;
-                if self.setloc_pending {
-                    self.setloc_pending = false;
-                    self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
-                    self.last_lba = self.lba;
-                }
-                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
-            }
-            0x06 | 0x1B => self.read_n(),
+            0x03 => self.play(),
+            0x04 => self.forward_back(true),
+            0x05 => self.forward_back(false),
+            0x06 => self.read_n(false),
+            0x1B => self.read_n(true),
             0x07 => {
                 if self.motor {
                     (
@@ -355,6 +477,8 @@ impl Cdrom {
                 self.drop_int1();
                 self.reading = false;
                 self.seeking = false;
+                self.playing = false;
+                self.skip = 0;
                 self.motor = false;
                 let stat = self.controller_stat();
                 (
@@ -372,6 +496,8 @@ impl Cdrom {
                 self.drop_int1();
                 self.reading = false;
                 self.seeking = false;
+                self.playing = false;
+                self.skip = 0;
                 let stat = self.controller_stat();
                 (
                     Some((0xC4E1, 3, vec![stat])),
@@ -404,8 +530,14 @@ impl Cdrom {
                     )),
                 )
             }
-            0x0B => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
-            0x0C => (Some((0xC4E1, 3, vec![self.controller_stat()])), None),
+            0x0B => {
+                self.muted = true;
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
+            0x0C => {
+                self.muted = false;
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
             0x0D => {
                 if self.param.len() >= 2 {
                     self.filter_file = self.param[0];
@@ -435,21 +567,26 @@ impl Cdrom {
             ),
             0x10 => self.getloc_l(),
             0x11 => self.getloc_p(),
+            0x12 => self.set_session(),
             0x13 => self.get_tn(),
             0x14 => self.get_td(),
             0x15 => self.seek_l(),
-            0x19 => {
-                let sub = self.param.first().copied().unwrap_or(0);
-                if sub == 0x20 {
-                    (Some((0xC4E1, 3, vec![0x94, 0x09, 0x19, 0xC0])), None)
-                } else {
-                    (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
-                }
-            }
+            0x16 => self.seek_p(),
+            0x19 => self.test_cmd(),
             0x1A => self.get_id(),
+            0x1C => self.reset_cmd(),
+            0x1D => self.get_q(),
+            0x1E => self.read_toc(),
+            0x1F => {
+                // SCPH-1001: unsupported Video CD; SPX leaves the parameter FIFO.
+                (Some((0xC4E1, 5, vec![0x11, 0x40])), None)
+            }
+            0x50..=0x57 => self.secret(cmd),
             _ => (Some((0xC4E1, 5, vec![0x11, 0x40])), None),
         };
-        self.param.clear();
+        if !matches!(cmd, 0x1F) {
+            self.param.clear();
+        }
         if let Some((cycles, irqn, result)) = first {
             if keep_pending {
                 self.cmd_delay = Some((cycles, irqn, result));
@@ -467,7 +604,9 @@ impl Cdrom {
         self.queue.retain(|(irqn, _)| *irqn != 1);
         if matches!(
             self.pending.as_ref().map(|p| &p.what),
-            Some(PendingWhat::Irq { irq: 1, .. }) | Some(PendingWhat::SeekDone { then_read: true })
+            Some(PendingWhat::Irq { irq: 1, .. })
+                | Some(PendingWhat::SeekDone { then_read: true })
+                | Some(PendingWhat::PlayTick)
         ) {
             self.pending = None;
         } else if let Some(p) = self.pending.as_mut() {
@@ -475,6 +614,7 @@ impl Cdrom {
                 &p.second,
                 Some((_, PendingWhat::Irq { irq: 1, .. }))
                     | Some((_, PendingWhat::SeekDone { then_read: true }))
+                    | Some((_, PendingWhat::PlayTick))
             ) {
                 p.second = None;
             }
@@ -482,9 +622,12 @@ impl Cdrom {
     }
 
     fn get_id(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        if self.shell_open {
+            return (Some((0xC4E1, 5, vec![0x11, 0x80])), None);
+        }
         let stat = self.controller_stat();
         match self.disc.as_ref() {
-            Some(disc) => {
+            Some(disc) if disc.licensed || self.scex_unlocked => {
                 let mut id = vec![stat, 0x00, 0x20, 0x00];
                 id.extend_from_slice(&disc.region);
                 (
@@ -492,6 +635,16 @@ impl Cdrom {
                     Some((0x4A00, PendingWhat::Irq { irq: 2, result: id })),
                 )
             }
+            Some(_) => (
+                Some((0xC4E1, 3, vec![stat])),
+                Some((
+                    0x4A00,
+                    PendingWhat::Irq {
+                        irq: 5,
+                        result: vec![0x0A, 0x80, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00],
+                    },
+                )),
+            ),
             None => (
                 Some((0xC4E1, 3, vec![stat])),
                 Some((
@@ -535,10 +688,34 @@ impl Cdrom {
         if self.motor {
             s |= 0x02;
         }
-        if self.seeking {
+        if self.shell_open {
+            s |= 0x10;
+        }
+        if self.playing && !self.seeking {
+            s |= 0x80;
+        } else if self.seeking {
             s |= 0x40;
         } else if self.reading {
             s |= 0x20;
+        }
+        s
+    }
+
+    pub fn open_shell(&mut self, irq: &mut Irq) {
+        self.shell_open = true;
+        self.playing = false;
+        self.reading = false;
+        self.push_or_deliver(5, vec![self.controller_stat() | 1, 0x80], irq);
+    }
+
+    pub fn close_shell(&mut self) {
+        self.shell_open = false;
+    }
+
+    pub fn take_analog(&mut self) -> (i16, i16) {
+        let s = self.analog;
+        if !self.playing && self.sound_map.len() < 0x900 {
+            self.analog = (0, 0);
         }
         s
     }
@@ -562,36 +739,342 @@ impl Cdrom {
     }
 
     fn get_tn(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let (first, last) = self
+            .disc
+            .as_ref()
+            .and_then(|d| d.tracks.first().zip(d.tracks.last()))
+            .map(|(a, b)| (to_bcd(u32::from(a.number)), to_bcd(u32::from(b.number))))
+            .unwrap_or((0x01, 0x01));
         (
-            Some((0xC4E1, 3, vec![self.controller_stat(), 0x01, 0x01])),
+            Some((0xC4E1, 3, vec![self.controller_stat(), first, last])),
             None,
         )
     }
 
     fn get_td(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
-        let track = self.param.first().copied().unwrap_or(0);
-        if track > 0x01 {
-            (
+        let want = bcd(self.param.first().copied().unwrap_or(0));
+        let Some(disc) = self.disc.as_ref() else {
+            return (
+                Some((0xC4E1, 5, vec![self.controller_stat() | 1, 0x80])),
+                None,
+            );
+        };
+        if want == 0 {
+            let abs = frames_to_msf(disc.sector_count() + 150);
+            return (
+                Some((0xC4E1, 3, vec![self.controller_stat(), abs.0, abs.1])),
+                None,
+            );
+        }
+        match disc.tracks.iter().find(|t| u32::from(t.number) == want) {
+            Some(t) => {
+                let abs = frames_to_msf(t.start_lba + 150);
+                (
+                    Some((0xC4E1, 3, vec![self.controller_stat(), abs.0, abs.1])),
+                    None,
+                )
+            }
+            None => (
                 Some((0xC4E1, 5, vec![self.controller_stat() | 1, 0x10])),
                 None,
-            )
-        } else {
-            let (mm, ss) = if track == 0 {
-                let abs = frames_to_msf(
-                    self.disc
-                        .as_ref()
-                        .map(|d| d.sector_count() + 150)
-                        .unwrap_or(150),
-                );
-                (abs.0, abs.1)
-            } else {
-                (0x00, 0x02)
-            };
-            (
-                Some((0xC4E1, 3, vec![self.controller_stat(), mm, ss])),
-                None,
-            )
+            ),
         }
+    }
+
+    fn play(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        self.motor = true;
+        self.playing = true;
+        self.reading = false;
+        if self.setloc_pending {
+            self.setloc_pending = false;
+            self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
+            self.last_lba = self.lba;
+        }
+        if let Some(&tr) = self.param.first() {
+            if let Some(t) = self
+                .disc
+                .as_ref()
+                .and_then(|d| d.tracks.iter().find(|x| x.number == bcd(tr) as u8))
+            {
+                self.lba = t.start_lba;
+                self.last_lba = self.lba;
+            }
+        }
+        self.play_ready = false;
+        self.skip = 0;
+        self.play_sectors = 0;
+        self.feed_cdda();
+        let stat = self.controller_stat();
+        (
+            Some((0xC4E1, 3, vec![stat])),
+            Some((self.sector_cycles(), PendingWhat::PlayTick)),
+        )
+    }
+
+    fn forward_back(
+        &mut self,
+        fwd: bool,
+    ) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        if !self.playing || !self.play_ready {
+            return (
+                Some((0xC4E1, 5, vec![self.controller_stat() | 1, 0x80])),
+                None,
+            );
+        }
+        let step = 75i32;
+        self.skip = if fwd {
+            self.skip.max(0) + step
+        } else {
+            self.skip.min(0) - step
+        };
+        self.lba = self.lba.saturating_add_signed(self.skip);
+        self.last_lba = self.lba;
+        self.feed_cdda();
+        (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+    }
+
+    fn report_bytes(&self) -> Vec<u8> {
+        let abs = frames_to_msf(self.last_lba + 150);
+        vec![
+            self.controller_stat(),
+            0x01,
+            0x01,
+            abs.0,
+            abs.1,
+            abs.2,
+            0,
+            0,
+        ]
+    }
+
+    fn set_session(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let s = self.param.first().copied().unwrap_or(0);
+        if s == 0 {
+            return (Some((0xC4E1, 5, vec![0x03, 0x10])), None);
+        }
+        if s > 1 {
+            let stat = self.controller_stat();
+            return (
+                Some((0xC4E1, 3, vec![stat])),
+                Some((
+                    SEEK_CYCLES,
+                    PendingWhat::Irq {
+                        irq: 5,
+                        result: vec![0x06, 0x40],
+                    },
+                )),
+            );
+        }
+        self.session = s;
+        let stat = self.controller_stat();
+        (
+            Some((0xC4E1, 3, vec![stat])),
+            Some((
+                SEEK_CYCLES,
+                PendingWhat::Irq {
+                    irq: 2,
+                    result: vec![stat],
+                },
+            )),
+        )
+    }
+
+    fn seek_p(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        self.setloc_pending = false;
+        self.seeking = true;
+        self.reading = false;
+        self.playing = false;
+        self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
+        let stat = self.controller_stat();
+        (
+            Some((0xC4E1, 3, vec![stat])),
+            Some((SEEK_CYCLES, PendingWhat::SeekDone { then_read: false })),
+        )
+    }
+
+    fn reset_cmd(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        self.mode = 0x20;
+        self.reading = false;
+        self.playing = false;
+        self.seeking = false;
+        self.scex_unlocked = false;
+        let stat = self.controller_stat();
+        (Some((0xC4E1, 3, vec![stat])), None)
+    }
+
+    fn get_q(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let stat = self.controller_stat();
+        let point = self.param.get(1).copied().unwrap_or(0x01);
+        let start = self
+            .disc
+            .as_ref()
+            .and_then(|d| {
+                d.tracks
+                    .iter()
+                    .find(|t| to_bcd(u32::from(t.number)) == point)
+            })
+            .map(|t| t.start_lba)
+            .unwrap_or(0);
+        let abs = frames_to_msf(start + 150);
+        let sub = vec![
+            0x41, 0x00, point, 0x00, 0x00, 0x00, 0x00, abs.0, abs.1, abs.2, 0,
+        ];
+        (
+            Some((0xC4E1, 3, vec![stat])),
+            Some((
+                SEEK_CYCLES,
+                PendingWhat::Irq {
+                    irq: 2,
+                    result: sub,
+                },
+            )),
+        )
+    }
+
+    fn read_toc(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let stat = self.controller_stat();
+        (
+            Some((0x13CCE, 3, vec![stat])),
+            Some((
+                0x20_0000,
+                PendingWhat::Irq {
+                    irq: 2,
+                    result: vec![stat],
+                },
+            )),
+        )
+    }
+
+    fn test_cmd(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        match self.param.first().copied().unwrap_or(0) {
+            0x20 => (Some((0xC4E1, 3, vec![0x94, 0x09, 0x19, 0xC0])), None),
+            0x21 => {
+                let mut f = 0u8;
+                if self.shell_open {
+                    f |= 2;
+                }
+                (Some((0xC4E1, 3, vec![f])), None)
+            }
+            0x22 => (Some((0xC4E1, 3, b"for U/C".to_vec())), None),
+            0x23 => (
+                Some((0xC4E1, 3, b"CXD2940Q/CXD1817Q/CXD2545Q/CXD1782BR".to_vec())),
+                None,
+            ),
+            0x24 => (
+                Some((0xC4E1, 3, b"CXD2940Q/CXD1817Q/CXD2545Q/CXD2510Q".to_vec())),
+                None,
+            ),
+            0x25 => (
+                Some((0xC4E1, 3, b"CXD2940Q/CXD1817Q/CXD1815Q/CXD1199BQ".to_vec())),
+                None,
+            ),
+            0x04 => {
+                self.motor = true;
+                self.scex_total = 0;
+                self.scex_ok = 0;
+                if self.disc.as_ref().is_some_and(|d| d.licensed) {
+                    self.scex_total = 1;
+                    self.scex_ok = 1;
+                }
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
+            0x05 => (Some((0xC4E1, 3, vec![self.scex_total, self.scex_ok])), None),
+            0x00 => {
+                self.motor = true;
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
+            0x03 => {
+                self.motor = false;
+                (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
+            }
+            _ => (Some((0xC4E1, 5, vec![0x11, 0x10])), None),
+        }
+    }
+
+    fn secret(&mut self, cmd: u8) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        let expect: &[&[u8]] = &[
+            b"",
+            b"Licensed by",
+            b"Sony",
+            b"Computer",
+            b"Entertainment",
+            b"of America",
+            b"",
+        ];
+        let idx = (cmd - 0x50) as usize;
+        if cmd == 0x57 {
+            self.scex_unlocked = false;
+            self.secret_step = 0;
+        } else if idx < expect.len()
+            && (expect[idx].is_empty() || self.param.starts_with(expect[idx]))
+            && self.secret_step == idx as u8
+        {
+            self.secret_step = idx as u8 + 1;
+            if cmd == 0x56 {
+                self.scex_unlocked = true;
+            }
+        } else {
+            self.scex_unlocked = false;
+            self.secret_step = 0;
+        }
+        (Some((0xC4E1, 5, vec![0x11, 0x40])), None)
+    }
+
+    fn feed_cdda(&mut self) {
+        if self.muted || !self.audio_here() {
+            self.analog = (0, 0);
+            return;
+        }
+        let Some(raw) = self.disc.as_ref().and_then(|d| d.sector(self.lba)) else {
+            self.analog = (0, 0);
+            return;
+        };
+        let l = i16::from_le_bytes([raw[0], raw[1]]);
+        let r = i16::from_le_bytes([raw[2], raw[3]]);
+        self.analog = self.apply_vol(l, r);
+    }
+
+    fn xa_to_spu(&self) -> bool {
+        if self.mode & 0x40 == 0 {
+            return false;
+        }
+        let Some(raw) = self.disc.as_ref().and_then(|d| d.sector(self.lba)) else {
+            return false;
+        };
+        if raw.len() < 24 || raw[15] != 2 {
+            return false;
+        }
+        let sm = raw[18];
+        if sm & 0x44 != 0x44 {
+            return false;
+        }
+        if self.mode & 8 != 0 && (raw[16] != self.filter_file || raw[17] != self.filter_channel) {
+            return false;
+        }
+        true
+    }
+
+    fn feed_xa(&mut self) {
+        if self.muted {
+            self.analog = (0, 0);
+            return;
+        }
+        let Some(raw) = self.disc.as_ref().and_then(|d| d.sector(self.lba)) else {
+            self.analog = (0, 0);
+            return;
+        };
+        let l = i16::from_le_bytes([raw[24], raw[25]]);
+        let r = i16::from_le_bytes([raw[26], raw[27]]);
+        self.analog = self.apply_vol(l, r);
+    }
+
+    fn apply_vol(&self, l: i16, r: i16) -> (i16, i16) {
+        let [ll, lr, rl, rr] = self.vol_applied.map(|v| i32::from(v));
+        let l = i32::from(l);
+        let r = i32::from(r);
+        let ol = ((l * ll + r * rl) >> 7).clamp(-0x8000, 0x7FFF) as i16;
+        let or = ((l * lr + r * rr) >> 7).clamp(-0x8000, 0x7FFF) as i16;
+        (ol, or)
     }
 
     fn getloc_l(&self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
@@ -617,7 +1100,9 @@ impl Cdrom {
         )
     }
 
-    fn read_n(&mut self) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+    fn read_n(&mut self, read_s: bool) -> (Option<(u32, u8, Vec<u8>)>, Option<(u32, PendingWhat)>) {
+        self.read_s = read_s;
+        self.retries = if read_s { 0 } else { 3 };
         if self.disc.is_none() {
             return (
                 Some((0xC4E1, 3, vec![self.controller_stat()])),
@@ -666,6 +1151,94 @@ impl Cdrom {
         } else {
             CYCLES_PER_SECTOR_1X
         }
+    }
+
+    fn sector_bad(&self) -> bool {
+        self.disc
+            .as_ref()
+            .and_then(|d| d.sector(self.lba))
+            .is_some_and(|raw| raw.len() > 15 && raw[15] == 0xFF)
+    }
+
+    fn audio_here(&self) -> bool {
+        self.disc.as_ref().is_some_and(|d| {
+            d.tracks
+                .iter()
+                .rev()
+                .find(|t| t.start_lba <= self.lba)
+                .is_some_and(|t| t.audio)
+        })
+    }
+
+    fn try_read_sector(&mut self, irq: &mut Irq) {
+        if self.xa_to_spu() {
+            self.feed_xa();
+            self.lba = self.lba.saturating_add(1);
+            if self.reading {
+                self.pending = Some(Pending {
+                    cycles: self.sector_cycles(),
+                    what: PendingWhat::Irq {
+                        irq: 1,
+                        result: vec![self.controller_stat()],
+                    },
+                    second: None,
+                });
+            }
+            return;
+        }
+        if self.sector_bad() {
+            if self.read_s || self.retries == 0 {
+                self.reading = false;
+                self.push_or_deliver(5, vec![self.controller_stat() | 1, 0x40], irq);
+            } else {
+                self.retries -= 1;
+                self.pending = Some(Pending {
+                    cycles: self.sector_cycles(),
+                    what: PendingWhat::Irq {
+                        irq: 1,
+                        result: vec![self.controller_stat()],
+                    },
+                    second: None,
+                });
+            }
+            return;
+        }
+        self.push_or_deliver(1, vec![self.controller_stat()], irq);
+    }
+
+    fn play_tick(&mut self, irq: &mut Irq) {
+        self.play_ready = true;
+        let step = if self.skip != 0 { self.skip } else { 1 };
+        let next = self.lba as i64 + i64::from(step);
+        let count = self
+            .disc
+            .as_ref()
+            .map(|d| i64::from(d.sector_count()))
+            .unwrap_or(0);
+        if next >= count {
+            self.playing = false;
+            self.motor = false;
+            self.skip = 0;
+            self.push_or_deliver(4, vec![self.controller_stat()], irq);
+            return;
+        }
+        if next < 0 {
+            self.lba = 0;
+            self.skip = 0;
+        } else {
+            self.lba = next as u32;
+        }
+        self.last_lba = self.lba;
+        self.play_sectors = self.play_sectors.saturating_add(1);
+        self.feed_cdda();
+        if self.mode & 4 != 0 && self.play_sectors % 10 == 0 {
+            self.push_or_deliver(1, self.report_bytes(), irq);
+        }
+        self.pending = Some(Pending {
+            cycles: self.sector_cycles(),
+            what: PendingWhat::PlayTick,
+            second: None,
+        });
     }
 
     fn capture_data_sector(&mut self) {
@@ -785,6 +1358,16 @@ fn frames_to_msf(frames: u32) -> (u8, u8, u8) {
         to_bcd(frames / 75 / 60),
         to_bcd((frames / 75) % 60),
         to_bcd(frames % 75),
+    )
+}
+
+fn sound_map_peak(buf: &[u8]) -> (i16, i16) {
+    if buf.len() < 4 {
+        return (0, 0);
+    }
+    (
+        i16::from_le_bytes([buf[0], buf[1]]),
+        i16::from_le_bytes([buf[2], buf[3]]),
     )
 }
 
@@ -1528,5 +2111,507 @@ mod tests {
             0,
             "clearing BFRD must not keep returning the pad byte"
         );
+    }
+
+    fn cue_two_tracks(dir: &Path) -> std::path::PathBuf {
+        let mut bin = vec![0u8; SECTOR_LEN * 200];
+        let lic = b"          Licensed  by          Sony Computer Entertainment Amer  ica";
+        bin[SECTOR_LEN * 4 + 24..SECTOR_LEN * 4 + 24 + lic.len()].copy_from_slice(lic);
+        for i in 0..588 {
+            let off = SECTOR_LEN * 150 + i * 4;
+            bin[off..off + 2].copy_from_slice(&0x1000u16.to_le_bytes());
+            bin[off + 2..off + 4].copy_from_slice(&0xE000u16.to_le_bytes());
+        }
+        std::fs::write(dir.join("game.bin"), &bin).unwrap();
+        let cue = dir.join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        writeln!(f, "  TRACK 02 AUDIO").unwrap();
+        writeln!(f, "    INDEX 01 00:02:00").unwrap();
+        cue
+    }
+
+    fn cue_unlicensed(dir: &Path) -> std::path::PathBuf {
+        let bin = vec![0u8; SECTOR_LEN * 24];
+        std::fs::write(dir.join("game.bin"), &bin).unwrap();
+        let cue = dir.join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        cue
+    }
+
+    fn cue_xa_and_bad(dir: &Path) -> std::path::PathBuf {
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        let off = SECTOR_LEN * 4;
+        bin[off] = 0x00;
+        for b in bin.iter_mut().take(off + 11).skip(off + 1) {
+            *b = 0xFF;
+        }
+        bin[off + 11] = 0x00;
+        bin[off + 12] = 0x00;
+        bin[off + 13] = 0x02;
+        bin[off + 14] = 0x04;
+        bin[off + 15] = 0x02;
+        bin[off + 16] = 0x01;
+        bin[off + 17] = 0x01;
+        bin[off + 18] = 0x44;
+        bin[off + 19] = 0x00;
+        bin[off + 24] = 0x0C;
+        for i in 0..112 {
+            bin[off + 16 + 16 + i] = 0x77;
+        }
+        let bad = SECTOR_LEN * 5;
+        bin[bad] = 0x00;
+        for b in bin.iter_mut().take(bad + 11).skip(bad + 1) {
+            *b = 0xFF;
+        }
+        bin[bad + 11] = 0x00;
+        bin[bad + 15] = 0xFF;
+        std::fs::write(dir.join("game.bin"), &bin).unwrap();
+        let cue = dir.join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        cue
+    }
+
+    #[test]
+    fn forward_backward_without_play_are_int5_stat_80h() {
+        let (_dir, mut cd) = load_licensed();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x04, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "Forward while idle is INT5");
+        assert_eq!(result_bytes(&mut cd, 2)[1], 0x80);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x05, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "Backward while idle is INT5");
+        assert_eq!(result_bytes(&mut cd, 2)[1], 0x80);
+    }
+
+    #[test]
+    fn forward_while_playing_is_int3_and_skips_along_the_disc() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_two_tracks(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0C, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x03, &[0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Play INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        send(&mut cd, &mut irq, 0x11, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        let before = result_bytes(&mut cd, 8);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x04, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            3,
+            "Forward while Playing is INT3"
+        );
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x11, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        let after = result_bytes(&mut cd, 8);
+        assert_ne!(
+            &after[5..8],
+            &before[5..8],
+            "Forward must skip along the disc (before {before:?} after {after:?})"
+        );
+    }
+
+    #[test]
+    fn play_with_report_repeats_int1() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_two_tracks(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x03, &[0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Play INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584 * 12);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1, "Play+Report INT1");
+        let r = result_bytes(&mut cd, 8);
+        assert_eq!(r.len(), 8, "report is eight bytes");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584 * 12);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            1,
+            "Play+Report INT1 repeats, not a one-shot"
+        );
+    }
+
+    #[test]
+    fn setsession_seekp_reset_getq_readtoc_match_spx() {
+        let (_dir, mut cd) = load_licensed();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x12, &[0x00]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "SetSession 00h is INT5");
+        assert_eq!(result_bytes(&mut cd, 2), vec![0x03, 0x10]);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x12, &[0x01]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "SetSession 01h INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        assert_eq!(hintsts(&mut cd, &mut irq), 2, "SetSession 01h INT2");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x12, &[0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "SetSession 02h INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "bad session INT5");
+        assert_eq!(result_bytes(&mut cd, 2)[1], 0x40);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x10]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x16, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "SeekP INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        assert_eq!(hintsts(&mut cd, &mut irq), 2, "SeekP INT2");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x11, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            &result_bytes(&mut cd, 8)[5..8],
+            &[0x00, 0x02, 0x10],
+            "SeekP uses Setloc MM:SS:FF"
+        );
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x1C, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "Reset INT3");
+        assert_eq!(cd.view().mode, 0x20, "Reset sets mode=20h");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 0x400000);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            0,
+            "Reset has no second INT; software waits 400000h cycles"
+        );
+        send(&mut cd, &mut irq, 0x1D, &[0x01, 0x01]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "GetQ INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        assert_eq!(hintsts(&mut cd, &mut irq), 2, "GetQ INT2");
+        let q = result_bytes(&mut cd, 11);
+        assert_eq!(q.len(), 11, "GetQ is 10 SubQ bytes plus peak LSB");
+        assert_eq!(q[2], 0x01, "POINT=01h");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x1E, &[]);
+        pump(&mut cd, &mut irq, 0x13CCE);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3, "ReadTOC INT3");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 0x20_0000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 2, "ReadTOC INT2");
+    }
+
+    #[test]
+    fn secret_unlock_and_video_cd_are_int5_11h_40h() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x50, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5);
+        assert_eq!(result_bytes(&mut cd, 2), vec![0x11, 0x40]);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x51, b"Licensed by");
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(result_bytes(&mut cd, 2), vec![0x11, 0x40]);
+        ack_irq(&mut cd, &mut irq);
+        cd.write8(0, 0, &mut irq);
+        cd.write8(2, 0xAB, &mut irq);
+        cd.write8(1, 0x1F, &mut irq);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5);
+        assert_eq!(result_bytes(&mut cd, 2), vec![0x11, 0x40]);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x01, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            5,
+            "1Fh must leave the param FIFO so leftover 0xAB makes Getstat INT5"
+        );
+    }
+
+    #[test]
+    fn test_19h_version_switches_region_chipset_scex() {
+        let (_dir, mut cd) = load_licensed();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0x20]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(result_bytes(&mut cd, 4), vec![0x94, 0x09, 0x19, 0xC0]);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0x21]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3);
+        assert_eq!(result_bytes(&mut cd, 1)[0] & 2, 0, "door closed");
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0x22]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(result_bytes(&mut cd, 7), b"for U/C".to_vec());
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0x23]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert!(
+            result_bytes(&mut cd, 16)
+                .windows(7)
+                .any(|w| w == b"CXD2940" || w == b"CXD1817" || w == b"CXD2545"),
+            "19h,23h is a chipset string"
+        );
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0x05]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            result_bytes(&mut cd, 2),
+            vec![0x01, 0x01],
+            "licensed disc SCEx counters"
+        );
+    }
+
+    #[test]
+    fn gettn_gettd_use_disc_toc() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_two_tracks(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x13, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            &result_bytes(&mut cd, 3)[1..],
+            &[0x01, 0x02],
+            "GetTN first/last from TOC"
+        );
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x14, &[0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            &result_bytes(&mut cd, 3)[1..],
+            &[0x00, 0x04],
+            "GetTD(2) is MM:SS of INDEX 01 00:02:00 plus 00:02 pregap"
+        );
+    }
+
+    #[test]
+    fn smen_volume_sound_map_xa_filter_cdda() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_xa_and_bad(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        cd.write8(0, 0, &mut irq);
+        cd.write8(3, 0x20, &mut irq);
+        send(&mut cd, &mut irq, 0x01, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        cd.write8(0, 1, &mut irq);
+        let flags = cd.read8(3);
+        assert_eq!(flags & 0x17, 0x13, "SMEN + INT3 is INT13h (got {flags:#x})");
+        ack_irq(&mut cd, &mut irq);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_two_tracks(dir2.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0C, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        cd.write8(0, 2, &mut irq);
+        cd.write8(2, 0, &mut irq);
+        cd.write8(3, 0, &mut irq);
+        cd.write8(0, 3, &mut irq);
+        cd.write8(1, 0, &mut irq);
+        cd.write8(2, 0, &mut irq);
+        cd.write8(3, 0x20, &mut irq);
+        send(&mut cd, &mut irq, 0x03, &[0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        let muted = cd.take_analog();
+        assert_eq!(muted, (0, 0), "ATV 0 applied is silent CD-DA");
+
+        let mut cd = Cdrom::new();
+        enable(&mut cd, &mut irq);
+        cd.write8(0, 2, &mut irq);
+        cd.write8(1, 0, &mut irq);
+        cd.write8(0, 1, &mut irq);
+        for _ in 0..0x900 {
+            cd.write8(1, 0x7F, &mut irq);
+        }
+        let sm = cd.take_analog();
+        assert_ne!(sm, (0, 0), "Sound Map 900h bytes reach analog out");
+
+        let dir3 = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_xa_and_bad(dir3.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0C, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x40]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq) & 7,
+            0,
+            "XA-ADPCM (Setmode.6, MODE2 audio+realtime) must not raise CPU INT1"
+        );
+        let xa = cd.take_analog();
+        assert_ne!(xa, (0, 0), "XA-ADPCM goes to analog/SPU");
+        send(&mut cd, &mut irq, 0x09, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 0x0021_181C);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0D, &[0x02, 0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x48]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        let _ = cd.take_analog();
+        assert_eq!(
+            cd.take_analog(),
+            (0, 0),
+            "Setmode filter drops non-matching XA file/channel"
+        );
+    }
+
+    #[test]
+    fn readn_retries_bad_sector_reads_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_xa_and_bad(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x80]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x05]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x15, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 225_792);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            0,
+            "ReadN retries a bad sector instead of INT1/INT5 on the first attempt"
+        );
+        pump(&mut cd, &mut irq, 225_792 * 4);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "ReadN gives up with INT5");
+        ack_irq(&mut cd, &mut irq);
+
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_xa_and_bad(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x80]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x05]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x15, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 451_584);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x1B, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 225_792);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            5,
+            "ReadS does not retry: INT5 after one sector time"
+        );
+    }
+
+    #[test]
+    fn shell_open_int5_and_unlicensed_getid() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        cd.open_shell(&mut irq);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "shell-open INT5");
+        assert_eq!(result_bytes(&mut cd, 2)[1], 0x80);
+        ack_irq(&mut cd, &mut irq);
+        cd.close_shell();
+
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_unlicensed(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x1A, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 3);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 50_000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "unlicensed GetID INT5");
+        let id = result_bytes(&mut cd, 8);
+        assert_eq!(id[0], 0x0A);
+        assert_eq!(id[1], 0x80);
     }
 }

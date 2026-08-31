@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::DisplayArea;
 
@@ -38,6 +38,15 @@ pub struct Gpu {
     display_enabled: bool,
     dma_dir: u8,
     interlace: bool,
+    disp_24: bool,
+    gpu_irq: bool,
+    range_x1: u32,
+    range_x2: u32,
+    range_y1: u32,
+    range_y2: u32,
+    vram_2m: bool,
+    tex_cache: HashMap<(u32, u32), u16>,
+    clut_cache: Option<(u32, u32, [u16; 16])>,
     transfer: Option<Transfer>,
     pub gp0_count: u64,
     pub gp1_count: u64,
@@ -130,6 +139,15 @@ impl Gpu {
             display_enabled: false,
             dma_dir: 0,
             interlace: false,
+            disp_24: false,
+            gpu_irq: false,
+            range_x1: 0x200,
+            range_x2: 0x200 + 256 * 10,
+            range_y1: 0x10,
+            range_y2: 0x10 + 240,
+            vram_2m: false,
+            tex_cache: HashMap::new(),
+            clut_cache: None,
             transfer: None,
             gp0_count: 0,
             gp1_count: 0,
@@ -182,6 +200,25 @@ impl Gpu {
 
     pub fn stat(&self) -> u32 {
         self.stat
+    }
+
+    pub fn irq_line(&self) -> bool {
+        self.gpu_irq
+    }
+
+    pub fn display_range(&self) -> (u32, u32, u32, u32) {
+        (self.range_x1, self.range_x2, self.range_y1, self.range_y2)
+    }
+
+    fn vis_h(&self) -> u32 {
+        let range_h = self.range_y2.saturating_sub(self.range_y1);
+        if self.display_vres >= 480 {
+            self.display_vres.max(1).min(480)
+        } else if range_h > 0 {
+            range_h.min(480)
+        } else {
+            self.display_vres.max(1).min(480)
+        }
     }
 
     pub fn fifo_full(&self) -> bool {
@@ -284,6 +321,12 @@ impl Gpu {
         if !self.display_enabled {
             s |= 1 << 23;
         }
+        if self.disp_24 {
+            s |= 1 << 21;
+        }
+        if self.gpu_irq {
+            s |= 1 << 24;
+        }
         s |= u32::from(self.dma_dir) << 29;
         self.stat = s;
     }
@@ -345,6 +388,7 @@ impl Gpu {
                 t.cur_y = y;
                 t.remaining = t.remaining.saturating_sub(1);
                 if t.remaining == 0 {
+                    self.tex_cache.clear();
                     self.transfer = None;
                     self.update_stat();
                 }
@@ -420,11 +464,22 @@ impl Gpu {
     fn exec_gp0(&mut self) {
         let cmd = self.gp0_cmd.unwrap();
         match cmd {
+            0x01 => {
+                self.tex_cache.clear();
+                self.clut_cache = None;
+            }
+            0x1F => {
+                self.gpu_irq = true;
+                self.update_stat();
+            }
             0x02 => self.fill(),
             0x20..=0x3F => self.polygon(),
             0x40..=0x5F => self.line(),
             0x60..=0x7F => self.rectangle(),
-            0x80 => self.vram_copy(),
+            0x80 => {
+                self.tex_cache.clear();
+                self.vram_copy();
+            }
             0xA0 | 0xC0 => {
                 let xy = self.gp0_buf[1];
                 let wh = self.gp0_buf[2];
@@ -503,6 +558,10 @@ impl Gpu {
                 self.draw_busy = 0;
                 self.block28 = false;
             }
+            0x02 => {
+                self.gpu_irq = false;
+                self.update_stat();
+            }
             0x03 => {
                 self.display_enabled = p & 1 == 0;
                 self.update_stat();
@@ -528,7 +587,19 @@ impl Gpu {
                 }
                 self.display_vres = if p & 4 != 0 { 480 } else { 240 };
                 self.interlace = p & (1 << 5) != 0;
+                self.disp_24 = p & (1 << 4) != 0;
                 self.update_stat();
+            }
+            0x06 => {
+                self.range_x1 = p & 0xFFF;
+                self.range_x2 = (p >> 12) & 0xFFF;
+            }
+            0x07 => {
+                self.range_y1 = p & 0x3FF;
+                self.range_y2 = (p >> 10) & 0x3FF;
+            }
+            0x09 => {
+                self.vram_2m = p & 1 != 0;
             }
             0x10 => {
                 self.gpuread = match p & 7 {
@@ -915,7 +986,7 @@ impl Gpu {
         }
     }
 
-    fn sample_tex(&self, u: u8, v: u8) -> u16 {
+    fn sample_tex(&mut self, u: u8, v: u8) -> u16 {
         let page = self.tex_page;
         let tx_base = (page & 0xF) * 64;
         let ty_base = ((page >> 4) & 1) * 256;
@@ -929,14 +1000,14 @@ impl Gpu {
         let vv = (u32::from(v) & my) | oy;
         match mode {
             0 => {
-                let texel = self.read_half(tx_base + uu / 4, ty_base + vv);
+                let texel = self.cached_half(tx_base + uu / 4, ty_base + vv);
                 let index = (texel >> ((uu & 3) * 4)) & 0xF;
-                self.read_half(self.clut_x + u32::from(index), self.clut_y)
+                self.cached_clut(u32::from(index))
             }
             1 => {
-                let texel = self.read_half(tx_base + uu / 2, ty_base + vv);
+                let texel = self.cached_half(tx_base + uu / 2, ty_base + vv);
                 let index = (texel >> ((uu & 1) * 8)) & 0xFF;
-                self.read_half(self.clut_x + u32::from(index), self.clut_y)
+                self.cached_clut(u32::from(index))
             }
             _ => self.read_half(tx_base + uu, ty_base + vv),
         }
@@ -968,13 +1039,44 @@ impl Gpu {
         self.write_half(x as u32, y as u32, c);
     }
 
+    fn cached_half(&mut self, x: u32, y: u32) -> u16 {
+        if let Some(&c) = self.tex_cache.get(&(x, y)) {
+            return c;
+        }
+        let p = self.read_half(x, y);
+        self.tex_cache.insert((x, y), p);
+        p
+    }
+
+    fn cached_clut(&mut self, index: u32) -> u16 {
+        let key = (self.clut_x, self.clut_y);
+        if let Some((cx, cy, pal)) = self.clut_cache {
+            if (cx, cy) == key {
+                return pal[index as usize & 15];
+            }
+        }
+        let mut pal = [0u16; 16];
+        for i in 0..16 {
+            pal[i] = self.read_half(self.clut_x + i as u32, self.clut_y);
+        }
+        let v = pal[index as usize & 15];
+        self.clut_cache = Some((key.0, key.1, pal));
+        v
+    }
+
     fn read_half(&self, x: u32, y: u32) -> u16 {
         let x = (x as usize) & (VRAM_W - 1);
+        if self.vram_2m && y >= 512 {
+            return 0x7FFF;
+        }
         let y = (y as usize) & (VRAM_H - 1);
         self.vram[y * VRAM_W + x]
     }
 
     fn write_half(&mut self, x: u32, y: u32, v: u16) {
+        if self.vram_2m && y >= 512 {
+            return;
+        }
         let x = (x as usize) & (VRAM_W - 1);
         let y = (y as usize) & (VRAM_H - 1);
         if self.mask_check && self.vram[y * VRAM_W + x] & 0x8000 != 0 {
@@ -1021,6 +1123,7 @@ impl Gpu {
             width: w,
             height: h,
             pixels,
+            bpp24: self.disp_24,
         }
     }
 
@@ -1045,14 +1148,30 @@ impl Gpu {
         )
     }
 
+    fn read_24(&self, x: u32, y: u32) -> u16 {
+        let byte = (y as usize * 2048).wrapping_add(x as usize * 3);
+        let mut rgb = [0u8; 3];
+        for (i, c) in rgb.iter_mut().enumerate() {
+            let off = byte + i;
+            let half = self.read_half((off / 2) as u32 % 1024, y);
+            *c = if off % 2 == 0 {
+                half as u8
+            } else {
+                (half >> 8) as u8
+            };
+        }
+        rgb888_to_555(u32::from(rgb[0]), u32::from(rgb[1]), u32::from(rgb[2]))
+    }
+
     pub fn display_area(&self) -> DisplayArea {
         let w = self.display_hres.max(1).min(640);
-        let h = self.display_vres.max(1).min(480);
+        let h = self.vis_h();
         if !self.display_enabled {
             return DisplayArea {
                 width: w,
                 height: h,
                 pixels: vec![0; (w * h) as usize],
+                bpp24: self.disp_24,
             };
         }
         if self.crt_w == w && self.crt_h == h && self.crt.len() == (w * h) as usize {
@@ -1060,12 +1179,14 @@ impl Gpu {
                 width: w,
                 height: h,
                 pixels: self.crt.clone(),
+                bpp24: self.disp_24,
             };
         }
         DisplayArea {
             width: w,
             height: h,
             pixels: vec![0; (w * h) as usize],
+            bpp24: self.disp_24,
         }
     }
 
@@ -1078,7 +1199,7 @@ impl Gpu {
             return;
         }
         let w = self.display_hres.max(1).min(640);
-        let h = self.display_vres.max(1).min(480);
+        let h = self.vis_h();
         if self.crt_w != w || self.crt_h != h {
             self.crt_w = w;
             self.crt_h = h;
@@ -1087,7 +1208,11 @@ impl Gpu {
         for y in 0..h {
             let row = (y * w) as usize;
             for x in 0..w {
-                self.crt[row + x as usize] = self.read_half(self.display_x + x, self.display_y + y);
+                self.crt[row + x as usize] = if self.disp_24 {
+                    self.read_24(self.display_x + x, self.display_y + y)
+                } else {
+                    self.read_half(self.display_x + x, self.display_y + y)
+                };
             }
         }
         self.crt_line = u32::MAX;
@@ -1114,7 +1239,7 @@ impl Gpu {
         }
         if !vblank && self.display_enabled && line != self.crt_line {
             let w = self.display_hres.max(1).min(640);
-            let h = self.display_vres.max(1).min(480);
+            let h = self.vis_h();
             if self.crt_w != w || self.crt_h != h {
                 self.crt_w = w;
                 self.crt_h = h;
@@ -2059,6 +2184,96 @@ mod tests {
             gpu.stat() & (1 << 13),
             0,
             "GPUSTAT.13 follows the interlace field when GP1(08h).5 is on"
+        );
+    }
+
+    fn draw_4bpp_dot(gpu: &mut Gpu, clut_y: u32) {
+        gpu.gp0(0xE1 << 24);
+        gpu.gp0(0x65 << 24 | 0x808080);
+        gpu.gp0(xy(8, 8));
+        gpu.gp0((clut_y << 6) << 16);
+        gpu.gp0(1 | (1 << 16));
+        settle(gpu);
+    }
+
+    #[test]
+    fn gp0_01h_discards_clut_cache_fill_does_not() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        draw_4bpp_dot(&mut gpu, 480);
+        assert_eq!(peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF, 0x001F);
+        clut[1] = 0x03E0;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0x02 << 24 | 0x0000F8);
+        gpu.gp0(400u32 << 16);
+        gpu.gp0(16 | (16 << 16));
+        settle(&mut gpu);
+        draw_4bpp_dot(&mut gpu, 480);
+        assert_eq!(
+            peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF,
+            0x001F,
+            "Fill and CLUT COPY leave the CLUT cache; textured draw still samples the old palette"
+        );
+        gpu.gp0(0x01 << 24);
+        settle(&mut gpu);
+        draw_4bpp_dot(&mut gpu, 480);
+        assert_eq!(
+            peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF,
+            0x03E0,
+            "GP0(01h) discards CLUT cache so the new VRAM palette is sampled"
+        );
+    }
+
+    #[test]
+    fn gp0_1fh_sets_gpustat_24_gp1_02h_clears_it() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0x1F << 24);
+        settle(&mut gpu);
+        assert_ne!(gpu.stat() & (1 << 24), 0, "GP0(1Fh) sets GPUSTAT.24");
+        assert!(gpu.irq_line());
+        gpu.gp1(0x02 << 24);
+        assert_eq!(gpu.stat() & (1 << 24), 0, "GP1(02h) acks GPUSTAT.24");
+        assert!(!gpu.irq_line());
+    }
+
+    #[test]
+    fn gp1_08h_24bpp_and_display_range_and_2mb() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x08 << 24 | (1 << 4) | 1);
+        assert_ne!(gpu.stat() & (1 << 21), 0, "GP1(08h) bit4 sets GPUSTAT.21");
+        gpu.gp1(0x03 << 24);
+        gpu.gp1(0x05 << 24);
+        gpu.tick(1, 0, false);
+        assert!(
+            gpu.display_area().bpp24,
+            "Display area is 24-bit when GP1(08h) bit4 is set"
+        );
+        gpu.gp1(0x06 << 24 | 0x200 | ((0x200 + 320 * 8) << 12));
+        gpu.gp1(0x07 << 24 | 10 | (110 << 10));
+        assert_eq!(gpu.display_range(), (0x200, 0x200 + 320 * 8, 10, 110));
+        gpu.gp1(0x03 << 24);
+        for line in 0..120 {
+            gpu.tick(1, line, false);
+        }
+        assert_eq!(
+            gpu.display_area().height,
+            100,
+            "GP1(07h) Y2-Y1 is the Display height"
+        );
+        gpu.gp1(0x09 << 24 | 1);
+        assert_eq!(
+            gpu.vram_rect(0, 512, 1, 1).pixels[0],
+            0x7FFF,
+            "GP1(09h) 2MB: VRAM Y>=200h is open bus 7FFFh"
         );
     }
 }

@@ -607,9 +607,21 @@ impl Gte {
             [[-r, r, ir0], [rt13, rt13, rt13], [rt22, rt22, rt22]]
         } else {
             [
-                [self.mx_el(mx, 0, 0), self.mx_el(mx, 0, 1), self.mx_el(mx, 0, 2)],
-                [self.mx_el(mx, 1, 0), self.mx_el(mx, 1, 1), self.mx_el(mx, 1, 2)],
-                [self.mx_el(mx, 2, 0), self.mx_el(mx, 2, 1), self.mx_el(mx, 2, 2)],
+                [
+                    self.mx_el(mx, 0, 0),
+                    self.mx_el(mx, 0, 1),
+                    self.mx_el(mx, 0, 2),
+                ],
+                [
+                    self.mx_el(mx, 1, 0),
+                    self.mx_el(mx, 1, 1),
+                    self.mx_el(mx, 1, 2),
+                ],
+                [
+                    self.mx_el(mx, 2, 0),
+                    self.mx_el(mx, 2, 1),
+                    self.mx_el(mx, 2, 2),
+                ],
             ]
         };
         let (tx, ty, tz) = match cv {
@@ -703,9 +715,18 @@ impl Gte {
                 None => 0,
             };
             let axis = (r as u32) + 1;
-            let mut acc = self.mac(axis, (t << 12) + i64::from(self.mx_el(mx, r, 0)) * i64::from(vec.0));
-            acc = self.mac(axis, acc + i64::from(self.mx_el(mx, r, 1)) * i64::from(vec.1));
-            acc = self.mac(axis, acc + i64::from(self.mx_el(mx, r, 2)) * i64::from(vec.2));
+            let mut acc = self.mac(
+                axis,
+                (t << 12) + i64::from(self.mx_el(mx, r, 0)) * i64::from(vec.0),
+            );
+            acc = self.mac(
+                axis,
+                acc + i64::from(self.mx_el(mx, r, 1)) * i64::from(vec.1),
+            );
+            acc = self.mac(
+                axis,
+                acc + i64::from(self.mx_el(mx, r, 2)) * i64::from(vec.2),
+            );
             let shifted = acc >> shift;
             self.data[25 + r] = shifted as u32;
             self.set_ir(r, shifted, lm);
@@ -741,8 +762,10 @@ impl Gte {
         for r in 0..3 {
             let bk = self.ctrl[13 + r] as i32 as i64;
             let axis = (r as u32) + 1;
-            let mut acc =
-                self.mac(axis, (bk << 12) + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0));
+            let mut acc = self.mac(
+                axis,
+                (bk << 12) + i64::from(self.mx_el(2, r, 0)) * i64::from(ir.0),
+            );
             acc = self.mac(axis, acc + i64::from(self.mx_el(2, r, 1)) * i64::from(ir.1));
             acc = self.mac(axis, acc + i64::from(self.mx_el(2, r, 2)) * i64::from(ir.2));
             let shifted = acc >> (sf * 12);
@@ -1124,7 +1147,7 @@ mod tests {
         g.write_data(0, 1 | (1 << 16)); // V0 = (1,1,?)
         g.write_data(1, 1);
         g.command(0x01 << 19 | 3 << 17 | 0x12); // sf=1, mx=3, v=V0, cv=TR=0
-        // MAC1 = ((-0x100)*1 + 0x100*1 + 0x20*1) >> 12 = 0x20 >> 12 = 0
+                                                // MAC1 = ((-0x100)*1 + 0x100*1 + 0x20*1) >> 12 = 0x20 >> 12 = 0
         assert_eq!(g.read_data(9) as i16, 0, "IR1 garbage row0");
         // MAC2 = (3+3+3)>>12 = 0
         assert_eq!(g.read_data(10) as i16, 0, "IR2 garbage row1");
