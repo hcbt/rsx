@@ -211,14 +211,10 @@ impl Gpu {
     }
 
     fn vis_h(&self) -> u32 {
-        let range_h = self.range_y2.saturating_sub(self.range_y1);
-        if self.display_vres >= 480 {
-            self.display_vres.max(1).min(480)
-        } else if range_h > 0 {
-            range_h.min(480)
-        } else {
-            self.display_vres.max(1).min(480)
-        }
+        // GP1(08h) sets the framebuffer size. GP1(07h) is the CRT window,
+        // not a second resolution; using Y2-Y1 as height blanks the Display
+        // area whenever that range disagrees with the CRT buffer size.
+        self.display_vres.max(1).min(480)
     }
 
     pub fn fifo_full(&self) -> bool {
@@ -2319,8 +2315,8 @@ mod tests {
         }
         assert_eq!(
             gpu.display_area().height,
-            100,
-            "GP1(07h) Y2-Y1 is the Display height"
+            240,
+            "GP1(08h) vertical resolution is the Display height; GP1(07h) is the CRT range"
         );
         gpu.gp1(0x09 << 24 | 1);
         assert_eq!(
