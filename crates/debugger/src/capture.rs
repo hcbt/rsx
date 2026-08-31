@@ -493,6 +493,7 @@ fn dump_crash_proj(machine: &Machine, dir: &Path, n: u64) {
         width: 512,
         height: 240,
         pixels,
+        bpp24: false,
     };
     let path = dir.join(format!("crash-proj-v{n:04}.png"));
     if let Err(e) = write_png(&area, &path) {
@@ -703,6 +704,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![0x001F, 0x03E0],
+            bpp24: false,
         };
         write_png(&area, &path).unwrap();
         let data = std::fs::read(&path).unwrap();
