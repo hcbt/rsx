@@ -315,6 +315,7 @@ impl Bus {
             &mut self.cdrom,
             &mut self.irq,
         );
+        self.irq.set_level(crate::irq::IRQ_GPU, self.gpu.irq_line());
     }
 
     pub fn read8(&mut self, addr: u32) -> Option<u8> {
@@ -644,6 +645,32 @@ mod tests {
             b.ram_word(0x80),
             0x00FF_FFFF,
             "OTC overwrote the posted word"
+        );
+    }
+
+    #[test]
+    fn gp0_1fh_then_tick_sets_i_stat_gpu_gp1_02h_edge_acks() {
+        let mut b = bus();
+        b.write32(0x1F80_1810, 0x1F << 24);
+        assert_eq!(
+            b.read16(0x1F80_1070).unwrap() & (1 << 1),
+            0,
+            "GP0(1Fh) sits in the FIFO: I_STAT.1 is not set on the write"
+        );
+        b.tick(16);
+        assert_ne!(
+            b.read16(0x1F80_1070).unwrap() & (1 << 1),
+            0,
+            "after tick, GP0(1Fh) sets I_STAT bit 1"
+        );
+        b.write32(0x1F80_1814, 0x02 << 24);
+        b.tick(1);
+        b.write32(0x1F80_1070, !u32::from(1u16 << 1));
+        b.tick(1);
+        assert_eq!(
+            b.read16(0x1F80_1070).unwrap() & (1 << 1),
+            0,
+            "GP1(02h) then a tick leaves I_STAT.1 edge-acked"
         );
     }
 }

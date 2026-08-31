@@ -1250,8 +1250,11 @@ impl Gpu {
             if h < 480 && line < h {
                 let row = (line * w) as usize;
                 for x in 0..w {
-                    self.crt[row + x as usize] =
-                        self.read_half(self.display_x + x, self.display_y + line);
+                    self.crt[row + x as usize] = if self.disp_24 {
+                        self.read_24(self.display_x + x, self.display_y + line)
+                    } else {
+                        self.read_half(self.display_x + x, self.display_y + line)
+                    };
                 }
             }
             self.crt_line = line;
@@ -2250,12 +2253,23 @@ mod tests {
         let mut gpu = Gpu::new();
         gpu.gp1(0x08 << 24 | (1 << 4) | 1);
         assert_ne!(gpu.stat() & (1 << 21), 0, "GP1(08h) bit4 sets GPUSTAT.21");
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x00F8);
+        settle(&mut gpu);
         gpu.gp1(0x03 << 24);
         gpu.gp1(0x05 << 24);
         gpu.tick(1, 0, false);
+        let area = gpu.display_area();
         assert!(
-            gpu.display_area().bpp24,
+            area.bpp24,
             "Display area is 24-bit when GP1(08h) bit4 is set"
+        );
+        assert_eq!(
+            area.pixels[0] & 0x7FFF,
+            0x001F,
+            "24bpp scanline latch converts packed RGB888 (F8,00,00) to RGB555, not the raw halfword 00F8h"
         );
         gpu.gp1(0x06 << 24 | 0x200 | ((0x200 + 320 * 8) << 12));
         gpu.gp1(0x07 << 24 | 10 | (110 << 10));

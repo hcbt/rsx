@@ -341,7 +341,8 @@ impl Cdrom {
                 if self.sound_map.len() < 0x900 {
                     self.sound_map.push(value);
                     if self.sound_map.len() == 0x900 {
-                        self.analog = sound_map_peak(&self.sound_map);
+                        let (l, r) = decode_xa(&self.sound_map, self.sound_map_coding);
+                        self.analog = self.apply_vol(l, r);
                     }
                 }
             }
@@ -1063,13 +1064,18 @@ impl Cdrom {
             self.analog = (0, 0);
             return;
         };
-        let l = i16::from_le_bytes([raw[24], raw[25]]);
-        let r = i16::from_le_bytes([raw[26], raw[27]]);
+        if raw.len() < 24 + 0x80 {
+            self.analog = (0, 0);
+            return;
+        }
+        let coding = raw.get(19).copied().unwrap_or(0);
+        let (l, r) = decode_xa(&raw[24..], coding);
         self.analog = self.apply_vol(l, r);
     }
 
     fn apply_vol(&self, l: i16, r: i16) -> (i16, i16) {
-        let [ll, lr, rl, rr] = self.vol_applied.map(|v| i32::from(v));
+        // SPX: ATV0 L→L, ATV1 L→R, ATV2 R→R (1F801801h.Index3), ATV3 R→L (1F801802h.Index3).
+        let [ll, lr, rr, rl] = self.vol_applied.map(|v| i32::from(v));
         let l = i32::from(l);
         let r = i32::from(r);
         let ol = ((l * ll + r * rl) >> 7).clamp(-0x8000, 0x7FFF) as i16;
@@ -1361,14 +1367,76 @@ fn frames_to_msf(frames: u32) -> (u8, u8, u8) {
     )
 }
 
-fn sound_map_peak(buf: &[u8]) -> (i16, i16) {
-    if buf.len() < 4 {
+fn decode_xa(buf: &[u8], coding: u8) -> (i16, i16) {
+    if buf.len() < 128 {
         return (0, 0);
     }
-    (
-        i16::from_le_bytes([buf[0], buf[1]]),
-        i16::from_le_bytes([buf[2], buf[3]]),
-    )
+    let src = &buf[..128];
+    let stereo = coding & 1 != 0;
+    let eight = coding & 0x10 != 0;
+    let mut old_l = 0i32;
+    let mut older_l = 0i32;
+    let mut old_r = 0i32;
+    let mut older_r = 0i32;
+    let l = xa_block(src, 0, 0, &mut old_l, &mut older_l, eight);
+    if stereo {
+        let r = xa_block(src, 0, 1, &mut old_r, &mut older_r, eight);
+        (l, r)
+    } else {
+        (l, l)
+    }
+}
+
+fn xa_block(
+    src: &[u8],
+    blk: usize,
+    nibble: usize,
+    old: &mut i32,
+    older: &mut i32,
+    eight: bool,
+) -> i16 {
+    const POS: [i32; 4] = [0, 60, 115, 98];
+    const NEG: [i32; 4] = [0, 0, -52, -55];
+    let header = src.get(4 + blk * 2 + nibble).copied().unwrap_or(0);
+    let mut sh = u32::from(header & 0xF);
+    if sh > 12 {
+        sh = 9;
+    }
+    let filter = ((header >> 4) & 3) as usize;
+    let f0 = POS[filter];
+    let f1 = NEG[filter];
+    let expand: u32 = if eight { 8 } else { 12 };
+    let mut first = 0i16;
+    for j in 0..28 {
+        let t = if eight {
+            let off = 16 + j * 4;
+            let word = u32::from_le_bytes([
+                src.get(off).copied().unwrap_or(0),
+                src.get(off + 1).copied().unwrap_or(0),
+                src.get(off + 2).copied().unwrap_or(0),
+                src.get(off + 3).copied().unwrap_or(0),
+            ]);
+            let b = ((word >> (nibble * 8)) & 0xFF) as i8 as i32;
+            b << expand.saturating_sub(sh)
+        } else {
+            let byte = src.get(16 + blk + j * 4).copied().unwrap_or(0);
+            let nib = (byte >> (nibble * 4)) & 0xF;
+            let t = if nib & 8 != 0 {
+                i32::from(nib) - 16
+            } else {
+                i32::from(nib)
+            };
+            t << expand.saturating_sub(sh)
+        };
+        let s = t + (*old * f0 + *older * f1 + 32) / 64;
+        let s = s.clamp(-0x8000, 0x7FFF);
+        if j == 0 {
+            first = s as i16;
+        }
+        *older = *old;
+        *old = s;
+    }
+    first
 }
 
 #[cfg(test)]
@@ -2429,6 +2497,26 @@ mod tests {
     }
 
     #[test]
+    fn default_atv_keeps_cdda_stereo() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = load_disc(&cue_two_tracks(dir.path())).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0C, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x03, &[0x02]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(
+            cd.take_analog(),
+            (0x1000, -0x2000),
+            "default ATV is L→L and R→R, not (L+R, 0)"
+        );
+    }
+
+    #[test]
     fn smen_volume_sound_map_xa_filter_cdda() {
         let dir = tempfile::tempdir().unwrap();
         let disc = load_disc(&cue_xa_and_bad(dir.path())).unwrap();
@@ -2470,13 +2558,22 @@ mod tests {
         let mut cd = Cdrom::new();
         enable(&mut cd, &mut irq);
         cd.write8(0, 2, &mut irq);
-        cd.write8(1, 0, &mut irq);
+        cd.write8(1, 0x01, &mut irq);
         cd.write8(0, 1, &mut irq);
-        for _ in 0..0x900 {
-            cd.write8(1, 0x7F, &mut irq);
+        for _ in 0..18 {
+            for _ in 0..16 {
+                cd.write8(1, 0, &mut irq);
+            }
+            for _ in 0..112 {
+                cd.write8(1, 0x07, &mut irq);
+            }
         }
         let sm = cd.take_analog();
-        assert_ne!(sm, (0, 0), "Sound Map 900h bytes reach analog out");
+        assert_eq!(
+            sm,
+            (0x7000, 0),
+            "Sound Map decodes 4-bit XA-ADPCM (nibble 7, shift 0) not raw PCM of the header bytes"
+        );
 
         let dir3 = tempfile::tempdir().unwrap();
         let disc = load_disc(&cue_xa_and_bad(dir3.path())).unwrap();
