@@ -207,6 +207,9 @@ impl Dma {
             cycles -= 1;
             if self.jobs[ch].is_none() {
                 self.finish(ch, irq);
+                if ch == 2 {
+                    gpu.end_gp0_stream();
+                }
             }
         }
     }
@@ -909,6 +912,62 @@ mod tests {
             dma.chcr(2) & (1 << 24),
             0,
             "a repeating GPU DMA node must clear CHCR.24 so DrawSync can return"
+        );
+    }
+
+    #[test]
+    fn gpu_dma_list_end_does_not_leave_gp0_waiting_for_params() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        gpu.gp0(0xE3 << 24);
+        gpu.gp0(0xE4 << 24 | 1023 | (511 << 10));
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        // One-word packet: GP0(28h) quad needs four more XY words. End of list.
+        poke(&mut ram, 0x2000, (1 << 24) | 0x00FF_FFFF);
+        poke(&mut ram, 0x2004, 0x28 << 24);
+        dma.write32(
+            0x1F80_10A0,
+            0x2000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10A8,
+            0x0100_0401,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        for _ in 0..64 {
+            gpu.tick(1, 0, false);
+            dma.tick(1, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        }
+        assert_eq!(dma.chcr(2) & (1 << 24), 0, "list DMA must finish");
+        assert_ne!(
+            gpu.stat() & (1 << 26),
+            0,
+            "SPX: after the GP0 DMA stream ends, GPUSTAT.26 must be ready so DrawSync is not stuck"
+        );
+        assert!(
+            !gpu.busy(),
+            "must not keep assembling a truncated GP0 command"
         );
     }
 

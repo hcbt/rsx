@@ -566,6 +566,8 @@ impl Gpu {
                 self.fifo.clear();
                 self.draw_busy = 0;
                 self.block28 = false;
+                self.transfer = None;
+                self.update_stat();
             }
             0x02 => {
                 self.gpu_irq = false;
@@ -1205,6 +1207,22 @@ impl Gpu {
 
     pub fn dma_write(&mut self, word: u32) {
         self.gp0(word);
+    }
+
+    /// End of a GP0 DMA stream: run complete commands still in the FIFO, then
+    /// drop a truncated command so GPUSTAT.26 is ready for DrawSync.
+    pub fn end_gp0_stream(&mut self) {
+        while let Some(w) = self.fifo.pop_front() {
+            self.accept_word(w);
+            if self.gp0_cmd.is_some() && !self.gp0_ready() && self.fifo.is_empty() {
+                break;
+            }
+        }
+        if self.gp0_cmd.is_some() && !self.gp0_ready() {
+            self.gp0_buf.clear();
+            self.gp0_cmd = None;
+        }
+        self.update_stat();
     }
 
     fn latch_frame(&mut self) {

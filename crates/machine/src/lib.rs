@@ -1178,7 +1178,16 @@ mod tests {
             m.ram_word(0x8006_1EA4),
         );
         let (n134, n13b) = m.nsf_reloc_hits();
-        eprintln!("  nsf_134c8={n134} nsf_13b30={n13b}");
+        let (le, lp, lmin, lmax, lstart, lstartn, leb) = m.dma_list_stats();
+        eprintln!(
+            "  nsf_134c8={n134} nsf_13b30={n13b} chcr2={:08X} jobs={:02X} gpustat={:08X} fifo={} draw={} busy={} list_pkts={lp} empty={le} range={lmin:06X}..{lmax:06X} start={lstart:06X}/{lstartn} empty_before={leb}",
+            m.dma_chcr(2),
+            m.dma_job_mask(),
+            m.gpustat(),
+            m.gpu_fifo_len(),
+            m.gpu_draw_remaining(),
+            u8::from(m.gpu_busy()),
+        );
         let table = m.ram_word(0x8005_C540);
         eprintln!(
             "  table={table:08X} +418={:08X} +41C={:08X} +420={:08X} +424={:08X} 9CE08={:08X} ACE08={:08X} BCE08={:08X} CCE08={:08X}",
