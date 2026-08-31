@@ -46,7 +46,7 @@ pub struct Gpu {
     range_y2: u32,
     vram_2m: bool,
     tex_cache: HashMap<(u32, u32), u16>,
-    clut_cache: Option<(u32, u32, [u16; 16])>,
+    clut_cache: Option<(u32, u32, [u16; 256])>,
     transfer: Option<Transfer>,
     pub gp0_count: u64,
     pub gp1_count: u64,
@@ -998,12 +998,12 @@ impl Gpu {
             0 => {
                 let texel = self.cached_half(tx_base + uu / 4, ty_base + vv);
                 let index = (texel >> ((uu & 3) * 4)) & 0xF;
-                self.cached_clut(u32::from(index))
+                self.cached_clut(u32::from(index), false)
             }
             1 => {
                 let texel = self.cached_half(tx_base + uu / 2, ty_base + vv);
                 let index = (texel >> ((uu & 1) * 8)) & 0xFF;
-                self.cached_clut(u32::from(index))
+                self.cached_clut(u32::from(index), true)
             }
             _ => self.read_half(tx_base + uu, ty_base + vv),
         }
@@ -1044,18 +1044,20 @@ impl Gpu {
         p
     }
 
-    fn cached_clut(&mut self, index: u32) -> u16 {
+    fn cached_clut(&mut self, index: u32, eight: bool) -> u16 {
+        // SPX: CLUT cache is 256 halfwords (one 8-bit palette, or sixteen 4-bit).
         let key = (self.clut_x, self.clut_y);
+        let idx = index as usize & if eight { 255 } else { 15 };
         if let Some((cx, cy, pal)) = self.clut_cache {
             if (cx, cy) == key {
-                return pal[index as usize & 15];
+                return pal[idx];
             }
         }
-        let mut pal = [0u16; 16];
-        for i in 0..16 {
+        let mut pal = [0u16; 256];
+        for i in 0..256 {
             pal[i] = self.read_half(self.clut_x + i as u32, self.clut_y);
         }
-        let v = pal[index as usize & 15];
+        let v = pal[idx];
         self.clut_cache = Some((key.0, key.1, pal));
         v
     }
@@ -2268,6 +2270,45 @@ mod tests {
             peek(&mut gpu, 16, 16, 1, 1).pixels[0] & 0x7FFF,
             0,
             "GP0(01h) discards texture cache so the Fill-black VRAM is sampled"
+        );
+    }
+
+    #[test]
+    fn eight_bit_texture_uses_256_entry_clut() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0 | (480u32 << 16));
+        gpu.gp0(256 | (1 << 16));
+        let mut pal = [0u32; 128];
+        pal[0] = 0x001F; // index 0 transparent-ish red in low, index 1 red
+        pal[8] = 0x03E0 << 16; // index 17 green in high half of word 8 (entries 16,17)
+        for w in pal {
+            gpu.gp0(w);
+        }
+        settle(&mut gpu);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0011); // 8-bit indices 0x11, 0x00; 4-bit nibbles 1,1,0,0
+        settle(&mut gpu);
+        // 4-bit sample at this CLUT must not pin a 16-entry cache.
+        gpu.gp0(0xE1 << 24);
+        gpu.gp0(0x65 << 24 | 0x808080);
+        gpu.gp0(xy(7, 8));
+        gpu.gp0((480u32 << 6) << 16);
+        gpu.gp0(1 | (1 << 16));
+        settle(&mut gpu);
+        gpu.gp0(0xE1 << 24 | (1 << 7)); // 8-bit texpage
+        gpu.gp0(0x65 << 24 | 0x808080);
+        gpu.gp0(xy(8, 8));
+        gpu.gp0((480u32 << 6) << 16);
+        gpu.gp0(1 | (1 << 16));
+        let p = peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF;
+        assert_eq!(
+            p, 0x03E0,
+            "8-bit index 17 must sample CLUT[17], not CLUT[17&15]=CLUT[1] (got {p:#06X})"
         );
     }
 
