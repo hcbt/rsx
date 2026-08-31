@@ -56,6 +56,7 @@ pub struct Cdrom {
     last_lba: u32,
     data_sector: Vec<u8>,
     pad_byte: u8,
+    fifo_loaded: bool,
     filter_file: u8,
     filter_channel: u8,
     want_data: bool,
@@ -106,6 +107,7 @@ impl Cdrom {
             last_lba: 0,
             data_sector: Vec::new(),
             pad_byte: 0,
+            fifo_loaded: false,
             filter_file: 0,
             filter_channel: 0,
             want_data: false,
@@ -257,6 +259,7 @@ impl Cdrom {
                 } else {
                     self.fifo.clear();
                     self.fifo_i = 0;
+                    self.fifo_loaded = false;
                     self.status &= !(1 << 6);
                 }
             }
@@ -707,7 +710,8 @@ impl Cdrom {
         self.fifo.clear();
         self.fifo.extend_from_slice(&self.data_sector);
         self.fifo_i = 0;
-        if !self.fifo.is_empty() {
+        self.fifo_loaded = !self.fifo.is_empty();
+        if self.fifo_loaded {
             self.status |= 1 << 6;
         } else {
             self.status &= !(1 << 6);
@@ -746,7 +750,7 @@ impl Cdrom {
                 }
             }
             b
-        } else if !self.data_sector.is_empty() {
+        } else if self.fifo_loaded {
             self.pad_byte
         } else {
             0
@@ -1463,6 +1467,15 @@ mod tests {
         send(&mut cd, &mut irq, 0x13, &[]);
         pump(&mut cd, &mut irq, 0xC4E1);
         assert_eq!(hintsts(&mut cd, &mut irq), 3, "GetTN INT3");
+        let _ = cd.read8(1);
+        ack_irq(&mut cd, &mut irq);
+        assert_eq!(
+            cd.read8(1),
+            0,
+            "IRQ ack must empty unread response bytes (GetTN is 3 bytes)"
+        );
+        send(&mut cd, &mut irq, 0x13, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
         let tn = result_bytes(&mut cd, 3);
         assert_eq!(&tn[1..], &[0x01, 0x01], "single-track disc first=last=01h");
         ack_irq(&mut cd, &mut irq);
@@ -1470,12 +1483,6 @@ mod tests {
         pump(&mut cd, &mut irq, 0xC4E1);
         assert_eq!(hintsts(&mut cd, &mut irq), 3, "GetTD INT3");
         assert_eq!(&result_bytes(&mut cd, 3)[1..], &[0x00, 0x02]);
-        ack_irq(&mut cd, &mut irq);
-        send(&mut cd, &mut irq, 0x01, &[]);
-        pump(&mut cd, &mut irq, 0xC4E1);
-        let _ = cd.read8(1);
-        ack_irq(&mut cd, &mut irq);
-        assert_eq!(cd.read8(1), 0, "response FIFO is emptied on IRQ ack");
     }
 
     #[test]
@@ -1499,6 +1506,12 @@ mod tests {
         pump(&mut cd, &mut irq, 0xC4E1);
         ack_irq(&mut cd, &mut irq);
         pump(&mut cd, &mut irq, 2_000_000);
+        cd.write8(0, 0, &mut irq);
+        assert_eq!(
+            cd.read8(2),
+            0,
+            "without Want Data the data port is 0, not the pad byte"
+        );
         want_data(&mut cd, &mut irq);
         for _ in 0..0x800 {
             let _ = cd.read8(2);
@@ -1507,6 +1520,13 @@ mod tests {
             cd.read8(2),
             0xA5,
             "past 800h the data FIFO repeats the byte at 800h-8"
+        );
+        cd.write8(0, 0, &mut irq);
+        cd.write8(3, 0, &mut irq);
+        assert_eq!(
+            cd.read8(2),
+            0,
+            "clearing BFRD must not keep returning the pad byte"
         );
     }
 }
