@@ -165,6 +165,10 @@ impl Machine {
         self.bus.dma().chcr(ch)
     }
 
+    pub fn dma_madr(&self, ch: usize) -> u32 {
+        self.bus.dma().madr(ch)
+    }
+
     pub fn write_queue_len(&self) -> usize {
         self.bus.write_queue_len()
     }
@@ -1060,6 +1064,92 @@ mod tests {
         );
     }
 
+    fn dump_crash_nsf(m: &Machine, tag: &str) {
+        let (ox, oy, x1, y1, x2, y2) = m.draw_env();
+        let cd = m.cd_view();
+        let pages = m.ram_word(0x8005_CFBC);
+        let mut tagged = 0u32;
+        let mut kseg = 0u32;
+        let mut sample = [0u32; 8];
+        if pages & 0xFF00_0000 == 0x8000_0000 {
+            for i in 0..256u32 {
+                let w = m.ram_word(pages.wrapping_add(i * 4));
+                if i < 8 {
+                    sample[i as usize] = w;
+                }
+                if w & 1 != 0 {
+                    tagged += 1;
+                } else if w & 0xFF00_0000 == 0x8000_0000 {
+                    kseg += 1;
+                }
+            }
+        }
+        eprintln!(
+            "nsf {tag} v={} pc={:08X} clip=({x1},{y1})-({x2},{y2}) ofs=({ox},{oy}) chcr3={:08X} cd lba={} read={} fifo={} mode={:02X} last={:02X} pend={:?} 587C={:08X} dest={:08X} bcrw={:08X} remain={:08X} 589C={:08X} CFA8={:08X} CFAC={:08X} desc={:08X} type={:08X} DCE08={:08X} 12CE08={:08X} 12CE18={:08X} pages={pages:08X} tagged={tagged} kseg={kseg} p0..7={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} 55C0={:08X} 58C8={:08X} 58D0={:08X} 58D4={:08X} 58D8={:08X} dma3madr={:08X}",
+            m.vblank_count(),
+            m.pc(),
+            m.dma_chcr(3),
+            cd.lba,
+            u8::from(cd.reading),
+            cd.fifo_bytes,
+            cd.mode,
+            cd.last_cmd,
+            cd.pending_cycles,
+            m.ram_word(0x8005_587C),
+            m.ram_word(0x8005_588C),
+            m.ram_word(0x8005_5894),
+            m.ram_word(0x8005_5898),
+            m.ram_word(0x8005_589C),
+            m.ram_word(0x8005_CFA8),
+            m.ram_word(0x8005_CFAC),
+            m.ram_word(m.ram_word(0x8005_CFAC)),
+            m.ram_word(m.ram_word(0x8005_CFAC).wrapping_add(4)),
+            m.ram_word(0x800D_CE08),
+            m.ram_word(0x8012_CE08),
+            m.ram_word(0x8012_CE18),
+            sample[0],
+            sample[1],
+            sample[2],
+            sample[3],
+            sample[4],
+            sample[5],
+            sample[6],
+            sample[7],
+            m.ram_word(0x8005_55C0),
+            m.ram_word(0x8005_58C8),
+            m.ram_word(0x8005_58D0),
+            m.ram_word(0x8005_58D4),
+            m.ram_word(0x8005_58D8),
+            m.dma_madr(3),
+        );
+        let nfiles = m.ram_word(0x8005_C550);
+        eprint!("  files={nfiles}");
+        for i in 0..nfiles.min(24) {
+            let rec = 0x8005_C554u32.wrapping_add(i.wrapping_mul(44));
+            eprint!(
+                " [{i}] ty={:04X} +10={:04X} p={:08X}",
+                m.ram_word(rec.wrapping_add(4)) & 0xFFFF,
+                m.ram_word(rec.wrapping_add(8)) >> 16,
+                m.ram_word(rec.wrapping_add(0x28)),
+            );
+        }
+        eprintln!();
+        if m.ram_word(0x8005_C8C4) != 0 {
+            eprint!("  desc C8C4");
+            for i in 0..11u32 {
+                eprint!(" {:08X}", m.ram_word(0x8005_C8C4 + i * 4));
+            }
+            eprintln!();
+        }
+        if m.ram_word(0x8005_C790) != 0 {
+            eprint!("  desc C790");
+            for i in 0..11u32 {
+                eprint!(" {:08X}", m.ram_word(0x8005_C790 + i * 4));
+            }
+            eprintln!();
+        }
+    }
+
     #[test]
     fn crash_airship_cinema_is_on_display_when_present() {
         let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
@@ -1071,7 +1161,12 @@ mod tests {
         }
         let mut m = Machine::from_bios_path(&bios).unwrap();
         m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(4000);
+        dump_crash_nsf(&m, "title");
+        m.run_until_vblank_count(5000);
+        dump_crash_nsf(&m, "loading");
         m.run_until_vblank_count(5100);
+        dump_crash_nsf(&m, "cinema");
         assert!(
             m.exception_log()
                 .iter()
@@ -1089,6 +1184,31 @@ mod tests {
         assert!(
             lit > 10_000,
             "Cortex airship cinema must be on the Display area by vblank 5100 (lit={lit} pc={:08X})",
+            m.pc()
+        );
+        for n in [5200, 5300, 5500, 5700, 5900] {
+            m.run_until_vblank_count(n);
+            dump_crash_nsf(&m, &format!("v{n}"));
+        }
+        m.run_until_vblank_count(11000);
+        assert!(
+            m.exception_log()
+                .iter()
+                .all(|e| e.0 != cop0::EXC_ADEL && e.0 != cop0::EXC_ADES),
+            "zone NSF page-in after cinema must not AdEL (exc={:?} pc={:08X})",
+            m.exception_log(),
+            m.pc()
+        );
+        let (ox, oy, x1, y1, x2, y2) = m.draw_env();
+        assert!(
+            x2 > x1 && y2 - y1 > 32,
+            "draw clip must stay a real rectangle after cinema (clip=({x1},{y1})-({x2},{y2}) ofs=({ox},{oy}) pc={:08X})",
+            m.pc()
+        );
+        assert_ne!(
+            m.pc() & 0x1FFF_FFFF,
+            0xA0,
+            "attract must not stick in A(40h) (pc={:08X})",
             m.pc()
         );
     }

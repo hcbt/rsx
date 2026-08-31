@@ -105,6 +105,10 @@ impl Dma {
         self.chcr.get(ch).copied().unwrap_or(0)
     }
 
+    pub fn madr(&self, ch: usize) -> u32 {
+        self.madr.get(ch).copied().unwrap_or(0)
+    }
+
     pub fn gpu_from_ram(&self) -> bool {
         match &self.jobs[2] {
             Some(Job::List { .. }) => true,
@@ -181,6 +185,10 @@ impl Dma {
             let Some(ch) = self.ready_ch(gpu) else {
                 break;
             };
+            if ch == 3 && !cdrom.drq() {
+                cycles -= 1;
+                continue;
+            }
             if self.hyper[ch] {
                 self.hyper[ch] = false;
                 cycles -= 1;
@@ -525,7 +533,12 @@ impl Dma {
     }
 
     fn bump_madr(&mut self, ch: usize, addr: u32, done: bool) {
-        self.madr[ch] = addr & 0x00FF_FFFF;
+        // SPX: SyncMode=0 leaves MADR at the start address unless chopping.
+        let mode = (self.chcr[ch] >> 9) & 3;
+        let chop = self.chcr[ch] & (1 << 8) != 0;
+        if mode != 0 || chop {
+            self.madr[ch] = addr & 0x00FF_FFFF;
+        }
         if done {
             self.jobs[ch] = None;
         }
@@ -914,6 +927,7 @@ mod tests {
             &mut cdrom,
             &mut irq,
         );
+        cdrom.test_fill_fifo(&0xAABB_CCDDu32.to_le_bytes());
         dma.write32(
             0x1F80_10B8,
             0x1100_0000,
@@ -1012,6 +1026,7 @@ mod tests {
             &mut irq,
         );
         poke(&mut ram, 0x3000, 0xDEAD_BEEF);
+        cdrom.test_fill_fifo(&0xAABB_CCDDu32.to_le_bytes());
         dma.write32(
             0x1F80_10A0,
             0x4000,
@@ -1057,6 +1072,7 @@ mod tests {
             &mut cdrom,
             &mut irq,
         );
+        cdrom.test_fill_fifo(&0xAABB_CCDDu32.to_le_bytes());
         dma.write32(
             0x1F80_10B8,
             0x1100_0000,
@@ -1413,6 +1429,74 @@ mod tests {
         );
         assert_eq!(peek(&ram, 0x2000), 0xAABB_CCDD);
         assert_eq!(peek(&ram, 0x2004), 0x1122_3344);
+    }
+
+    #[test]
+    fn cd_dma_stalls_until_want_data_loads_the_fifo() {
+        let mut dma = Dma::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let mut gpu = Gpu::new();
+        let mut spu = Spu::new();
+        let mut cdrom = Cdrom::new();
+        let mut irq = Irq::new();
+        poke(&mut ram, 0x3000, 0xDEAD_BEEF);
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B0,
+            0x3000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B4,
+            2,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_10B8,
+            0x1100_0000,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.tick(4096, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        assert_ne!(
+            dma.read32(0x1F80_10B8) & (1 << 24),
+            0,
+            "SPX: CD DMA waits on DRQSTS when Want Data has not loaded the FIFO"
+        );
+        assert_eq!(peek(&ram, 0x3000), 0xDEAD_BEEF);
+        cdrom.test_fill_fifo(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        dma.tick(4096, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        assert_eq!(
+            dma.read32(0x1F80_10B8) & (1 << 24),
+            0,
+            "CD DMA completes once BFRD has loaded the sector"
+        );
+        assert_eq!(peek(&ram, 0x3000), 0x4433_2211);
+        assert_eq!(peek(&ram, 0x3004), 0x8877_6655);
+        assert_eq!(
+            dma.read32(0x1F80_10B0) & 0x00FF_FFFF,
+            0x3000,
+            "SPX: SyncMode=0 leaves MADR at the start address"
+        );
     }
 
     #[test]

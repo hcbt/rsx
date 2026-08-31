@@ -1351,6 +1351,19 @@ impl Cdrom {
             | (u32::from(self.pop_fifo()) << 16)
             | (u32::from(self.pop_fifo()) << 24)
     }
+
+    /// SPX DRQSTS: data FIFO has a sector (BFRD loaded), including pad bytes
+    /// after the 800h/924h payload. Empty when Want Data is clear.
+    pub fn drq(&self) -> bool {
+        self.fifo_loaded
+    }
+
+    #[cfg(test)]
+    pub fn test_fill_fifo(&mut self, bytes: &[u8]) {
+        self.data_sector = bytes.to_vec();
+        self.want_data = true;
+        self.load_data_fifo();
+    }
 }
 
 fn bcd(v: u8) -> u32 {
