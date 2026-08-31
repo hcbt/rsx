@@ -79,6 +79,7 @@ pub struct Cdrom {
     skip: i32,
     play_ready: bool,
     play_sectors: u32,
+    session_fail: u8,
 }
 
 enum PendingWhat {
@@ -150,6 +151,7 @@ impl Cdrom {
             skip: 0,
             play_ready: false,
             play_sectors: 0,
+            session_fail: 0,
         }
     }
 
@@ -269,6 +271,12 @@ impl Cdrom {
         if self.smen && irqn == 3 {
             self.irq_flag |= 0x10;
             self.smen = false;
+        }
+        if irqn == 5 && self.session_fail > 0 {
+            self.session_fail -= 1;
+            if self.session_fail > 0 {
+                self.queue.push_back((5, vec![0x06, 0x40]));
+            }
         }
         self.status |= 1 << 5; // result ready
         self.status &= !(1 << 7); // not busy
@@ -854,6 +862,7 @@ impl Cdrom {
             return (Some((0xC4E1, 5, vec![0x03, 0x10])), None);
         }
         if s > 1 {
+            self.session_fail = 2;
             let stat = self.controller_stat();
             return (
                 Some((0xC4E1, 3, vec![stat])),
@@ -2355,6 +2364,13 @@ mod tests {
         assert_eq!(hintsts(&mut cd, &mut irq), 5, "bad session INT5");
         assert_eq!(result_bytes(&mut cd, 2)[1], 0x40);
         ack_irq(&mut cd, &mut irq);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            5,
+            "SetSession 02h on a single-session disc is twice INT5(06h,40h)"
+        );
+        assert_eq!(result_bytes(&mut cd, 2), vec![0x06, 0x40]);
+        ack_irq(&mut cd, &mut irq);
         send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x10]);
         pump(&mut cd, &mut irq, 0xC4E1);
         ack_irq(&mut cd, &mut irq);
@@ -2469,6 +2485,11 @@ mod tests {
             vec![0x01, 0x01],
             "licensed disc SCEx counters"
         );
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x19, &[0xFF]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        assert_eq!(hintsts(&mut cd, &mut irq), 5, "unknown Test 19h is INT5");
+        assert_eq!(result_bytes(&mut cd, 2), vec![0x11, 0x10]);
     }
 
     #[test]

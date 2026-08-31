@@ -1342,6 +1342,59 @@ mod tests {
             0,
             "DMA0 CHCR bit 28 clears when the transfer begins"
         );
+        poke_ram(&mut ram, 0x1080, 0x99AA_BBCC);
+        dma.write32(
+            0x1F80_10F0,
+            0xFFFF_FFFF,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_1080,
+            0x1080,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_1084,
+            64,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        dma.write32(
+            0x1F80_1088,
+            0x1100_0201,
+            &mut ram,
+            &mut gpu,
+            &mut spu,
+            &mut cdrom,
+            &mut irq,
+        );
+        assert_eq!(
+            dma.read32(0x1F80_1088) & (1 << 28),
+            0,
+            "DMA0 CHCR bit 28 clears on begin, before any tick"
+        );
+        assert_ne!(
+            dma.read32(0x1F80_1088) & (1 << 24),
+            0,
+            "DMA0 CHCR bit 24 stays set until the copy finishes"
+        );
+        dma.tick(128, &mut ram, &mut gpu, &mut spu, &mut cdrom, &mut irq);
+        assert_eq!(
+            dma.read32(0x1F80_1088) & (1 << 24),
+            0,
+            "DMA0 CHCR bit 24 clears when the 64-word copy finishes"
+        );
         run_ch(
             &mut dma,
             1,

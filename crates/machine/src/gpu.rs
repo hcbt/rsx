@@ -2191,9 +2191,13 @@ mod tests {
     }
 
     fn draw_4bpp_dot(gpu: &mut Gpu, clut_y: u32) {
+        draw_4bpp_at(gpu, 8, 8, clut_y);
+    }
+
+    fn draw_4bpp_at(gpu: &mut Gpu, x: i32, y: i32, clut_y: u32) {
         gpu.gp0(0xE1 << 24);
         gpu.gp0(0x65 << 24 | 0x808080);
-        gpu.gp0(xy(8, 8));
+        gpu.gp0(xy(x, y));
         gpu.gp0((clut_y << 6) << 16);
         gpu.gp0(1 | (1 << 16));
         settle(gpu);
@@ -2233,6 +2237,41 @@ mod tests {
             peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF,
             0x03E0,
             "GP0(01h) discards CLUT cache so the new VRAM palette is sampled"
+        );
+    }
+
+    #[test]
+    fn gp0_01h_discards_texture_cache_fill_does_not() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        draw_4bpp_dot(&mut gpu, 480);
+        assert_eq!(peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF, 0x001F);
+        gpu.gp0(0x02 << 24);
+        gpu.gp0(0);
+        gpu.gp0(16 | (16 << 16));
+        settle(&mut gpu);
+        draw_4bpp_dot(&mut gpu, 480);
+        assert_eq!(
+            peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF,
+            0x001F,
+            "Fill does not discard texture cache; draw still samples the old texel"
+        );
+        gpu.gp0(0x01 << 24);
+        settle(&mut gpu);
+        draw_4bpp_at(&mut gpu, 16, 16, 480);
+        assert_eq!(
+            peek(&mut gpu, 16, 16, 1, 1).pixels[0] & 0x7FFF,
+            0,
+            "GP0(01h) discards texture cache so the Fill-black VRAM is sampled"
         );
     }
 
