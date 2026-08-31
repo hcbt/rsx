@@ -506,6 +506,43 @@ mod tests {
     }
 
     #[test]
+    fn irq_on_cop2cmd_executes_gte_then_epc_points_at_it() {
+        // SPX: IRQ during a GTE command still runs the command; EPC points at it
+        // so the BIOS skip (EPC+4) yields one execution. Skipping the command
+        // before the handler makes Crash drop RTPS/NCLIP and break geometry.
+        let bios = bios_with_program(&[
+            0x3C08_4040, // lui t0, 0x4040     CU2|BEV
+            0x3508_0100, // ori t0, t0, 0x0100 IM bit8, IEC=0
+            0x4088_6000, // mtc0 t0, sr
+            0x2409_0100, // addiu t1, zero, 0x100
+            0x4089_6800, // mtc0 t1, cause     software IRQ pending
+            0x2408_0004, // addiu t0, zero, 4
+            0x4888_4800, // mtc2 t0, IR1
+            0x0000_0000, // nop
+            0x0000_0000, // nop
+            0x3C08_4040, // lui t0, 0x4040
+            0x3508_0101, // ori t0, t0, 0x0101 IEC on
+            0x4088_6000, // mtc0 t0, sr
+            0x4A00_0028, // cop2 SQR           IRQ sampled here
+            0x240A_00FF, // addiu t2, zero, 0xFF must not run
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..13 {
+            m.step();
+        }
+        let (code, pc, _) = m.last_exception().expect("IRQ must fire on the cop2cmd");
+        assert_eq!(code, cop0::EXC_INT, "EXC_INT");
+        assert_eq!(pc, 0xBFC0_0030, "EPC is the cop2cmd, not the next opcode");
+        assert_eq!(
+            m.gte_op_counts()[0x28],
+            1,
+            "SQR must run once before the handler (BIOS will skip it on return)"
+        );
+        assert_eq!(m.gpr(10), 0, "the opcode after cop2cmd must not execute");
+        assert_eq!(m.pc(), 0xBFC0_0180, "BEV=1 general exception vector");
+    }
+
+    #[test]
     fn addi_overflow_takes_the_ovf_exception() {
         // ADDI of 1 onto 0x7FFFFFFF must trap (EXC_OVF), not leave the dest stale.
         let bios = bios_with_program(&[
@@ -1019,6 +1056,39 @@ mod tests {
         assert!(
             black > 200_000,
             "licensed screen is still black (black={black} pc={:08X})",
+            m.pc()
+        );
+    }
+
+    #[test]
+    fn crash_airship_cinema_is_on_display_when_present() {
+        let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../roms/Crash Bandicoot (USA)/Crash Bandicoot (USA).cue");
+        if !bios.exists() || !disc.exists() {
+            eprintln!("skipping: no local BIOS or Disc");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&bios).unwrap();
+        m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(5100);
+        assert!(
+            m.exception_log()
+                .iter()
+                .all(|e| e.0 != cop0::EXC_ADEL && e.0 != cop0::EXC_ADES),
+            "airship cinema must not AdEL/AdES (exc={:?} pc={:08X})",
+            m.exception_log(),
+            m.pc()
+        );
+        let lit = m
+            .display_area()
+            .pixels
+            .iter()
+            .filter(|p| **p & 0x7FFF != 0)
+            .count();
+        assert!(
+            lit > 10_000,
+            "Cortex airship cinema must be on the Display area by vblank 5100 (lit={lit} pc={:08X})",
             m.pc()
         );
     }

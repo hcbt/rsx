@@ -501,7 +501,7 @@ impl Dma {
     }
 
     fn otc_word(&mut self, ram: &mut [u8]) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr,
                 remaining,
@@ -519,15 +519,20 @@ impl Dma {
             write32(ram, *addr, next);
             *addr = (*addr as i32).wrapping_add(*step) as u32 & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
+        self.bump_madr(6, addr, done);
+    }
+
+    fn bump_madr(&mut self, ch: usize, addr: u32, done: bool) {
+        self.madr[ch] = addr & 0x00FF_FFFF;
         if done {
-            self.jobs[6] = None;
+            self.jobs[ch] = None;
         }
     }
 
     fn mdec_in_word(&mut self, ram: &[u8]) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr, remaining, ..
             }) = self.jobs[0].as_mut()
@@ -539,15 +544,13 @@ impl Dma {
             self.mdec_out.push_back(w);
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
-        if done {
-            self.jobs[0] = None;
-        }
+        self.bump_madr(0, addr, done);
     }
 
     fn mdec_out_word(&mut self, ram: &mut [u8]) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr, remaining, ..
             }) = self.jobs[1].as_mut()
@@ -558,15 +561,13 @@ impl Dma {
             write32(ram, *addr, w);
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
-        if done {
-            self.jobs[1] = None;
-        }
+        self.bump_madr(1, addr, done);
     }
 
     fn pio_word(&mut self, ram: &mut [u8]) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr,
                 remaining,
@@ -586,33 +587,30 @@ impl Dma {
             }
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
-        if done {
-            self.jobs[5] = None;
-        }
+        self.bump_madr(5, addr, done);
     }
 
     fn cd_word(&mut self, ram: &mut [u8], cdrom: &mut Cdrom) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr, remaining, ..
             }) = self.jobs[3].as_mut()
             else {
                 return;
             };
-            write32(ram, *addr, cdrom.dma_read32());
+            let w = cdrom.dma_read32();
+            write32(ram, *addr, w);
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
-        if done {
-            self.jobs[3] = None;
-        }
+        self.bump_madr(3, addr, done);
     }
 
     fn spu_word(&mut self, ram: &mut [u8], spu: &mut Spu) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr,
                 remaining,
@@ -629,15 +627,13 @@ impl Dma {
             }
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
-        if done {
-            self.jobs[4] = None;
-        }
+        self.bump_madr(4, addr, done);
     }
 
     fn gpu_block_word(&mut self, ram: &mut [u8], gpu: &mut Gpu) {
-        let done = {
+        let (done, addr) = {
             let Some(Job::Block {
                 addr,
                 remaining,
@@ -654,11 +650,9 @@ impl Dma {
             }
             *addr = addr.wrapping_add(4) & 0x1F_FFFF;
             *remaining -= 1;
-            *remaining == 0
+            (*remaining == 0, *addr)
         };
-        if done {
-            self.jobs[2] = None;
-        }
+        self.bump_madr(2, addr, done);
     }
 
     fn finish(&mut self, ch: usize, irq: &mut Irq) {
@@ -1341,6 +1335,11 @@ mod tests {
             dma.read32(0x1F80_1088) & (1 << 28),
             0,
             "DMA0 CHCR bit 28 clears when the transfer begins"
+        );
+        assert_eq!(
+            dma.read32(0x1F80_1080) & 0x00FF_FFFF,
+            0x1008,
+            "SPX: MADR walks with the transfer (start+2 words)"
         );
         poke_ram(&mut ram, 0x1080, 0x99AA_BBCC);
         dma.write32(

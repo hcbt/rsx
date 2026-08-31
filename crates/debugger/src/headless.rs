@@ -209,6 +209,20 @@ fn write_sample(
         wall0.elapsed(),
     );
     writeln!(out, "{}", Sample::from_machine(machine, pace).line())?;
+    let log = machine.exception_log();
+    if !log.is_empty() {
+        write!(out, "  exc")?;
+        for (code, pc, ra) in log {
+            write!(out, " {code:02X}@{pc:08X} ra={ra:08X}")?;
+        }
+        writeln!(
+            out,
+            " last={:?} badvaddr={:08X} sr={:08X}",
+            machine.last_exception(),
+            machine.badvaddr(),
+            machine.sr()
+        )?;
+    }
     out.flush()
 }
 

@@ -211,11 +211,6 @@ impl Cpu {
 
         self.cop0.set_ip_hw(bus.irq().pending_for_cop0());
         let irq = self.cop0.iec() && (self.cop0.cause & self.cop0.sr & 0xFF00) != 0;
-        if irq && !self.in_delay {
-            self.exception(bus, cop0::EXC_INT, 0);
-            bus.tick(1);
-            return;
-        }
 
         if self.current_pc & 3 != 0 {
             self.cop0.badvaddr = self.current_pc;
@@ -233,6 +228,26 @@ impl Cpu {
                 return;
             }
         };
+
+        // SPX: IRQ on a GTE command still executes it; EPC points at the cop2cmd
+        // so the BIOS skip (EPC+4) yields one run. Taking INT before the command
+        // makes the handler skip a GTE op that never ran (Crash geometry).
+        if irq && !self.in_delay {
+            if instr & 0xFE00_0000 == 0x4A00_0000 {
+                let incoming = self.pending_load.take();
+                self.incoming_load = incoming;
+                self.last_write = None;
+                self.decode_execute(bus, instr);
+                if let Some((reg, val)) = incoming {
+                    if self.last_write != Some(reg) && reg != 0 {
+                        self.gpr[reg as usize] = val;
+                    }
+                }
+            }
+            self.exception(bus, cop0::EXC_INT, 0);
+            bus.tick(fetch_c.max(1));
+            return;
+        }
 
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
@@ -309,10 +324,6 @@ impl Cpu {
         let bd = self.in_delay;
         if bd {
             epc = epc.wrapping_sub(4);
-        }
-        if code == cop0::EXC_INT {
-            let instr = 0; // skip GTE-on-IRQ handled at decode if needed
-            let _ = instr;
         }
         let handler = self.cop0.enter_exception(epc, code, bd, ce);
         self.pc = handler;

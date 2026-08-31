@@ -99,6 +99,27 @@ pub fn capture_at_vblanks(
         let (ox, oy, x1, y1, x2, y2) = machine.draw_env();
         let (n30, px0, px1, py0, py1, nout) = machine.last_gouraud_tri_stats();
         let (cn, cx0, cx1, cy0, cy1) = machine.gouraud_tri_stats();
+        let exc: Vec<String> = machine
+            .exception_log()
+            .iter()
+            .map(|(code, pc, ra)| format!("{code:02X}@{pc:08X} ra={ra:08X}"))
+            .collect();
+        eprintln!(
+            "  exc=[{}] last={:?} badvaddr={:08X} sr={:08X} pc={:08X}",
+            exc.join(" "),
+            machine.last_exception(),
+            machine.badvaddr(),
+            machine.sr(),
+            machine.pc(),
+        );
+        for (code, pc, ra) in machine.exception_log() {
+            eprintln!(
+                "  exc-insn {code:02X} @{pc:08X} ra={ra:08X} [-4]={:08X} [0]={:08X} [+4]={:08X}",
+                machine.ram_word(pc.wrapping_sub(4)),
+                machine.ram_word(*pc),
+                machine.ram_word(pc.wrapping_add(4)),
+            );
+        }
         eprintln!(
             "captured {} {}x{} display=({dx},{dy}) {dw}x{dh} on={on} ofs=({ox},{oy}) clip=({x1},{y1})-({x2},{y2}) hash={:016x} last30 n={n30} out={nout} xy=({px0},{py0})-({px1},{py1}) now30 n={cn} xy=({cx0},{cy0})-({cx1},{cy1}) GTE H={:#x} OFX={:#x} OFY={:#x} ZSF3={:#x}",
             path.display(),
