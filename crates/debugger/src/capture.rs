@@ -105,13 +105,34 @@ pub fn capture_at_vblanks(
             .map(|(code, pc, ra)| format!("{code:02X}@{pc:08X} ra={ra:08X}"))
             .collect();
         eprintln!(
-            "  exc=[{}] last={:?} badvaddr={:08X} sr={:08X} pc={:08X}",
+            "  exc=[{}] last={:?} badvaddr={:08X} sr={:08X} pc={:08X} v0={:08X} a0={:08X} s0={:08X} s2={:08X} s3={:08X} nsf_table={:08X}",
             exc.join(" "),
             machine.last_exception(),
             machine.badvaddr(),
             machine.sr(),
             machine.pc(),
+            machine.gpr(2),
+            machine.gpr(4),
+            machine.gpr(16),
+            machine.gpr(18),
+            machine.gpr(19),
+            machine.ram_word(0x8005_C530),
         );
+        let nsf_hash = machine.ram_word(0x8005_C530);
+        let nsf_pages = machine.ram_word(0x8005_CFBC);
+        let nsf_files = machine.ram_word(0x8005_C550);
+        eprintln!(
+            "  ram nsf_hash={nsf_hash:08X} nsf_pages={nsf_pages:08X} nsf_files={nsf_files:08X}"
+        );
+        if nsf_pages & 0xFF00_0000 == 0x8000_0000 {
+            eprintln!(
+                "  ram pages[0..3]={:08X} {:08X} {:08X} {:08X}",
+                machine.ram_word(nsf_pages),
+                machine.ram_word(nsf_pages.wrapping_add(4)),
+                machine.ram_word(nsf_pages.wrapping_add(8)),
+                machine.ram_word(nsf_pages.wrapping_add(12)),
+            );
+        }
         for (code, pc, ra) in machine.exception_log() {
             eprintln!(
                 "  exc-insn {code:02X} @{pc:08X} ra={ra:08X} [-4]={:08X} [0]={:08X} [+4]={:08X}",
