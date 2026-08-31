@@ -36,6 +36,8 @@ pub struct CdromView {
 /// 33.8688 MHz / 75 sectors/s (1×). Mode bit 7 selects 2×.
 const CYCLES_PER_SECTOR_1X: u32 = 451_584;
 const SEEK_CYCLES: u32 = 451_584;
+/// SPX: a handful of sectors; stall rather than drop the locked front.
+const SECTOR_BUF: usize = 8;
 
 /// CD-ROM controller: status, GetID, and sector reads.
 pub struct Cdrom {
@@ -69,6 +71,7 @@ pub struct Cdrom {
     header_valid: bool,
     last_lba: u32,
     data_sector: Vec<u8>,
+    sector_buf: VecDeque<(u32, Vec<u8>)>,
     pad_byte: u8,
     fifo_loaded: bool,
     filter_file: u8,
@@ -142,6 +145,7 @@ impl Cdrom {
             header_valid: false,
             last_lba: 0,
             data_sector: Vec::new(),
+            sector_buf: VecDeque::new(),
             pad_byte: 0,
             fifo_loaded: false,
             filter_file: 0,
@@ -297,12 +301,44 @@ impl Cdrom {
         self.status |= 1 << 5; // result ready
         self.status &= !(1 << 7); // not busy
         if irqn == 1 && !self.playing {
-            self.capture_data_sector();
+            if let Some((sec_lba, data)) = self.sector_buf.pop_front() {
+                self.last_lba = sec_lba;
+                self.data_sector = data;
+                self.sync_pad_byte();
+            } else {
+                self.capture_data_sector();
+            }
             if self.want_data {
                 self.load_data_fifo();
             }
+            self.arm_next_int1();
         }
         self.update_irq_line(irq);
+    }
+
+    fn fifo_busy(&self) -> bool {
+        self.fifo_loaded && self.fifo_i < self.fifo.len()
+    }
+
+    fn arm_next_int1(&mut self) {
+        if self.reading && !self.playing && self.pending.is_none() {
+            self.pending = Some(Pending {
+                cycles: self.sector_cycles(),
+                what: PendingWhat::Irq {
+                    irq: 1,
+                    result: vec![self.controller_stat()],
+                },
+                second: None,
+            });
+        }
+    }
+
+    fn clear_sector_buf(&mut self) {
+        self.sector_buf.clear();
+        self.fifo.clear();
+        self.fifo_i = 0;
+        self.fifo_loaded = false;
+        self.status &= !(1 << 6);
     }
 
     fn pop_queue(&mut self, irq: &mut Irq) {
@@ -537,6 +573,7 @@ impl Cdrom {
                 self.reading = false;
                 self.seeking = false;
                 self.playing = false;
+                self.clear_sector_buf();
                 self.skip = 0;
                 self.motor = false;
                 let stat = self.controller_stat();
@@ -556,6 +593,7 @@ impl Cdrom {
                 self.reading = false;
                 self.seeking = false;
                 self.playing = false;
+                self.clear_sector_buf();
                 self.skip = 0;
                 let stat = self.controller_stat();
                 (
@@ -947,6 +985,7 @@ impl Cdrom {
         self.seeking = true;
         self.reading = false;
         self.playing = false;
+        self.clear_sector_buf();
         self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
         let stat = self.controller_stat();
         (
@@ -1160,6 +1199,7 @@ impl Cdrom {
         self.setloc_pending = false;
         self.seeking = true;
         self.reading = false;
+        self.clear_sector_buf();
         self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
         let stat = self.controller_stat();
         (
@@ -1188,6 +1228,7 @@ impl Cdrom {
             self.setloc_pending = false;
             self.seeking = true;
             self.reading = false;
+            self.clear_sector_buf();
             self.lba = msf_to_lba(self.loc.0, self.loc.1, self.loc.2);
             let stat = self.controller_stat();
             (
@@ -1198,6 +1239,7 @@ impl Cdrom {
             (Some((0xC4E1, 3, vec![self.controller_stat()])), None)
         } else {
             self.reading = true;
+            self.clear_sector_buf();
             self.lba = self.last_lba;
             let stat = self.controller_stat();
             (
@@ -1271,6 +1313,16 @@ impl Cdrom {
             }
             return;
         }
+        // Locked FIFO: buffer at 1×/2×, no extra INT1. INT3 still queues.
+        if self.fifo_busy() && self.irq_flag & 7 == 0 && self.sector_buf.len() < SECTOR_BUF {
+            self.extra_capture();
+            self.arm_next_int1();
+            return;
+        }
+        if self.fifo_busy() || self.irq_flag & 7 == 1 {
+            self.arm_next_int1();
+            return;
+        }
         self.push_or_deliver(1, vec![self.controller_stat()], irq);
     }
 
@@ -1309,22 +1361,13 @@ impl Cdrom {
         });
     }
 
-    fn capture_data_sector(&mut self) {
-        let Some(disc) = self.disc.as_ref() else {
-            self.reading = false;
-            self.data_sector.clear();
-            return;
-        };
+    fn take_disc_sector(&mut self) -> Option<(u32, Vec<u8>)> {
+        let disc = self.disc.as_ref()?;
         if self.lba >= disc.sector_count() {
             self.reading = false;
-            self.data_sector.clear();
-            return;
+            return None;
         }
-        let Some(raw) = disc.sector(self.lba) else {
-            self.reading = false;
-            self.data_sector.clear();
-            return;
-        };
+        let raw = disc.sector(self.lba)?;
         if raw.len() >= 20 {
             self.header.copy_from_slice(&raw[12..20]);
             self.header_valid = true;
@@ -1335,16 +1378,35 @@ impl Cdrom {
             (24, 0x800)
         };
         let end = (start + len).min(raw.len());
-        self.data_sector.clear();
-        self.data_sector.extend_from_slice(&raw[start..end]);
+        let data = raw[start..end].to_vec();
+        let sec_lba = self.lba;
+        self.lba += 1;
+        Some((sec_lba, data))
+    }
+
+    fn sync_pad_byte(&mut self) {
         let pad_i = if self.mode & 0x20 != 0 {
             0x924 - 4
         } else {
             0x800 - 8
         };
         self.pad_byte = self.data_sector.get(pad_i).copied().unwrap_or(0);
-        self.last_lba = self.lba;
-        self.lba += 1;
+    }
+
+    fn capture_data_sector(&mut self) {
+        let Some((sec_lba, data)) = self.take_disc_sector() else {
+            self.data_sector.clear();
+            return;
+        };
+        self.last_lba = sec_lba;
+        self.data_sector = data;
+        self.sync_pad_byte();
+    }
+
+    fn extra_capture(&mut self) {
+        if let Some(pair) = self.take_disc_sector() {
+            self.sector_buf.push_back(pair);
+        }
     }
 
     fn load_data_fifo(&mut self) {
@@ -1379,15 +1441,20 @@ impl Cdrom {
             self.fifo_i += 1;
             if self.fifo_i >= self.fifo.len() {
                 self.status &= !(1 << 6);
-                if self.reading && self.pending.is_none() {
-                    self.pending = Some(Pending {
-                        cycles: self.sector_cycles(),
-                        what: PendingWhat::Irq {
-                            irq: 1,
-                            result: vec![self.controller_stat()],
-                        },
-                        second: None,
-                    });
+                if self.reading && !self.playing {
+                    if self.sector_buf.is_empty() {
+                        // Empty ring: next INT1 is a full sector from drain.
+                        self.pending = Some(Pending {
+                            cycles: self.sector_cycles(),
+                            what: PendingWhat::Irq {
+                                irq: 1,
+                                result: vec![self.controller_stat()],
+                            },
+                            second: None,
+                        });
+                    } else if self.pending.is_none() {
+                        self.arm_next_int1();
+                    }
                 }
             }
             b
@@ -1414,6 +1481,7 @@ impl Cdrom {
     #[cfg(test)]
     pub fn test_fill_fifo(&mut self, bytes: &[u8]) {
         self.data_sector = bytes.to_vec();
+        self.sector_buf.clear();
         self.want_data = true;
         self.load_data_fifo();
     }
@@ -1645,6 +1713,85 @@ mod tests {
         assert!(
             s.contains("Licens"),
             "unread sector must stay in the FIFO ({s:?})"
+        );
+    }
+
+    #[test]
+    fn readn_fifo_stays_locked_while_dma_and_sector_clock_buffers_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        let lic = b"          Licensed  by          Sony Computer Entertainment Amer  ica";
+        bin[SECTOR_LEN * 4 + 24..SECTOR_LEN * 4 + 24 + lic.len()].copy_from_slice(lic);
+        bin[SECTOR_LEN * 5 + 24..SECTOR_LEN * 5 + 24 + 8].copy_from_slice(b"NEXTSECT");
+        std::fs::write(dir.path().join("game.bin"), &bin).unwrap();
+        let cue = dir.path().join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        let disc = load_disc(&cue).unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(disc);
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0x80]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        ack_irq(&mut cd, &mut irq);
+        want_data(&mut cd, &mut irq);
+        let mut head = Vec::new();
+        for _ in 0..16 {
+            head.push(cd.read8(2));
+        }
+        assert!(
+            String::from_utf8_lossy(&head).contains("Licens"),
+            "DMA started on the first sector ({head:?})"
+        );
+        pump(&mut cd, &mut irq, 300_000);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            0,
+            "no extra INT1 while the FIFO is still being read (DMA in progress)"
+        );
+        let mut more = Vec::new();
+        for _ in 0..16 {
+            more.push(cd.read8(2));
+        }
+        assert!(
+            String::from_utf8_lossy(&more).contains("ed  by"),
+            "locked FIFO must not be replaced mid-DMA ({more:?})"
+        );
+        assert!(
+            !String::from_utf8_lossy(&more).contains("NEXTSECT"),
+            "must not skip to the next sector while DMA holds the FIFO ({more:?})"
+        );
+        for _ in 32..0x800 {
+            let _ = cd.read8(2);
+        }
+        // Less than a fresh 2× sector (225792) from drain, but enough for the
+        // leftover sector-clock that ran during the locked DMA.
+        pump(&mut cd, &mut irq, 200_000);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            1,
+            "SPX: sector clock buffered the next sector; INT1 after the locked FIFO drains"
+        );
+        want_data(&mut cd, &mut irq);
+        let mut second = Vec::new();
+        for _ in 0..8 {
+            second.push(cd.read8(2));
+        }
+        assert!(
+            String::from_utf8_lossy(&second).contains("NEXTSECT"),
+            "buffered sector is the next one ({second:?})"
         );
     }
 
