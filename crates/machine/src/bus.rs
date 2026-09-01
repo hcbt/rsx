@@ -236,11 +236,16 @@ impl Bus {
 
     /// ADR 0011: GPU draw occupancy is only visible as GPUSTAT.26/28. A
     /// GPUSTAT load skips that run up to the next scanline (so GPUSTAT.31
-    /// and vblank still edge).
+    /// and vblank still edge). `tick` would otherwise consume skip_hint
+    /// (~1.9 lines) across two scanlines.
     fn skip_gpu_draw_occupancy(&mut self) {
-        if self.gpu.draw_remaining() > 0 {
-            self.tick(self.skip_hint());
+        let draw = self.gpu.draw_remaining();
+        if draw == 0 {
+            return;
         }
+        let to_line = (CYCLES_PER_LINE - (self.cycles % CYCLES_PER_LINE)) as u32;
+        let n = self.skip_hint().min(to_line.max(1)).min(draw);
+        self.tick(n);
     }
 
     pub fn tick(&mut self, mut cycles: u32) {
@@ -713,6 +718,59 @@ mod tests {
         assert_eq!(
             after, 0,
             "one GPUSTAT load skips the remaining occupancy, not one cycle"
+        );
+    }
+
+    #[test]
+    fn gpustat_read_does_not_skip_past_the_next_scanline() {
+        // ADR 0011: GPUSTAT.31 and vblank are observable. skip_hint is 4096
+        // (~1.9 lines); tick() would consume that across two scanlines.
+        let mut b = bus();
+        b.write32(0x1F80_1810, 0xE3_0000_00);
+        b.write32(0x1F80_1810, 0xE4_0000_00 | 1023 | (511 << 10));
+        b.write32(0x1F80_1810, 0x60 << 24 | 0x00F800);
+        b.write32(0x1F80_1810, 0);
+        b.write32(0x1F80_1810, 80 | (80 << 16));
+        b.tick(8);
+        let busy = b.gpu().draw_remaining();
+        assert!(
+            busy > 4096,
+            "80×80 occupancy must exceed two scanlines (busy={busy})"
+        );
+        let pos = b.cycles() % CYCLES_PER_LINE;
+        let to_line = (CYCLES_PER_LINE - pos) as u32;
+        assert!(
+            to_line > 100,
+            "need headroom on this scanline to park 100 cycles before the edge"
+        );
+        b.tick(to_line - 100);
+        let remain = (CYCLES_PER_LINE - (b.cycles() % CYCLES_PER_LINE)) as u32;
+        assert!(
+            remain > 0 && remain <= 100,
+            "must sit just before the next scanline (remain={remain})"
+        );
+        let v0 = b.vblank_count();
+        let bit31 = b.gpu().stat() >> 31;
+        let c0 = b.cycles();
+        let after_stat = b.read32(0x1F80_1814).unwrap();
+        let dt = b.cycles() - c0;
+        assert!(
+            dt <= u64::from(remain),
+            "GPUSTAT skip must stop at the next scanline (dt={dt} remain={remain})"
+        );
+        assert!(
+            dt >= 1 && b.gpu().draw_remaining() < busy,
+            "must still skip the occupancy that fits in this line"
+        );
+        assert_eq!(
+            b.vblank_count(),
+            v0,
+            "one GPUSTAT load must not fire vblank by crossing two lines"
+        );
+        assert_ne!(
+            after_stat >> 31,
+            bit31,
+            "240p GPUSTAT.31 must toggle once (one line), not twice (XOR 0)"
         );
     }
 }

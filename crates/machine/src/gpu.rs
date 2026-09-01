@@ -837,6 +837,7 @@ impl Gpu {
         // edge of a clockwise mesh.
         let max_vx = a.0.max(b.0).max(c.0);
         let max_vy = a.1.max(b.1).max(c.1);
+        let x_end = max_vx.min(self.draw_x2.saturating_add(1));
         let dw0dx = b.1 - c.1;
         let dw1dx = c.1 - a.1;
         let dw2dx = a.1 - b.1;
@@ -904,7 +905,7 @@ impl Gpu {
                 let mut g_num = row_g;
                 let mut b_num = row_b;
                 let mut x = minx;
-                while x < max_vx && !inside(w0, w1, w2, area) {
+                while x < x_end && !inside(w0, w1, w2, area) {
                     w0 += dw0dx;
                     w1 += dw1dx;
                     w2 += dw2dx;
@@ -915,7 +916,7 @@ impl Gpu {
                     b_num += db_dx;
                     x += 1;
                 }
-                while x < max_vx && inside(w0, w1, w2, area) {
+                while x < x_end && inside(w0, w1, w2, area) {
                     let color = if let Some(c) = const_color {
                         c
                     } else if textured {
@@ -1944,6 +1945,30 @@ mod tests {
         assert!(
             lit > 8,
             "offset then trunc11 must land the triangle at x≈936 (lit={lit})"
+        );
+    }
+
+    #[test]
+    fn triangle_does_not_plot_past_drawing_area_x() {
+        // Drawing area X2 is inclusive. tri() walks x < max_vx and put_drawn
+        // does not clip, so a wide triangle must still stop at draw_x2.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 8, 40);
+        offset(&mut gpu, 0, 0);
+        gpu.gp0(0x20 << 24 | 0x0000F8);
+        gpu.gp0(xy(0, 0));
+        gpu.gp0(xy(80, 0));
+        gpu.gp0(xy(0, 40));
+        let inside = peek(&mut gpu, 1, 1, 7, 8);
+        let outside = peek(&mut gpu, 9, 1, 8, 8);
+        assert!(
+            red_count(&inside.pixels) > 8,
+            "pixels at x<=draw_x2 must still plot"
+        );
+        assert_eq!(
+            red_count(&outside.pixels),
+            0,
+            "x > draw_x2 must not be written (VRAM wrap / unclipped span)"
         );
     }
 
