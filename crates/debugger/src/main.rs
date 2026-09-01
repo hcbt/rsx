@@ -26,6 +26,8 @@ struct Debugger {
     pace: Option<clock::HostPace>,
     pace_log_at: Instant,
     pace_was_behind: bool,
+    /// Guest vblank last uploaded to the wgpu texture (ADR 0004).
+    uploaded_vblank: u64,
 }
 
 impl Debugger {
@@ -47,6 +49,7 @@ impl Debugger {
             pace: None,
             pace_log_at: Instant::now(),
             pace_was_behind: false,
+            uploaded_vblank: u64::MAX,
         };
         match audio::Output::start() {
             Ok(o) => d.audio = Some(o),
@@ -127,17 +130,27 @@ impl eframe::App for Debugger {
                     self.clock = Some((Instant::now(), m.cycles()));
                 }
                 let (t0, c0) = self.clock.unwrap();
-                let elapsed = t0.elapsed();
-                match clock::pace(m.cycles(), c0, elapsed) {
-                    clock::Pace::Run => {
-                        m.run_until_cycle(clock::target_cycles(c0, elapsed));
-                        let pcm = m.take_audio();
-                        if let Some(a) = self.audio.as_ref() {
-                            a.push(&pcm);
+                let slice0 = Instant::now();
+                // Same policy as `clock::run_slice` (present budget vs Wait).
+                let p = loop {
+                    let elapsed = t0.elapsed();
+                    match clock::pace(m.cycles(), c0, elapsed) {
+                        clock::Pace::Wait(wait) => break clock::Pace::Wait(wait),
+                        clock::Pace::Run => {
+                            if slice0.elapsed() >= clock::RUN_SLICE {
+                                break clock::Pace::Run;
+                            }
+                            m.run_until_cycle(clock::target_cycles(c0, elapsed));
                         }
-                        ctx.request_repaint();
                     }
-                    clock::Pace::Wait(wait) => ctx.request_repaint_after(wait),
+                };
+                let pcm = m.take_audio();
+                if let Some(a) = self.audio.as_ref() {
+                    a.push(&pcm);
+                }
+                match p {
+                    clock::Pace::Run => ctx.request_repaint(),
+                    clock::Pace::Wait(wait) => ctx.request_repaint_after(clock::present_wait(wait)),
                 }
             }
             self.note_pace();
@@ -239,21 +252,28 @@ impl eframe::App for Debugger {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Display area");
             if let Some(m) = self.machine.as_ref() {
-                let area = m.display_area();
-                let image = area_to_color_image(&area);
-                let tex = self.texture.get_or_insert_with(|| {
-                    ctx.load_texture("display", image.clone(), Default::default())
-                });
-                tex.set(image, Default::default());
+                let v = m.vblank_count();
+                if clock::display_needs_present(self.uploaded_vblank, v) || self.texture.is_none() {
+                    let area = m.display_area();
+                    let image = area_to_color_image(&area);
+                    let tex = self.texture.get_or_insert_with(|| {
+                        ctx.load_texture("display", image.clone(), Default::default())
+                    });
+                    tex.set(image, Default::default());
+                    self.uploaded_vblank = v;
+                }
+                let (_, _, area_w, area_h, _) = m.display_origin();
                 let avail = ui.available_size();
-                let aspect = area.width as f32 / area.height.max(1) as f32;
+                let aspect = area_w.max(1) as f32 / area_h.max(1) as f32;
                 let mut w = avail.x;
                 let mut h = w / aspect;
                 if h > avail.y {
                     h = avail.y;
                     w = h * aspect;
                 }
-                ui.image((tex.id(), egui::vec2(w.max(1.0), h.max(1.0))));
+                if let Some(tex) = self.texture.as_ref() {
+                    ui.image((tex.id(), egui::vec2(w.max(1.0), h.max(1.0))));
+                }
             }
         });
     }

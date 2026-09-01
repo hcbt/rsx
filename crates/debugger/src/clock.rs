@@ -95,6 +95,56 @@ pub fn pace(guest_cycles: u64, origin_cycles: u64, elapsed: Duration) -> Pace {
     }
 }
 
+/// Host time spent on one Debugger present. ADR 0004 copies the Display area
+/// once per guest vblank; a tight egui spin must not starve `run_until_cycle`.
+pub const RUN_SLICE: Duration = Duration::from_millis(32);
+
+/// Floor for `request_repaint_after` when the guest is at/ahead of wall.
+/// `pace` waits one SPU sample (~23 µs); waking egui that often rebuilds the
+/// UI at tens of kHz and starves the Machine (Spyro title 89–94%).
+pub fn present_wait(wait: Duration) -> Duration {
+    let vblank_ns = (rsx_machine::CYCLES_PER_LINE * u64::from(rsx_machine::LINES_PER_FRAME))
+        * 1_000_000_000
+        / CPU_HZ;
+    let min = Duration::from_nanos(vblank_ns);
+    if wait < min {
+        min
+    } else {
+        wait
+    }
+}
+
+/// Copy the Display area into the wgpu texture only when the guest vblank
+/// advanced (ADR 0004).
+pub fn display_needs_present(uploaded_vblank: u64, guest_vblank: u64) -> bool {
+    guest_vblank != uploaded_vblank
+}
+
+/// Run the guest until it is at/ahead of wall or `budget` of host time in
+/// `run_to` has elapsed. A present slice that returns after one tiny `Run`
+/// starves catch-up (Spyro title ~121% headless becomes 89–94% windowed).
+pub fn run_slice(
+    origin_cycles: u64,
+    mut wall: impl FnMut() -> Duration,
+    mut guest_cycles: impl FnMut() -> u64,
+    budget: Duration,
+    mut host_dt: impl FnMut() -> Duration,
+    mut run_to: impl FnMut(u64),
+) -> Pace {
+    loop {
+        let p = pace(guest_cycles(), origin_cycles, wall());
+        match p {
+            Pace::Wait(_) => return p,
+            Pace::Run => {
+                if host_dt() >= budget {
+                    return Pace::Run;
+                }
+                run_to(target_cycles(origin_cycles, wall()));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +206,69 @@ mod tests {
     #[test]
     fn measure_rejects_zero_elapsed() {
         assert!(measure(CPU_HZ, 60, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn present_wait_is_at_least_one_vblank_not_one_spu_sample() {
+        let sample = sample_period();
+        let w = present_wait(sample);
+        assert!(
+            w >= Duration::from_millis(15),
+            "egui must not wake every SPU sample ({sample:?} → {w:?})"
+        );
+        let long = Duration::from_millis(50);
+        assert_eq!(present_wait(long), long);
+    }
+
+    #[test]
+    fn display_needs_present_only_when_vblank_advanced() {
+        assert!(!display_needs_present(12, 12));
+        assert!(display_needs_present(12, 13));
+        assert!(display_needs_present(0, 1));
+    }
+
+    #[test]
+    fn run_slice_stops_at_wait_when_guest_catches_wall() {
+        let guest = std::cell::Cell::new(0u64);
+        let wall = Duration::from_millis(10);
+        let p = run_slice(
+            0,
+            || wall,
+            || guest.get(),
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            |target| guest.set(target),
+        );
+        assert!(
+            matches!(p, Pace::Wait(_)),
+            "one catch-up to the wall must Wait, not spin Run"
+        );
+        assert!(guest.get() >= target_cycles(0, wall));
+    }
+
+    #[test]
+    fn run_slice_keeps_running_until_budget_when_still_behind() {
+        let guest = std::cell::Cell::new(0u64);
+        let host = std::cell::Cell::new(Duration::ZERO);
+        let steps = std::cell::Cell::new(0u32);
+        let wall = Duration::from_secs(1);
+        let p = run_slice(
+            0,
+            || wall,
+            || guest.get(),
+            Duration::from_millis(5),
+            || host.get(),
+            |_target| {
+                guest.set(guest.get() + 1);
+                steps.set(steps.get() + 1);
+                host.set(host.get() + Duration::from_millis(1));
+            },
+        );
+        assert_eq!(p, Pace::Run, "still behind after the present budget");
+        assert!(
+            steps.get() >= 5,
+            "must keep calling run_to until budget, not once (steps={})",
+            steps.get()
+        );
     }
 }
