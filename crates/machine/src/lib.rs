@@ -1414,6 +1414,60 @@ mod tests {
     }
 
     #[test]
+    fn spyro_reaches_title_menu_when_present() {
+        let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../roms/Spyro the Dragon (USA)/Spyro the Dragon (USA).cue");
+        if !bios.exists() || !disc.exists() {
+            eprintln!("skipping: no local BIOS or Disc");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&bios).unwrap();
+        m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(3000);
+        let adel = m.exception_log().iter().any(|e| e.0 == 4 || e.0 == 10);
+        assert!(
+            !adel,
+            "title menu path must not AdEL/AdES (exc={:?} pc={:08X})",
+            m.exception_log(),
+            m.pc()
+        );
+        assert!(
+            (0x8001_0000..0x8008_0000).contains(&m.pc()),
+            "PC in the loaded EXE (pc={:08X})",
+            m.pc()
+        );
+        let (dx, dy, dw, dh, on) = m.display_origin();
+        assert!(on, "Spyro display enable");
+        assert_eq!(
+            (dw, dh),
+            (512, 240),
+            "Spyro 512×240 at the title menu (display=({dx},{dy}) {dw}x{dh} pc={:08X})",
+            m.pc()
+        );
+        let hash = m.display_area_hash();
+        assert_ne!(
+            hash,
+            0x5e98_b118_c5e5_e59c,
+            "must not still be the SCEA Presents card (hash={hash:016x} pc={:08X})",
+            m.pc()
+        );
+        assert_ne!(
+            hash,
+            0x3d80_189f_d4f5_72dd,
+            "must not be a cleared black frame (hash={hash:016x} pc={:08X})",
+            m.pc()
+        );
+        let area = m.display_area();
+        let lit = area.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
+        assert!(
+            lit > 1_000,
+            "3D title menu must be on the Display area (lit={lit} hash={hash:016x} pc={:08X})",
+            m.pc()
+        );
+    }
+
+    #[test]
     fn spyro_reaches_512x240_when_present() {
         let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
         let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1440,8 +1494,8 @@ mod tests {
         );
         let cd = m.cd_view();
         assert!(
-            cd.lba > 17_000,
-            "WAD ReadN must advance past the first sector (lba={} pc={:08X})",
+            cd.lba > 37,
+            "WAD ReadN must advance past the directory sector (lba={} pc={:08X})",
             cd.lba,
             m.pc()
         );

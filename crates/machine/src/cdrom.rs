@@ -420,10 +420,15 @@ impl Cdrom {
                 if value & 0x20 != 0 {
                     self.smen = true;
                 }
-                self.want_data = value & 0x80 != 0;
-                if self.want_data {
+                let want = value & 0x80 != 0;
+                if want && !self.want_data {
+                    // SPX: BFRD 0→1 loads the locked sector from index 0.
+                    // Writing 1 while already 1 must not rewind: CdRead peeks
+                    // 12 header bytes then DMA 800h of the rest (user data).
+                    self.want_data = true;
                     self.load_data_fifo();
-                } else {
+                } else if !want {
+                    self.want_data = false;
                     self.fifo.clear();
                     self.fifo_i = 0;
                     self.fifo_loaded = false;
@@ -1834,13 +1839,116 @@ mod tests {
             "SPX: leftover 924h bytes must not block the next INT1"
         );
         want_data(&mut cd, &mut irq);
-        let mut second = Vec::new();
-        for _ in 0..8 {
-            second.push(cd.read8(2));
+        let w = cd.dma_read32();
+        assert_eq!(
+            &w.to_le_bytes(),
+            b"SECT",
+            "next 924h INT1 DMA is the following sector ({:?})",
+            w.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn bfrd_already_set_does_not_rewind_the_924h_fifo() {
+        // SPX BFRD 0→1 loads index 0. CdRead peeks 12 header bytes, then
+        // writes BFRD=1 again and DMA 800h — that must continue at the user
+        // payload, not reload MM:SS:FF onto dest[0].
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        let sec = SECTOR_LEN * 4;
+        bin[sec + 12..sec + 16].copy_from_slice(&[0x00, 0x02, 0x04, 0x02]);
+        bin[sec + 24..sec + 32].copy_from_slice(b"USERDATA");
+        std::fs::write(dir.path().join("game.bin"), &bin).unwrap();
+        let cue = dir.path().join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(load_disc(&cue).unwrap());
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0xA0]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        want_data(&mut cd, &mut irq);
+        let mut head = Vec::new();
+        for _ in 0..12 {
+            head.push(cd.read8(2));
         }
-        assert!(
-            String::from_utf8_lossy(&second).contains("SECTORB!"),
-            "next 924h INT1 is the following sector ({second:?})"
+        assert_eq!(
+            &head[..4],
+            &[0x00, 0x02, 0x04, 0x02],
+            "peek is MM:SS:FF ({head:?})"
+        );
+        want_data(&mut cd, &mut irq);
+        let w = cd.dma_read32();
+        assert_eq!(
+            &w.to_le_bytes(),
+            b"USER",
+            "second BFRD=1 must not rewind onto the header ({:?})",
+            w.to_le_bytes()
+        );
+        for _ in 4..0x800 {
+            let _ = cd.read8(2);
+        }
+        assert_eq!(
+            cd.view().fifo_bytes,
+            0x118,
+            "12-byte peek + 800h DMA leaves 280 of 924h"
+        );
+    }
+
+    #[test]
+    fn form2_924h_fifo_leads_with_the_sector_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        let sec = SECTOR_LEN * 4;
+        bin[sec + 12..sec + 16].copy_from_slice(&[0x00, 0x02, 0x04, 0x02]);
+        bin[sec + 18] = 0x20; // MODE2 Form2
+        bin[sec + 22] = 0x20;
+        bin[sec + 24..sec + 32].copy_from_slice(b"FORM2DAT");
+        std::fs::write(dir.path().join("game.bin"), &bin).unwrap();
+        let cue = dir.path().join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(load_disc(&cue).unwrap());
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0xA0]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        want_data(&mut cd, &mut irq);
+        let mut head = Vec::new();
+        for _ in 0..16 {
+            head.push(cd.read8(2));
+        }
+        assert_eq!(
+            &head[..4],
+            &[0x00, 0x02, 0x04, 0x02],
+            "Form2 924h starts at MM:SS:FF ({head:?})"
+        );
+        assert_eq!(
+            &head[12..16],
+            b"FORM",
+            "Form2 user follows the 12-byte header ({head:?})"
         );
     }
 
