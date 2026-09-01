@@ -120,6 +120,13 @@ pub fn display_needs_present(uploaded_vblank: u64, guest_vblank: u64) -> bool {
     guest_vblank != uploaded_vblank
 }
 
+/// GPR / I/O log rebuild while `Pace::Run` (behind) starves the next
+/// `run_until_cycle` slice. Spyro title is ~99% headless; that inspect
+/// paint is the windowed drop.
+pub fn inspect_needs_paint(pace: Pace) -> bool {
+    !matches!(pace, Pace::Run)
+}
+
 /// Run the guest until it is at/ahead of wall or `budget` of host time in
 /// `run_to` has elapsed. A present slice that returns after one tiny `Run`
 /// starves catch-up (Spyro title ~121% headless becomes 89–94% windowed).
@@ -225,6 +232,15 @@ mod tests {
         assert!(!display_needs_present(12, 12));
         assert!(display_needs_present(12, 13));
         assert!(display_needs_present(0, 1));
+    }
+
+    #[test]
+    fn inspect_ui_is_skipped_while_behind() {
+        assert!(
+            !inspect_needs_paint(Pace::Run),
+            "32 GPR labels + log must not rebuild on a catch-up slice"
+        );
+        assert!(inspect_needs_paint(Pace::Wait(Duration::from_millis(16))));
     }
 
     #[test]

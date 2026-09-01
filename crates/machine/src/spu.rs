@@ -456,7 +456,7 @@ impl Spu {
     }
 
     fn voice_sample(&mut self, i: usize) -> i32 {
-        if !self.voices[i].started {
+        if !self.voices[i].started || self.voices[i].phase == Phase::Off {
             return 0;
         }
         let pitch = u32::from(self.regs[i * 8 + 2]).min(0x4000);

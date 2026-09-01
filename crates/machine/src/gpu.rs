@@ -1400,16 +1400,34 @@ impl Gpu {
             self.crt.resize((w * h) as usize, 0);
         }
         for y in 0..h {
-            let row = (y * w) as usize;
-            for x in 0..w {
-                self.crt[row + x as usize] = if self.disp_24 {
-                    self.read_24(self.display_x + x, self.display_y + y)
-                } else {
-                    self.read_half(self.display_x + x, self.display_y + y)
-                };
-            }
+            self.copy_display_line(y, (y * w) as usize, w);
         }
         self.crt_line = u32::MAX;
+    }
+
+    fn copy_display_line(&mut self, y: u32, row: usize, w: u32) {
+        if self.disp_24 {
+            for x in 0..w {
+                let p = self.read_24(self.display_x + x, self.display_y + y);
+                self.crt[row + x as usize] = p;
+            }
+            return;
+        }
+        let vx = self.display_x;
+        let vy = self.display_y + y;
+        if self.vram_2m && vy >= 512 {
+            self.crt[row..row + w as usize].fill(0x7FFF);
+            return;
+        }
+        if vx + w <= VRAM_W as u32 && vy < VRAM_H as u32 {
+            let start = (vy as usize) * VRAM_W + vx as usize;
+            self.crt[row..row + w as usize].copy_from_slice(&self.vram[start..start + w as usize]);
+            return;
+        }
+        for x in 0..w {
+            let p = self.read_half(vx + x, vy);
+            self.crt[row + x as usize] = p;
+        }
     }
 
     pub fn tick(&mut self, cycles: u32, line: u32, vblank: bool) {
@@ -1442,14 +1460,7 @@ impl Gpu {
             // 480i is latched whole at vblank. Line-by-line even/odd weave of two
             // poses is what the live Display area was showing as combing.
             if h < 480 && line < h {
-                let row = (line * w) as usize;
-                for x in 0..w {
-                    self.crt[row + x as usize] = if self.disp_24 {
-                        self.read_24(self.display_x + x, self.display_y + line)
-                    } else {
-                        self.read_half(self.display_x + x, self.display_y + line)
-                    };
-                }
+                self.copy_display_line(line, (line * w) as usize, w);
             }
             self.crt_line = line;
         }

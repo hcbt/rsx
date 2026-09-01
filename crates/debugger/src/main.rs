@@ -124,6 +124,7 @@ impl Debugger {
 
 impl eframe::App for Debugger {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut paint_inspect = true;
         if self.running {
             if let Some(m) = self.machine.as_mut() {
                 if self.clock.is_none() {
@@ -148,6 +149,7 @@ impl eframe::App for Debugger {
                 if let Some(a) = self.audio.as_ref() {
                     a.push(&pcm);
                 }
+                paint_inspect = clock::inspect_needs_paint(p);
                 match p {
                     clock::Pace::Run => ctx.request_repaint(),
                     clock::Pace::Wait(wait) => ctx.request_repaint_after(clock::present_wait(wait)),
@@ -191,63 +193,65 @@ impl eframe::App for Debugger {
             }
         });
 
-        egui::SidePanel::left("regs")
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.heading("CPU");
-                if let Some(m) = self.machine.as_ref() {
-                    ui.monospace(format!("PC {:08X}", m.pc()));
-                    ui.monospace(format!("GPUSTAT {:08X}", m.gpustat()));
-                    ui.monospace(format!("vblank {}", m.vblank_count()));
-                    match self.pace {
-                        Some(p) => {
-                            let color = if p.behind() {
-                                egui::Color32::RED
-                            } else {
-                                ui.visuals().text_color()
-                            };
-                            ui.colored_label(
-                                color,
-                                format!(
-                                    "clock {:.2} / {:.2} MHz  {:.0}%",
-                                    p.hz / 1_000_000.0,
-                                    CPU_HZ as f64 / 1_000_000.0,
-                                    p.of_crystal * 100.0
-                                ),
-                            );
-                            ui.colored_label(
-                                color,
-                                format!(
-                                    "fps   {:.1} / {:.2}     {:.0}%",
-                                    p.fps,
-                                    ntsc_vblank_hz(),
-                                    p.of_ntsc * 100.0
-                                ),
-                            );
+        if paint_inspect {
+            egui::SidePanel::left("regs")
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.heading("CPU");
+                    if let Some(m) = self.machine.as_ref() {
+                        ui.monospace(format!("PC {:08X}", m.pc()));
+                        ui.monospace(format!("GPUSTAT {:08X}", m.gpustat()));
+                        ui.monospace(format!("vblank {}", m.vblank_count()));
+                        match self.pace {
+                            Some(p) => {
+                                let color = if p.behind() {
+                                    egui::Color32::RED
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                ui.colored_label(
+                                    color,
+                                    format!(
+                                        "clock {:.2} / {:.2} MHz  {:.0}%",
+                                        p.hz / 1_000_000.0,
+                                        CPU_HZ as f64 / 1_000_000.0,
+                                        p.of_crystal * 100.0
+                                    ),
+                                );
+                                ui.colored_label(
+                                    color,
+                                    format!(
+                                        "fps   {:.1} / {:.2}     {:.0}%",
+                                        p.fps,
+                                        ntsc_vblank_hz(),
+                                        p.of_ntsc * 100.0
+                                    ),
+                                );
+                            }
+                            None => {
+                                ui.monospace("clock —");
+                                ui.monospace("fps   —");
+                            }
                         }
-                        None => {
-                            ui.monospace("clock —");
-                            ui.monospace("fps   —");
+                        for i in 0..32u8 {
+                            ui.monospace(format!("r{i:02} {:08X}", m.gpr(i)));
                         }
-                    }
-                    for i in 0..32u8 {
-                        ui.monospace(format!("r{i:02} {:08X}", m.gpr(i)));
-                    }
-                } else if let Some(e) = &self.error {
-                    ui.colored_label(egui::Color32::RED, e);
-                }
-            });
-
-        egui::TopBottomPanel::bottom("log")
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.heading("I/O + IRQ log");
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for line in &self.log {
-                        ui.monospace(line);
+                    } else if let Some(e) = &self.error {
+                        ui.colored_label(egui::Color32::RED, e);
                     }
                 });
-            });
+
+            egui::TopBottomPanel::bottom("log")
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.heading("I/O + IRQ log");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for line in &self.log {
+                            ui.monospace(line);
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Display area");
