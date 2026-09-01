@@ -1206,7 +1206,19 @@ impl Gpu {
     }
 
     pub fn dma_write(&mut self, word: u32) {
-        self.gp0(word);
+        // Linked-list DMA is a stream of packet words, not CPU GP0 commands.
+        // GP0(E3h..E5h) execute immediately on a CPU write so they skip the
+        // FIFO; a vertex whose high byte is E3h/E4h/E5h must still enter the
+        // FIFO as a parameter of the command already queued.
+        self.gp0_count += 1;
+        if self.gp0_words.len() < 96 {
+            self.gp0_words.push(word);
+        }
+        while self.fifo.len() >= FIFO_WORDS {
+            self.tick(1, 0, false);
+        }
+        self.fifo.push_back(word);
+        self.update_stat();
     }
 
     /// End of a GP0 DMA stream: run complete commands still in the FIFO, then
@@ -1705,6 +1717,38 @@ mod tests {
 
     fn offset(gpu: &mut Gpu, x: i32, y: i32) {
         gpu.gp0(0xE5 << 24 | (x as u32 & 0x7FF) | ((y as u32 & 0x7FF) << 11));
+    }
+
+    #[test]
+    fn dma_vertex_with_e3_high_byte_is_not_drawing_area() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        // Offset so 11-bit Y 0x500 (−768) lands on screen Y 20. High byte E5h.
+        offset(&mut gpu, 0, 788);
+        settle(&mut gpu);
+        // GP0(28h) quad via DMA2. Second vertex high byte is E5h — a CPU
+        // GP0(E5h) would set drawing offset, but this word is XY.
+        gpu.dma_write(0x28 << 24 | 0x00_FF_00);
+        gpu.dma_write(10 | (0x4F6 << 16));
+        gpu.dma_write(0xE5 << 24 | 40);
+        gpu.dma_write(10 | (0x514 << 16));
+        gpu.dma_write(40 | (0x514 << 16));
+        settle(&mut gpu);
+        assert_eq!(
+            (gpu.draw_x1, gpu.draw_y1, gpu.draw_x2, gpu.draw_y2),
+            (0, 0, 1023, 511),
+            "SPX: a GP0 DMA parameter is not GP0(E3h..E5h) even when bits 24–31 match"
+        );
+        assert_eq!(
+            (gpu.off_x, gpu.off_y),
+            (0, 788),
+            "drawing offset must stay; the E5h-looking word is a vertex"
+        );
+        let pix = peek(&mut gpu, 20, 25, 1, 1).pixels[0] & 0x7FFF;
+        assert_ne!(
+            pix, 0,
+            "the quad must still rasterize using the E5h-looking vertex as XY"
+        );
     }
 
     fn red_count(pixels: &[u16]) -> usize {

@@ -1220,6 +1220,94 @@ mod tests {
         eprintln!();
     }
 
+    fn letterbox_magenta(area: &DisplayArea) -> usize {
+        let w = area.width as usize;
+        let h = area.height as usize;
+        let mut n = 0;
+        for y in (0..12.min(h)).chain(h.saturating_sub(12)..h) {
+            for x in 0..w {
+                let p = area.pixels[y * w + x];
+                let r = p & 0x1F;
+                let g = (p >> 5) & 0x1F;
+                let b = (p >> 10) & 0x1F;
+                if r >= 24 && b >= 24 && g <= 8 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn letterbox_sky(area: &DisplayArea) -> usize {
+        let w = area.width as usize;
+        let h = area.height as usize;
+        let mut n = 0;
+        for y in (0..12.min(h)).chain(h.saturating_sub(12)..h) {
+            for x in 0..w {
+                let p = area.pixels[y * w + x];
+                let r = p & 0x1F;
+                let g = (p >> 5) & 0x1F;
+                let b = (p >> 10) & 0x1F;
+                if b >= 16 && r <= 8 && g <= 12 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn interior_flat_green(area: &DisplayArea) -> usize {
+        let w = area.width as usize;
+        let h = area.height as usize;
+        let y0 = 12.min(h);
+        let y1 = h.saturating_sub(12);
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in 0..w {
+                let p = area.pixels[y * w + x];
+                let r = p & 0x1F;
+                let g = (p >> 5) & 0x1F;
+                let b = (p >> 10) & 0x1F;
+                if g >= 12 && r <= 6 && b <= 6 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn assert_letterbox(m: &Machine, label: &str) {
+        let area = m.display_area();
+        let mag = letterbox_magenta(&area);
+        let sky = letterbox_sky(&area);
+        eprintln!("  letterbox {label} magenta={mag} sky={sky}");
+        assert!(
+            mag < 256,
+            "{label}: letterbox must not be magenta/pink (magenta={mag} pc={:08X})",
+            m.pc()
+        );
+        assert!(
+            sky < 512,
+            "{label}: letterbox must not keep leftover airship sky (sky={sky} pc={:08X})",
+            m.pc()
+        );
+    }
+
+    fn assert_no_covering_green(m: &Machine, label: &str) {
+        let area = m.display_area();
+        let green = interior_flat_green(&area);
+        let interior = area
+            .width
+            .saturating_mul(area.height.saturating_sub(24))
+            .max(1);
+        eprintln!("  picture {label} flat_green={green}/{interior}");
+        assert!(
+            green * 10 < interior as usize,
+            "{label}: interior must not be covering flat-green quads (flat_green={green}/{interior} pc={:08X})",
+            m.pc()
+        );
+    }
+
     #[test]
     fn crash_airship_cinema_is_on_display_when_present() {
         let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
@@ -1256,10 +1344,19 @@ mod tests {
             "Cortex airship cinema must be on the Display area by vblank 5100 (lit={lit} pc={:08X})",
             m.pc()
         );
+        assert_letterbox(&m, "v5100");
         for n in [5200, 5300, 5500, 5700, 5900] {
             m.run_until_vblank_count(n);
             dump_crash_nsf(&m, &format!("v{n}"));
         }
+        assert_letterbox(&m, "v5900");
+        assert_no_covering_green(&m, "v5900");
+        let (ox, oy, x1, y1, x2, y2) = m.draw_env();
+        assert!(
+            x2 > x1 && y2 - y1 > 32,
+            "draw clip must stay a real rectangle at castle interior (clip=({x1},{y1})-({x2},{y2}) ofs=({ox},{oy}) pc={:08X})",
+            m.pc()
+        );
         m.run_until_vblank_count(11000);
         assert!(
             m.exception_log()
@@ -1281,6 +1378,7 @@ mod tests {
             "attract must not stick in A(40h) (pc={:08X})",
             m.pc()
         );
+        assert_letterbox(&m, "v11000");
     }
 
     #[test]
