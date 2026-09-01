@@ -1,10 +1,41 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::DisplayArea;
 
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
 const FIFO_WORDS: usize = 16;
+const TEX_CACHE_BITS: usize = VRAM_W * VRAM_H / 64;
+const TEX_PAGE: usize = 256 * 256;
+const TEX_PAGE_BITS: usize = TEX_PAGE / 64;
+
+/// Sampled-texel cache. Fill does not discard it; GP0(01h) does (SPX).
+/// Dense so a long 3D scene does not grow a HashMap of every unique halfword.
+struct TexCache {
+    data: Vec<u16>,
+    valid: Vec<u64>,
+    page: Vec<u16>,
+    page_valid: Vec<u64>,
+    page_key: u64,
+}
+
+impl TexCache {
+    fn new() -> Self {
+        Self {
+            data: vec![0; VRAM_W * VRAM_H],
+            valid: vec![0; TEX_CACHE_BITS],
+            page: vec![0; TEX_PAGE],
+            page_valid: vec![0; TEX_PAGE_BITS],
+            page_key: u64::MAX,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.valid.fill(0);
+        self.page_valid.fill(0);
+        self.page_key = u64::MAX;
+    }
+}
 
 pub struct Gpu {
     vram: Vec<u16>,
@@ -47,7 +78,7 @@ pub struct Gpu {
     range_y1: u32,
     range_y2: u32,
     vram_2m: bool,
-    tex_cache: HashMap<(u32, u32), u16>,
+    tex_cache: TexCache,
     clut_cache: Option<(u32, u32, [u16; 256])>,
     transfer: Option<Transfer>,
     pub gp0_count: u64,
@@ -150,7 +181,7 @@ impl Gpu {
             range_y1: 0x10,
             range_y2: 0x10 + 240,
             vram_2m: false,
-            tex_cache: HashMap::new(),
+            tex_cache: TexCache::new(),
             clut_cache: None,
             transfer: None,
             gp0_count: 0,
@@ -729,7 +760,7 @@ impl Gpu {
             }
             verts[i] = (x, y, color, u, v);
         }
-        if (cmd >> 24) as u8 == 0x30 {
+        if cfg!(test) && (cmd >> 24) as u8 == 0x30 {
             self.frame_n30 += 1;
             let mut miny = i32::MAX;
             let mut maxy = i32::MIN;
@@ -787,7 +818,6 @@ impl Gpu {
         dither: bool,
     ) {
         let minx = a.0.min(b.0).min(c.0).max(self.draw_x1);
-        let maxx = a.0.max(b.0).max(c.0).min(self.draw_x2);
         let miny = a.1.min(b.1).min(c.1).max(self.draw_y1);
         let maxy = a.1.max(b.1).max(c.1).min(self.draw_y2);
         let area = orient(a.0, a.1, b.0, b.1, c.0, c.1);
@@ -807,67 +837,135 @@ impl Gpu {
         // edge of a clockwise mesh.
         let max_vx = a.0.max(b.0).max(c.0);
         let max_vy = a.1.max(b.1).max(c.1);
+        let dw0dx = b.1 - c.1;
+        let dw1dx = c.1 - a.1;
+        let dw2dx = a.1 - b.1;
+        let dw0dy = c.0 - b.0;
+        let dw1dy = a.0 - c.0;
+        let dw2dy = b.0 - a.0;
+        let mut row_w0 = orient(b.0, b.1, c.0, c.1, minx, miny);
+        let mut row_w1 = orient(c.0, c.1, a.0, a.1, minx, miny);
+        let mut row_w2 = orient(a.0, a.1, b.0, b.1, minx, miny);
+        let flat = a.2 == b.2 && b.2 == c.2;
+        let const_color = if !textured && flat && !dither {
+            Some(rgb888_to_555(
+                a.2 & 0xFF,
+                (a.2 >> 8) & 0xFF,
+                (a.2 >> 16) & 0xFF,
+            ))
+        } else {
+            None
+        };
+        let area64 = i64::from(area);
+        let (au, bu, cu) = (i64::from(a.3), i64::from(b.3), i64::from(c.3));
+        let (av, bv, cv) = (i64::from(a.4), i64::from(b.4), i64::from(c.4));
+        let (ar, br, cr) = (
+            i64::from(a.2 & 0xFF),
+            i64::from(b.2 & 0xFF),
+            i64::from(c.2 & 0xFF),
+        );
+        let (ag, bg, cg) = (
+            i64::from((a.2 >> 8) & 0xFF),
+            i64::from((b.2 >> 8) & 0xFF),
+            i64::from((c.2 >> 8) & 0xFF),
+        );
+        let (ab, bb, cb) = (
+            i64::from((a.2 >> 16) & 0xFF),
+            i64::from((b.2 >> 16) & 0xFF),
+            i64::from((c.2 >> 16) & 0xFF),
+        );
+        let du_dx = i64::from(dw0dx) * au + i64::from(dw1dx) * bu + i64::from(dw2dx) * cu;
+        let dv_dx = i64::from(dw0dx) * av + i64::from(dw1dx) * bv + i64::from(dw2dx) * cv;
+        let dr_dx = i64::from(dw0dx) * ar + i64::from(dw1dx) * br + i64::from(dw2dx) * cr;
+        let dg_dx = i64::from(dw0dx) * ag + i64::from(dw1dx) * bg + i64::from(dw2dx) * cg;
+        let db_dx = i64::from(dw0dx) * ab + i64::from(dw1dx) * bb + i64::from(dw2dx) * cb;
+        let du_dy = i64::from(dw0dy) * au + i64::from(dw1dy) * bu + i64::from(dw2dy) * cu;
+        let dv_dy = i64::from(dw0dy) * av + i64::from(dw1dy) * bv + i64::from(dw2dy) * cv;
+        let dr_dy = i64::from(dw0dy) * ar + i64::from(dw1dy) * br + i64::from(dw2dy) * cr;
+        let dg_dy = i64::from(dw0dy) * ag + i64::from(dw1dy) * bg + i64::from(dw2dy) * cg;
+        let db_dy = i64::from(dw0dy) * ab + i64::from(dw1dy) * bb + i64::from(dw2dy) * cb;
+        let mut row_u = i64::from(row_w0) * au + i64::from(row_w1) * bu + i64::from(row_w2) * cu;
+        let mut row_v = i64::from(row_w0) * av + i64::from(row_w1) * bv + i64::from(row_w2) * cv;
+        let mut row_r = i64::from(row_w0) * ar + i64::from(row_w1) * br + i64::from(row_w2) * cr;
+        let mut row_g = i64::from(row_w0) * ag + i64::from(row_w1) * bg + i64::from(row_w2) * cg;
+        let mut row_b = i64::from(row_w0) * ab + i64::from(row_w1) * bb + i64::from(row_w2) * cb;
+        let cost = if self.plotting { self.plot_cost } else { 0 };
+        let plotting = self.plotting;
+        self.plotting = false;
+        let mut plots = 0u32;
         for y in miny..=maxy {
-            if y >= max_vy {
-                continue;
-            }
-            for x in minx..=maxx {
-                if x >= max_vx {
-                    continue;
+            if y < max_vy {
+                let mut w0 = row_w0;
+                let mut w1 = row_w1;
+                let mut w2 = row_w2;
+                let mut u_num = row_u;
+                let mut v_num = row_v;
+                let mut r_num = row_r;
+                let mut g_num = row_g;
+                let mut b_num = row_b;
+                let mut x = minx;
+                while x < max_vx && !inside(w0, w1, w2, area) {
+                    w0 += dw0dx;
+                    w1 += dw1dx;
+                    w2 += dw2dx;
+                    u_num += du_dx;
+                    v_num += dv_dx;
+                    r_num += dr_dx;
+                    g_num += dg_dx;
+                    b_num += db_dx;
+                    x += 1;
                 }
-                let w0 = orient(b.0, b.1, c.0, c.1, x, y);
-                let w1 = orient(c.0, c.1, a.0, a.1, x, y);
-                let w2 = orient(a.0, a.1, b.0, b.1, x, y);
-                if (w0 != 0 && (w0 ^ area) < 0)
-                    || (w1 != 0 && (w1 ^ area) < 0)
-                    || (w2 != 0 && (w2 ^ area) < 0)
-                {
-                    continue;
-                }
-                let sum = w0 + w1 + w2;
-                if sum == 0 {
-                    continue;
-                }
-                let vr = interp(w0, w1, w2, a.2 & 0xFF, b.2 & 0xFF, c.2 & 0xFF, sum) as u32;
-                let vg = interp(
-                    w0,
-                    w1,
-                    w2,
-                    (a.2 >> 8) & 0xFF,
-                    (b.2 >> 8) & 0xFF,
-                    (c.2 >> 8) & 0xFF,
-                    sum,
-                ) as u32;
-                let vb = interp(
-                    w0,
-                    w1,
-                    w2,
-                    (a.2 >> 16) & 0xFF,
-                    (b.2 >> 16) & 0xFF,
-                    (c.2 >> 16) & 0xFF,
-                    sum,
-                ) as u32;
-                let color = if textured {
-                    let u = (i64::from(w0) * i64::from(a.3)
-                        + i64::from(w1) * i64::from(b.3)
-                        + i64::from(w2) * i64::from(c.3))
-                        / i64::from(sum);
-                    let v = (i64::from(w0) * i64::from(a.4)
-                        + i64::from(w1) * i64::from(b.4)
-                        + i64::from(w2) * i64::from(c.4))
-                        / i64::from(sum);
-                    let tex = self.sample_tex(u as u8, v as u8);
-                    if blend {
-                        blend_texel_dither(tex, vr, vg, vb, x, y, dither)
+                while x < max_vx && inside(w0, w1, w2, area) {
+                    let color = if let Some(c) = const_color {
+                        c
+                    } else if textured {
+                        let tex = self.sample_tex((u_num / area64) as u8, (v_num / area64) as u8);
+                        if blend {
+                            blend_texel_dither(
+                                tex,
+                                (r_num / area64) as u32,
+                                (g_num / area64) as u32,
+                                (b_num / area64) as u32,
+                                x,
+                                y,
+                                dither,
+                            )
+                        } else {
+                            tex
+                        }
                     } else {
-                        tex
-                    }
-                } else {
-                    rgb888_to_555_dither(vr, vg, vb, x, y, dither)
-                };
-                self.plot(x, y, color, textured, semi);
+                        rgb888_to_555_dither(
+                            (r_num / area64) as u32,
+                            (g_num / area64) as u32,
+                            (b_num / area64) as u32,
+                            x,
+                            y,
+                            dither,
+                        )
+                    };
+                    plots += self.put_drawn(x, y, color, textured, semi);
+                    w0 += dw0dx;
+                    w1 += dw1dx;
+                    w2 += dw2dx;
+                    u_num += du_dx;
+                    v_num += dv_dx;
+                    r_num += dr_dx;
+                    g_num += dg_dx;
+                    b_num += db_dx;
+                    x += 1;
+                }
             }
+            row_w0 += dw0dy;
+            row_w1 += dw1dy;
+            row_w2 += dw2dy;
+            row_u += du_dy;
+            row_v += dv_dy;
+            row_r += dr_dy;
+            row_g += dg_dy;
+            row_b += db_dy;
         }
+        self.plotting = plotting;
+        self.draw_busy = self.draw_busy.saturating_add(plots.saturating_mul(cost));
     }
 
     fn line(&mut self) {
@@ -1001,9 +1099,17 @@ impl Gpu {
 
     fn sample_tex(&mut self, u: u8, v: u8) -> u16 {
         let page = self.tex_page;
-        let tx_base = (page & 0xF) * 64;
-        let ty_base = ((page >> 4) & 1) * 256;
-        let mode = (page >> 7) & 3;
+        let key = u64::from(page)
+            | (u64::from(self.clut_x) << 16)
+            | (u64::from(self.clut_y) << 32)
+            | (u64::from(self.tex_win_mask_x & 0x1F) << 41)
+            | (u64::from(self.tex_win_mask_y & 0x1F) << 46)
+            | (u64::from(self.tex_win_off_x & 0x1F) << 51)
+            | (u64::from(self.tex_win_off_y & 0x1F) << 56);
+        if self.tex_cache.page_key != key {
+            self.tex_cache.page_key = key;
+            self.tex_cache.page_valid.fill(0);
+        }
         // SPX: UV = (UV AND NOT (mask*8)) OR ((offset AND mask)*8)
         let mx = !(self.tex_win_mask_x << 3) & 0xFF;
         let my = !(self.tex_win_mask_y << 3) & 0xFF;
@@ -1011,7 +1117,16 @@ impl Gpu {
         let oy = ((self.tex_win_off_y & self.tex_win_mask_y) << 3) & 0xFF;
         let uu = (u32::from(u) & mx) | ox;
         let vv = (u32::from(v) & my) | oy;
-        match mode {
+        let i = (vv as usize) * 256 + uu as usize;
+        let bit = 1u64 << (i & 63);
+        let slot = i >> 6;
+        if self.tex_cache.page_valid[slot] & bit != 0 {
+            return self.tex_cache.page[i];
+        }
+        let tx_base = (page & 0xF) * 64;
+        let ty_base = ((page >> 4) & 1) * 256;
+        let mode = (page >> 7) & 3;
+        let p = match mode {
             0 => {
                 let texel = self.cached_half(tx_base + uu / 4, ty_base + vv);
                 let index = (texel >> ((uu & 3) * 4)) & 0xF;
@@ -1023,7 +1138,10 @@ impl Gpu {
                 self.cached_clut(u32::from(index), true)
             }
             _ => self.read_half(tx_base + uu, ty_base + vv),
-        }
+        };
+        self.tex_cache.page[i] = p;
+        self.tex_cache.page_valid[slot] |= bit;
+        p
     }
 
     fn vertex_xy(&self, word: u32) -> (i32, i32) {
@@ -1036,28 +1154,60 @@ impl Gpu {
         if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
             return;
         }
+        let n = self.put_drawn(x, y, color, textured, semi);
+        if self.plotting {
+            self.draw_busy = self
+                .draw_busy
+                .saturating_add(n.saturating_mul(self.plot_cost));
+        }
+    }
+
+    /// Triangle interior is already clipped. Count occupancy at the caller.
+    fn put_drawn(&mut self, x: i32, y: i32, color: u16, textured: bool, semi: bool) -> u32 {
         if textured && color & 0x7FFF == 0 {
-            return;
+            return 0;
         }
         // SPX: textured semi-trans blends only when the texel STP (bit15) is set.
         let do_semi = semi && (!textured || color & 0x8000 != 0);
         let mut c = color & 0x7FFF;
         if do_semi {
-            let dst = self.read_half(x as u32, y as u32);
-            c = blend_semi(dst, c, (self.tex_page >> 5) & 3);
+            c = blend_semi(
+                self.read_half(x as u32, y as u32),
+                c,
+                (self.tex_page >> 5) & 3,
+            );
         }
         if self.mask_set {
             c |= 0x8000;
         }
-        self.write_half(x as u32, y as u32, c);
+        if self.vram_2m && (y as u32) >= 512 {
+            return 0;
+        }
+        let xi = (x as usize) & (VRAM_W - 1);
+        let yi = (y as usize) & (VRAM_H - 1);
+        let i = yi * VRAM_W + xi;
+        if self.mask_check && self.vram[i] & 0x8000 != 0 {
+            return 0;
+        }
+        self.vram[i] = c;
+        1
     }
 
     fn cached_half(&mut self, x: u32, y: u32) -> u16 {
-        if let Some(&c) = self.tex_cache.get(&(x, y)) {
-            return c;
+        if self.vram_2m && y >= 512 {
+            return 0x7FFF;
         }
-        let p = self.read_half(x, y);
-        self.tex_cache.insert((x, y), p);
+        let xi = (x as usize) & (VRAM_W - 1);
+        let yi = (y as usize) & (VRAM_H - 1);
+        let i = yi * VRAM_W + xi;
+        let bit = 1u64 << (i & 63);
+        let slot = i >> 6;
+        if self.tex_cache.valid[slot] & bit != 0 {
+            return self.tex_cache.data[i];
+        }
+        let p = self.vram[i];
+        self.tex_cache.data[i] = p;
+        self.tex_cache.valid[slot] |= bit;
         p
     }
 
@@ -1315,8 +1465,10 @@ impl Gpu {
             self.last_long30 = self.frame_long30;
             self.last_max_dy = self.frame_max_dy;
             self.last_poly_op = self.frame_poly_op;
-            std::mem::swap(&mut self.last_scatter, &mut self.frame_scatter);
-            self.frame_scatter.fill(0);
+            if cfg!(test) {
+                std::mem::swap(&mut self.last_scatter, &mut self.frame_scatter);
+                self.frame_scatter.fill(0);
+            }
             self.frame_poly_op = [0; 32];
             self.frame_n30 = 0;
             self.frame_n30_out = 0;
@@ -1362,9 +1514,8 @@ fn orient(ax: i32, ay: i32, bx: i32, by: i32, cx: i32, cy: i32) -> i32 {
     (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
 }
 
-fn interp(w0: i32, w1: i32, w2: i32, a: u32, b: u32, c: u32, sum: i32) -> i32 {
-    ((i64::from(w0) * i64::from(a) + i64::from(w1) * i64::from(b) + i64::from(w2) * i64::from(c))
-        / i64::from(sum)) as i32
+fn inside(w0: i32, w1: i32, w2: i32, area: i32) -> bool {
+    !(w0 != 0 && (w0 ^ area) < 0) && !(w1 != 0 && (w1 ^ area) < 0) && !(w2 != 0 && (w2 ^ area) < 0)
 }
 
 fn rgb888_to_555(r: u32, g: u32, b: u32) -> u16 {

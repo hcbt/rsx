@@ -437,10 +437,6 @@ impl Gte {
         self.data[18] = self.data[19];
         self.data[19] = sz;
         let n = unr_divide(self.ctrl[26] as u16, sz as u16, &mut self.ctrl[31]);
-        if n == 0x1FFFF {
-            self.title_explode += 1;
-            self.acc_explode = self.acc_explode.saturating_add(1);
-        }
         let ofx = self.ctrl[24] as i32 as i64;
         let ofy = self.ctrl[25] as i32 as i64;
         let ir1 = self.data[9] as i16 as i64;
@@ -450,64 +446,14 @@ impl Gte {
         let sy_mac = self.mac(0, i64::from(n) * ir2 + ofy);
         let sx = saturate_sx(sx_mac >> 16, &mut self.ctrl[31]);
         let sy = saturate_sy(sy_mac >> 16, &mut self.ctrl[31]);
-        if self.ctrl[26] as u16 == 0x1F4 {
-            self.acc_rtps = self.acc_rtps.saturating_add(1);
-            self.title_ir2_min = self.title_ir2_min.min(ir2 as i32);
-            self.title_ir2_max = self.title_ir2_max.max(ir2 as i32);
-            self.title_vy_min = self.title_vy_min.min(vy);
-            self.title_vy_max = self.title_vy_max.max(vy);
-            let r12 = self.rt_el(0, 1);
-            let r21 = self.rt_el(1, 0);
-            let r22 = self.rt_el(1, 1);
-            let r23 = self.rt_el(1, 2);
-            let r32 = self.rt_el(2, 1);
-            // Crash object R is yaw + 5/8 Y at tgeo 4800 (R00≈4511), not world
-            // identity 5/8 (R00=4096). Idle vblanks only transform the board.
-            let r00 = self.rt_el(0, 0);
-            let object = r12.abs() < 200
-                && r21.abs() < 200
-                && r23.abs() < 200
-                && r32.abs() < 200
-                && r22 < -1000
-                && r00.abs() > 4200;
-            if object {
-                self.acc_obj_n = self.acc_obj_n.saturating_add(1);
-                self.acc_obj_sy_min = self.acc_obj_sy_min.min(sy);
-                self.acc_obj_vy_min = self.acc_obj_vy_min.min(vy);
-                self.acc_obj_vy_max = self.acc_obj_vy_max.max(vy);
-                self.acc_obj_vx_min = self.acc_obj_vx_min.min(vx);
-                self.acc_obj_vx_max = self.acc_obj_vx_max.max(vx);
-                self.acc_obj_vz_min = self.acc_obj_vz_min.min(vz);
-                self.acc_obj_vz_max = self.acc_obj_vz_max.max(vz);
-                if sy >= self.acc_obj_sy_max {
-                    self.acc_obj_sy_max = sy;
-                    self.acc_obj_try = tr[1] as i32;
-                    self.acc_obj_trz = tr[2] as i32;
-                }
+        #[cfg(test)]
+        {
+            if n == 0x1FFFF {
+                self.title_explode += 1;
+                self.acc_explode = self.acc_explode.saturating_add(1);
             }
-            if sy > self.last_hi_sy {
-                let rt = [
-                    self.rt_el(0, 0),
-                    self.rt_el(0, 1),
-                    self.rt_el(0, 2),
-                    self.rt_el(1, 0),
-                    self.rt_el(1, 1),
-                    self.rt_el(1, 2),
-                    self.rt_el(2, 0),
-                    self.rt_el(2, 1),
-                    self.rt_el(2, 2),
-                ];
-                self.last_hi_sy = sy;
-                self.last_hi_ir2 = ir2 as i32;
-                self.last_hi_n = n;
-                self.last_hi_sz = sz;
-                self.last_hi_vy = vy;
-                self.last_hi_try = tr[1] as i32;
-                self.last_hi_trz = tr[2] as i32;
-                self.last_hi_r21 = rt[3];
-                self.last_hi_r22 = rt[4];
-                self.last_hi_r23 = rt[5];
-                self.last_hi_rt = rt;
+            if self.ctrl[26] as u16 == 0x1F4 {
+                self.note_rtps_frame(vx, vy, vz, &tr, n, sz, ir2 as i32, sy);
             }
         }
         self.data[12] = self.data[13];
@@ -518,6 +464,78 @@ impl Gte {
         let mac0 = self.mac(0, i64::from(n) * dqa + dqb);
         self.data[24] = mac0 as u32;
         self.set_ir0(mac0 >> 12);
+    }
+
+    #[cfg(test)]
+    fn note_rtps_frame(
+        &mut self,
+        vx: i32,
+        vy: i32,
+        vz: i32,
+        tr: &[i64; 3],
+        n: u32,
+        sz: u32,
+        ir2: i32,
+        sy: i32,
+    ) {
+        self.acc_rtps = self.acc_rtps.saturating_add(1);
+        self.title_ir2_min = self.title_ir2_min.min(ir2);
+        self.title_ir2_max = self.title_ir2_max.max(ir2);
+        self.title_vy_min = self.title_vy_min.min(vy);
+        self.title_vy_max = self.title_vy_max.max(vy);
+        let r12 = self.rt_el(0, 1);
+        let r21 = self.rt_el(1, 0);
+        let r22 = self.rt_el(1, 1);
+        let r23 = self.rt_el(1, 2);
+        let r32 = self.rt_el(2, 1);
+        // Crash object R is yaw + 5/8 Y at tgeo 4800 (R00≈4511), not world
+        // identity 5/8 (R00=4096). Idle vblanks only transform the board.
+        let r00 = self.rt_el(0, 0);
+        let object = r12.abs() < 200
+            && r21.abs() < 200
+            && r23.abs() < 200
+            && r32.abs() < 200
+            && r22 < -1000
+            && r00.abs() > 4200;
+        if object {
+            self.acc_obj_n = self.acc_obj_n.saturating_add(1);
+            self.acc_obj_sy_min = self.acc_obj_sy_min.min(sy);
+            self.acc_obj_vy_min = self.acc_obj_vy_min.min(vy);
+            self.acc_obj_vy_max = self.acc_obj_vy_max.max(vy);
+            self.acc_obj_vx_min = self.acc_obj_vx_min.min(vx);
+            self.acc_obj_vx_max = self.acc_obj_vx_max.max(vx);
+            self.acc_obj_vz_min = self.acc_obj_vz_min.min(vz);
+            self.acc_obj_vz_max = self.acc_obj_vz_max.max(vz);
+            if sy >= self.acc_obj_sy_max {
+                self.acc_obj_sy_max = sy;
+                self.acc_obj_try = tr[1] as i32;
+                self.acc_obj_trz = tr[2] as i32;
+            }
+        }
+        if sy > self.last_hi_sy {
+            let rt = [
+                self.rt_el(0, 0),
+                self.rt_el(0, 1),
+                self.rt_el(0, 2),
+                self.rt_el(1, 0),
+                self.rt_el(1, 1),
+                self.rt_el(1, 2),
+                self.rt_el(2, 0),
+                self.rt_el(2, 1),
+                self.rt_el(2, 2),
+            ];
+            self.last_hi_sy = sy;
+            self.last_hi_ir2 = ir2;
+            self.last_hi_n = n;
+            self.last_hi_sz = sz;
+            self.last_hi_vy = vy;
+            self.last_hi_try = tr[1] as i32;
+            self.last_hi_trz = tr[2] as i32;
+            self.last_hi_r21 = rt[3];
+            self.last_hi_r22 = rt[4];
+            self.last_hi_r23 = rt[5];
+            self.last_hi_rt = rt;
+        }
     }
 
     fn rtps(&mut self, sf: u32, lm: bool) {

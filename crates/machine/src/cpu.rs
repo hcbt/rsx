@@ -212,11 +212,14 @@ impl Cpu {
         self.in_delay = self.branch_delay;
         self.branch_delay = false;
         self.current_pc = self.pc;
-        if self.current_pc == 0x8001_34C8 {
-            self.nsf_134c8 = self.nsf_134c8.saturating_add(1);
-        }
-        if self.current_pc == 0x8001_3B30 {
-            self.nsf_13b30 = self.nsf_13b30.saturating_add(1);
+        #[cfg(test)]
+        {
+            if self.current_pc == 0x8001_34C8 {
+                self.nsf_134c8 = self.nsf_134c8.saturating_add(1);
+            }
+            if self.current_pc == 0x8001_3B30 {
+                self.nsf_13b30 = self.nsf_13b30.saturating_add(1);
+            }
         }
 
         self.cop0.set_ip_hw(bus.irq().pending_for_cop0());

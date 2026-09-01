@@ -234,6 +234,15 @@ impl Bus {
         self.step_size(4096).max(1)
     }
 
+    /// ADR 0011: GPU draw occupancy is only visible as GPUSTAT.26/28. A
+    /// GPUSTAT load skips that run up to the next scanline (so GPUSTAT.31
+    /// and vblank still edge).
+    fn skip_gpu_draw_occupancy(&mut self) {
+        if self.gpu.draw_remaining() > 0 {
+            self.tick(self.skip_hint());
+        }
+    }
+
     pub fn tick(&mut self, mut cycles: u32) {
         while cycles > 0 {
             let to_line = (CYCLES_PER_LINE - (self.cycles % CYCLES_PER_LINE)) as u32;
@@ -371,7 +380,10 @@ impl Bus {
             0x1F80_1080..=0x1F80_10FC => self.dma.read32(p),
             0x1F80_1100..=0x1F80_1128 => u32::from(self.timers.read16(p)),
             0x1F80_1810 => self.gpu.read_gpuread(),
-            0x1F80_1814 => self.gpu.stat(),
+            0x1F80_1814 => {
+                self.skip_gpu_draw_occupancy();
+                self.gpu.stat()
+            }
             0x1F80_1C00..=0x1F80_1FFF => u32::from(self.spu.read16(p)),
             0x1FC0_0000..=0x1FFF_FFFF => {
                 let off = ((p - 0x1FC0_0000) as usize) % self.bios.len();
@@ -671,6 +683,36 @@ mod tests {
             b.read16(0x1F80_1070).unwrap() & (1 << 1),
             0,
             "GP1(02h) then a tick leaves I_STAT.1 edge-acked"
+        );
+    }
+
+    #[test]
+    fn gpustat_read_skips_draw_occupancy() {
+        // ADR 0011: GPU occupancy is not observable except as GPUSTAT.26/28.
+        // A GPUSTAT load while drawing must skip that run, not 1,1,1 it.
+        let mut b = bus();
+        b.write32(0x1F80_1810, 0xE3_0000_00);
+        b.write32(0x1F80_1810, 0xE4_0000_00 | 1023 | (511 << 10));
+        b.write32(0x1F80_1810, 0x60 << 24 | 0x00F800);
+        b.write32(0x1F80_1810, 0);
+        b.write32(0x1F80_1810, 8 | (8 << 16));
+        b.tick(8);
+        let busy = b.gpu().draw_remaining();
+        assert!(
+            busy >= 50,
+            "8×8 rect occupancy must still be outstanding (busy={busy})"
+        );
+        let c0 = b.cycles();
+        let _ = b.read32(0x1F80_1814);
+        let dt = b.cycles() - c0;
+        let after = b.gpu().draw_remaining();
+        assert!(
+            dt >= u64::from(busy.min(2160)) && after < busy,
+            "GPUSTAT read must skip draw occupancy (dt={dt} busy {busy}→{after})"
+        );
+        assert_eq!(
+            after, 0,
+            "one GPUSTAT load skips the remaining occupancy, not one cycle"
         );
     }
 }
