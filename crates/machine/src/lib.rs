@@ -1414,6 +1414,47 @@ mod tests {
     }
 
     #[test]
+    fn spyro_reaches_512x240_when_present() {
+        let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
+        let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../roms/Spyro the Dragon (USA)/Spyro the Dragon (USA).cue");
+        if !bios.exists() || !disc.exists() {
+            eprintln!("skipping: no local BIOS or Disc");
+            return;
+        }
+        let mut m = Machine::from_bios_path(&bios).unwrap();
+        m.insert_disc(&disc).unwrap();
+        m.run_until_vblank_count(1200);
+        let (dx, dy, dw, dh, on) = m.display_origin();
+        assert!(on, "Spyro display enable");
+        assert_eq!(
+            (dw, dh),
+            (512, 240),
+            "Spyro 512×240 after EXE load (display=({dx},{dy}) {dw}x{dh} pc={:08X})",
+            m.pc()
+        );
+        assert!(
+            (0x8001_0000..0x8008_0000).contains(&m.pc()),
+            "PC in the loaded EXE (pc={:08X})",
+            m.pc()
+        );
+        let cd = m.cd_view();
+        assert!(
+            cd.lba > 17_000,
+            "WAD ReadN must advance past the first sector (lba={} pc={:08X})",
+            cd.lba,
+            m.pc()
+        );
+        let area = m.display_area();
+        let lit = area.pixels.iter().filter(|p| **p & 0x7FFF != 0).count();
+        assert!(
+            lit > 200,
+            "SCEA Presents card must be on the Display area (lit={lit} pc={:08X})",
+            m.pc()
+        );
+    }
+
+    #[test]
     fn licensed_logo_draws_the_mark_when_present() {
         let bios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SCPH1001.BIN");
         let disc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

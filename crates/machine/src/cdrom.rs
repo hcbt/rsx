@@ -316,10 +316,6 @@ impl Cdrom {
         self.update_irq_line(irq);
     }
 
-    fn fifo_busy(&self) -> bool {
-        self.fifo_loaded && self.fifo_i < self.fifo.len()
-    }
-
     fn arm_next_int1(&mut self) {
         if self.reading && !self.playing && self.pending.is_none() {
             self.pending = Some(Pending {
@@ -1313,13 +1309,13 @@ impl Cdrom {
             }
             return;
         }
-        // Locked FIFO: buffer at 1×/2×, no extra INT1. INT3 still queues.
-        if self.fifo_busy() && self.irq_flag & 7 == 0 && self.sector_buf.len() < SECTOR_BUF {
-            self.extra_capture();
-            self.arm_next_int1();
-            return;
-        }
-        if self.fifo_busy() || self.irq_flag & 7 == 1 {
+        // SPX: INT1 queues behind an unacked INT3. A second INT1 waits while
+        // INT1 is still showing. Unread FIFO bytes after HCLRCTL do not hold
+        // the next INT1 (924h leftover after an 800h DMA).
+        if self.irq_flag & 7 == 1 {
+            if self.sector_buf.len() < SECTOR_BUF {
+                self.extra_capture();
+            }
             self.arm_next_int1();
             return;
         }
@@ -1743,9 +1739,15 @@ mod tests {
         send(&mut cd, &mut irq, 0x06, &[]);
         pump(&mut cd, &mut irq, 0xC4E1);
         ack_irq(&mut cd, &mut irq);
-        pump(&mut cd, &mut irq, 2_000_000);
-        assert_eq!(hintsts(&mut cd, &mut irq), 1);
-        ack_irq(&mut cd, &mut irq);
+        let mut saw_int1 = false;
+        for _ in 0..40 {
+            pump(&mut cd, &mut irq, 50_000);
+            if hintsts(&mut cd, &mut irq) == 1 {
+                saw_int1 = true;
+                break;
+            }
+        }
+        assert!(saw_int1, "first INT1");
         want_data(&mut cd, &mut irq);
         let mut head = Vec::new();
         for _ in 0..16 {
@@ -1755,11 +1757,11 @@ mod tests {
             String::from_utf8_lossy(&head).contains("Licens"),
             "DMA started on the first sector ({head:?})"
         );
-        pump(&mut cd, &mut irq, 300_000);
+        pump(&mut cd, &mut irq, 50_000);
         assert_eq!(
             hintsts(&mut cd, &mut irq),
-            0,
-            "no extra INT1 while the FIFO is still being read (DMA in progress)"
+            1,
+            "unacked INT1 stays INT1; sector clock buffers instead of replacing it"
         );
         let mut more = Vec::new();
         for _ in 0..16 {
@@ -1767,22 +1769,18 @@ mod tests {
         }
         assert!(
             String::from_utf8_lossy(&more).contains("ed  by"),
-            "locked FIFO must not be replaced mid-DMA ({more:?})"
+            "locked FIFO must not be replaced before the next Data Request ({more:?})"
         );
         assert!(
             !String::from_utf8_lossy(&more).contains("NEXTSECT"),
-            "must not skip to the next sector while DMA holds the FIFO ({more:?})"
+            "must not skip to the next sector before its INT1 is accepted ({more:?})"
         );
-        for _ in 32..0x800 {
-            let _ = cd.read8(2);
-        }
-        // Less than a fresh 2× sector (225792) from drain, but enough for the
-        // leftover sector-clock that ran during the locked DMA.
-        pump(&mut cd, &mut irq, 200_000);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 230_000);
         assert_eq!(
             hintsts(&mut cd, &mut irq),
             1,
-            "SPX: sector clock buffered the next sector; INT1 after the locked FIFO drains"
+            "SPX: INT1 after ack follows the sector clock, even if the FIFO still has unread bytes"
         );
         want_data(&mut cd, &mut irq);
         let mut second = Vec::new();
@@ -1792,6 +1790,57 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&second).contains("NEXTSECT"),
             "buffered sector is the next one ({second:?})"
+        );
+    }
+
+    #[test]
+    fn readn_924h_int1_after_ack_with_unread_tail() {
+        // Spyro CdRead of a 924h sector DMAs 800h words and leaves 292 bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = vec![0u8; SECTOR_LEN * 24];
+        bin[SECTOR_LEN * 4 + 12..SECTOR_LEN * 4 + 12 + 8].copy_from_slice(b"SECTORA!");
+        bin[SECTOR_LEN * 5 + 12..SECTOR_LEN * 5 + 12 + 8].copy_from_slice(b"SECTORB!");
+        std::fs::write(dir.path().join("game.bin"), &bin).unwrap();
+        let cue = dir.path().join("game.cue");
+        let mut f = std::fs::File::create(&cue).unwrap();
+        writeln!(f, "FILE \"game.bin\" BINARY").unwrap();
+        writeln!(f, "  TRACK 01 MODE2/2352").unwrap();
+        writeln!(f, "    INDEX 01 00:00:00").unwrap();
+        let mut cd = Cdrom::new();
+        cd.insert(load_disc(&cue).unwrap());
+        let mut irq = Irq::new();
+        enable(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x0E, &[0xA0]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x02, &[0x00, 0x02, 0x04]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        send(&mut cd, &mut irq, 0x06, &[]);
+        pump(&mut cd, &mut irq, 0xC4E1);
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 2_000_000);
+        assert_eq!(hintsts(&mut cd, &mut irq), 1);
+        want_data(&mut cd, &mut irq);
+        for _ in 0..0x800 {
+            let _ = cd.read8(2);
+        }
+        assert_eq!(cd.view().fifo_bytes, 0x124, "924h − 800h leftover");
+        ack_irq(&mut cd, &mut irq);
+        pump(&mut cd, &mut irq, 230_000);
+        assert_eq!(
+            hintsts(&mut cd, &mut irq),
+            1,
+            "SPX: leftover 924h bytes must not block the next INT1"
+        );
+        want_data(&mut cd, &mut irq);
+        let mut second = Vec::new();
+        for _ in 0..8 {
+            second.push(cd.read8(2));
+        }
+        assert!(
+            String::from_utf8_lossy(&second).contains("SECTORB!"),
+            "next 924h INT1 is the following sector ({second:?})"
         );
     }
 
