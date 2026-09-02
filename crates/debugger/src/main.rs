@@ -165,8 +165,12 @@ impl Debugger {
 
 impl eframe::App for Debugger {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let pad_sw = self.pad.poll();
+        if let Some(line) = self.pad.take_note() {
+            self.log.push(line);
+        }
         if let Some(m) = self.machine.as_mut() {
-            pad::inject(m, self.pad.poll());
+            pad::inject(m, pad_sw);
         }
         let mut refresh_inspect = true;
         if self.running {

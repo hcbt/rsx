@@ -17,6 +17,7 @@ toml = "0.8"
 png = "0.17"
 cpal = "0.15"
 gilrs = "0.11.2"
+objc2-game-controller = { version = "0.3.2", features = ["GCController", "GCExtendedGamepad", "GCPhysicalInputProfile", "GCControllerButtonInput", "GCControllerAxisInput", "GCControllerDirectionPad", "GCControllerElement", "GCDevice"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,11 +1,15 @@
-//! Host DualShock 4 / HID gamepad → Machine slot 1. The Machine never opens HID.
+//! Host DualShock 4 → Machine slot 1. The Machine never opens HID.
+//!
+//! On macOS a DualShock 4 over Bluetooth is a Game Controller device, not an
+//! IOKit HID gamepad, so gilrs does not see it. Poll `GCController` first.
 
 use gilrs::{Axis, Button, Gamepad, Gilrs};
 use rsx_machine::{map_ds4_switches, HostButtons, Machine};
 
 pub struct HostPad {
     gilrs: Option<Gilrs>,
-    named: bool,
+    named: Option<String>,
+    note: Option<String>,
 }
 
 impl HostPad {
@@ -13,37 +17,168 @@ impl HostPad {
         match Gilrs::new() {
             Ok(g) => Self {
                 gilrs: Some(g),
-                named: false,
+                named: None,
+                note: None,
             },
             Err(e) => {
                 eprintln!("host pad: {e}");
                 Self {
                     gilrs: None,
-                    named: false,
+                    named: None,
+                    note: None,
                 }
             }
         }
     }
 
+    /// One-shot line for the I/O log when a host pad appears.
+    pub fn take_note(&mut self) -> Option<String> {
+        self.note.take()
+    }
+
     /// `None` means no host pad: slot 1 stays disconnected.
     pub fn poll(&mut self) -> Option<u16> {
+        if let Some((name, buttons)) = poll_game_controller() {
+            self.note_name(&name);
+            return Some(map_ds4_switches(&buttons));
+        }
         let gilrs = self.gilrs.as_mut()?;
         while gilrs.next_event().is_some() {}
         let id = gilrs
             .gamepads()
             .find(|(_, p)| p.is_connected())
             .map(|(id, _)| id)?;
-        let pad = gilrs.gamepad(id);
-        if !self.named {
-            eprintln!("host pad: {} → slot 1", pad.name());
-            self.named = true;
+        let (name, sw) = {
+            let pad = gilrs.gamepad(id);
+            (pad.name().to_string(), map_ds4_switches(&from_gilrs(&pad)))
+        };
+        self.note_name(&name);
+        Some(sw)
+    }
+
+    fn note_name(&mut self, name: &str) {
+        if self.named.as_deref() != Some(name) {
+            let line = format!("host pad: {name} → slot 1");
+            eprintln!("{line}");
+            self.note = Some(line);
+            self.named = Some(name.to_string());
         }
-        Some(map_ds4_switches(&from_gilrs(&pad)))
+    }
+}
+
+/// DualShock 4 on macOS Game Controller: A=Cross, B=Circle, X=Square, Y=Triangle,
+/// Menu=Options/Start, Options=Share/Select.
+pub fn host_buttons_from_extended(
+    a: bool,
+    b: bool,
+    x: bool,
+    y: bool,
+    menu: bool,
+    options: bool,
+    up: bool,
+    right: bool,
+    down: bool,
+    left: bool,
+    l1: bool,
+    r1: bool,
+    l2: bool,
+    r2: bool,
+    stick_x: f32,
+    stick_y: f32,
+) -> HostButtons {
+    HostButtons {
+        select: options,
+        start: menu,
+        up,
+        right,
+        down,
+        left,
+        l2,
+        r2,
+        l1,
+        r1,
+        triangle: y,
+        circle: b,
+        cross: a,
+        square: x,
+        stick_x,
+        stick_y,
+    }
+}
+
+fn poll_game_controller() -> Option<(String, HostButtons)> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::poll()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
 pub fn inject(machine: &mut Machine, switches: Option<u16>) {
     machine.set_slot1_pad(switches);
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::host_buttons_from_extended;
+    use objc2_game_controller::{
+        GCController, GCControllerButtonInput, GCDevice, GCExtendedGamepad,
+    };
+    use rsx_machine::HostButtons;
+
+    fn pressed(btn: &impl std::ops::Deref<Target = GCControllerButtonInput>) -> bool {
+        // Apple's isPressed: the live element state for this poll.
+        unsafe { btn.isPressed() }
+    }
+
+    pub fn poll() -> Option<(String, HostButtons)> {
+        // Linked GameController.framework; array of currently connected pads.
+        let controllers = unsafe { GCController::controllers() };
+        let n = controllers.count();
+        for i in 0..n {
+            let c = controllers.objectAtIndex(i);
+            let Some(gp) = (unsafe { c.extendedGamepad() }) else {
+                continue;
+            };
+            let name = unsafe { c.vendorName() }
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(unsafe { c.productCategory() }.to_string()))
+                .unwrap_or_else(|| "Wireless Controller".into());
+            let buttons = from_extended(&gp);
+            return Some((name, buttons));
+        }
+        None
+    }
+
+    fn from_extended(gp: &GCExtendedGamepad) -> HostButtons {
+        let dpad = unsafe { gp.dpad() };
+        let stick = unsafe { gp.leftThumbstick() };
+        let options = unsafe { gp.buttonOptions() }
+            .map(|b| pressed(&b))
+            .unwrap_or(false);
+        host_buttons_from_extended(
+            pressed(&unsafe { gp.buttonA() }),
+            pressed(&unsafe { gp.buttonB() }),
+            pressed(&unsafe { gp.buttonX() }),
+            pressed(&unsafe { gp.buttonY() }),
+            pressed(&unsafe { gp.buttonMenu() }),
+            options,
+            pressed(&unsafe { dpad.up() }),
+            pressed(&unsafe { dpad.right() }),
+            pressed(&unsafe { dpad.down() }),
+            pressed(&unsafe { dpad.left() }),
+            pressed(&unsafe { gp.leftShoulder() }),
+            pressed(&unsafe { gp.rightShoulder() }),
+            pressed(&unsafe { gp.leftTrigger() }),
+            pressed(&unsafe { gp.rightTrigger() }),
+            unsafe { stick.xAxis().value() },
+            unsafe { stick.yAxis().value() },
+        )
+    }
 }
 
 fn pressed(pad: &Gamepad<'_>, btn: Button) -> bool {
@@ -120,6 +255,18 @@ mod tests {
         f.write_all(&data).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn ds4_game_controller_menu_is_start_and_a_is_cross() {
+        let b = host_buttons_from_extended(
+            true, false, false, false, true, false, false, false, false, false, false, false,
+            false, false, 0.0, 0.0,
+        );
+        let sw = map_ds4_switches(&b);
+        assert_eq!(sw & (1 << 14), 0, "buttonA is Cross");
+        assert_eq!(sw & (1 << 3), 0, "buttonMenu (Options) is Start");
+        assert_eq!(sw | (1 << 14) | (1 << 3), 0xFFFF);
     }
 
     #[test]

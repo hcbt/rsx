@@ -73,5 +73,5 @@ SIO0 at `1F801040h`. Slot 1 may be a standard digital pad (ID `5A41h`). Empty po
 _Avoid_: SIO1, DualShock analog mode as the first pad
 
 **Pad**:
-A standard digital controller on JOY slot 1. The Debugger maps a host DualShock 4 (Share→Select, Options→Start, face/shoulders/D-pad, left stick as D-pad) onto its active-low switches and injects that on present. No host pad → slot 1 stays empty. The Machine does not open HID.
+A standard digital controller on JOY slot 1. The Debugger maps a host DualShock 4 (Share→Select, Options→Start, face/shoulders/D-pad, left stick as D-pad) onto its active-low switches and injects that on present. On macOS the DualShock 4 is a Game Controller device, not IOKit HID. No host pad → slot 1 stays empty. The Machine does not open HID.
 _Avoid_: rumble, analog ID `5A73h`, slot 2, keyboard-as-pad
