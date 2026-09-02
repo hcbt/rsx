@@ -130,28 +130,81 @@ mod macos {
     use rsx_machine::HostButtons;
 
     fn pressed(btn: &impl std::ops::Deref<Target = GCControllerButtonInput>) -> bool {
-        // Apple's isPressed: the live element state for this poll.
-        unsafe { btn.isPressed() }
+        // Analog face/shoulders: isPressed or the analog value past the click.
+        unsafe { btn.isPressed() || btn.value() >= 0.5 }
+    }
+
+    fn name_of(c: &GCController) -> String {
+        unsafe { c.vendorName() }
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(unsafe { c.productCategory() }.to_string()))
+            .unwrap_or_else(|| "Wireless Controller".into())
+    }
+
+    fn from_controller(c: &GCController) -> Option<HostButtons> {
+        // capture() latches the live state vector; reading elements without
+        // it can stay at released on macOS.
+        let snap = unsafe { c.capture() };
+        let gp = unsafe { snap.extendedGamepad() }?;
+        Some(from_extended(&gp))
     }
 
     pub fn poll() -> Option<(String, HostButtons)> {
-        // Linked GameController.framework; array of currently connected pads.
+        let mut combined: Option<HostButtons> = None;
+        let mut name = String::new();
+        // The pad the user just touched, then every other extended pad OR'd
+        // so a second "PS4 Controller" entry does not hide the DualShock 4.
+        if let Some(c) = unsafe { GCController::current() } {
+            if let Some(b) = from_controller(&c) {
+                name = name_of(&c);
+                combined = Some(b);
+            }
+        }
         let controllers = unsafe { GCController::controllers() };
-        let n = controllers.count();
-        for i in 0..n {
+        for i in 0..controllers.count() {
             let c = controllers.objectAtIndex(i);
-            let Some(gp) = (unsafe { c.extendedGamepad() }) else {
+            let Some(b) = from_controller(&c) else {
                 continue;
             };
-            let name = unsafe { c.vendorName() }
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .or_else(|| Some(unsafe { c.productCategory() }.to_string()))
-                .unwrap_or_else(|| "Wireless Controller".into());
-            let buttons = from_extended(&gp);
-            return Some((name, buttons));
+            if name.is_empty() {
+                name = name_of(&c);
+            }
+            combined = Some(match combined {
+                Some(a) => merge_host(a, b),
+                None => b,
+            });
         }
-        None
+        combined.map(|b| (name, b))
+    }
+
+    fn merge_host(a: HostButtons, b: HostButtons) -> HostButtons {
+        HostButtons {
+            select: a.select || b.select,
+            start: a.start || b.start,
+            up: a.up || b.up,
+            right: a.right || b.right,
+            down: a.down || b.down,
+            left: a.left || b.left,
+            l2: a.l2 || b.l2,
+            r2: a.r2 || b.r2,
+            l1: a.l1 || b.l1,
+            r1: a.r1 || b.r1,
+            triangle: a.triangle || b.triangle,
+            circle: a.circle || b.circle,
+            cross: a.cross || b.cross,
+            square: a.square || b.square,
+            stick_x: if a.stick_x.abs() >= b.stick_x.abs() {
+                a.stick_x
+            } else {
+                b.stick_x
+            },
+            stick_y: if a.stick_y.abs() >= b.stick_y.abs() {
+                a.stick_y
+            } else {
+                b.stick_y
+            },
+        }
     }
 
     fn from_extended(gp: &GCExtendedGamepad) -> HostButtons {

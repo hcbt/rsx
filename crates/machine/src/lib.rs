@@ -878,7 +878,7 @@ mod tests {
             0,
             "I_STAT.7 still 0 on the TX step"
         );
-        m.run_until_cycle(m.cycles() + 200);
+        m.run_until_cycle(m.cycles() + 400);
         assert_ne!(
             m.irq_stat() & (1 << 7),
             0,

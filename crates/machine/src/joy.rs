@@ -54,8 +54,9 @@ pub fn map_ds4_switches(b: &HostButtons) -> u16 {
 }
 
 /// SPX: Kernel waits ~100 cycles after TX, then acks old IRQ7, then waits
-/// for the new one. /ACK must not rise I_STAT.7 in the TX cycle.
-const ACK_DELAY: u32 = 100;
+/// for the new one. /ACK in that window is ignored. Timeout is 100µs
+/// (~3387 cycles) from the last SCK. Fire in between.
+const ACK_DELAY: u32 = 250;
 /// SPX: /ACK LOW duration is circa 100 clock cycles.
 const ACK_HOLD: u32 = 100;
 
@@ -338,14 +339,18 @@ mod tests {
             0,
             "I_STAT.7 must not rise in the same cycle as TX"
         );
-        joy.tick(99, &mut irq);
+        joy.tick(100, &mut irq);
         assert_eq!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
-            "Kernel waits ~100 cycles before the new IRQ7"
+            "Kernel waits ~100 cycles then acks old IRQ7; /ACK in that window is lost"
         );
-        joy.tick(1, &mut irq);
-        assert_ne!(irq.read16(0x1F80_1070) & (1 << IRQ_PAD), 0);
+        joy.tick(150, &mut irq);
+        assert_ne!(
+            irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
+            0,
+            "new IRQ7 after the Kernel wait, still inside the 100µs timeout"
+        );
     }
 
     #[test]
@@ -355,19 +360,19 @@ mod tests {
         joy.set_slot1(Some(0xFFFF));
         select_slot1(&mut joy);
         let _ = tx_rx(&mut joy, 0x01);
-        joy.tick(200, &mut irq);
+        joy.tick(300, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
         let _ = tx_rx(&mut joy, 0x42);
-        joy.tick(200, &mut irq);
+        joy.tick(300, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
         let _ = tx_rx(&mut joy, 0x00);
-        joy.tick(200, &mut irq);
+        joy.tick(300, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
         let _ = tx_rx(&mut joy, 0x00);
-        joy.tick(200, &mut irq);
+        joy.tick(300, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
         let _ = tx_rx(&mut joy, 0x00);
-        joy.tick(200, &mut irq);
+        joy.tick(300, &mut irq);
         assert_eq!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
