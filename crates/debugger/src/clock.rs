@@ -127,6 +127,13 @@ pub fn inspect_needs_paint(pace: Pace) -> bool {
     !matches!(pace, Pace::Run)
 }
 
+/// Keep the CPU / log panels in the egui tree while behind (omitting them
+/// unmounts the SidePanel and it blinks back on Wait). Refresh the GPR
+/// snapshot only when not catching up, or once if none exists yet.
+pub fn inspect_should_refresh(pace: Pace, has_snapshot: bool) -> bool {
+    !has_snapshot || inspect_needs_paint(pace)
+}
+
 /// Run the guest until it is at/ahead of wall or `budget` of host time in
 /// `run_to` has elapsed. A present slice that returns after one tiny `Run`
 /// starves catch-up (Spyro title ~121% headless becomes 89–94% windowed).
@@ -241,6 +248,18 @@ mod tests {
             "32 GPR labels + log must not rebuild on a catch-up slice"
         );
         assert!(inspect_needs_paint(Pace::Wait(Duration::from_millis(16))));
+        assert!(
+            inspect_should_refresh(Pace::Run, false),
+            "first frame must fill a snapshot or the CPU panel is empty"
+        );
+        assert!(
+            !inspect_should_refresh(Pace::Run, true),
+            "a filled snapshot must stay mounted without a GPR rebuild"
+        );
+        assert!(inspect_should_refresh(
+            Pace::Wait(Duration::from_millis(16)),
+            true
+        ));
     }
 
     #[test]
