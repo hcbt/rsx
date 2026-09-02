@@ -33,10 +33,7 @@ struct Debugger {
 }
 
 struct InspectSnapshot {
-    pc: u32,
-    gpustat: u32,
-    vblank: u64,
-    gprs: [u32; 32],
+    text: clock::InspectText,
 }
 
 impl Debugger {
@@ -141,11 +138,25 @@ impl Debugger {
             gprs[i as usize] = m.gpr(i);
         }
         self.inspect = Some(InspectSnapshot {
-            pc: m.pc(),
-            gpustat: m.gpustat(),
-            vblank: m.vblank_count(),
-            gprs,
+            text: clock::format_inspect(m.pc(), m.gpustat(), m.vblank_count(), &gprs),
         });
+    }
+
+    fn upload_display(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.machine.as_ref() else {
+            return;
+        };
+        let v = m.vblank_count();
+        if !clock::display_needs_present(self.uploaded_vblank, v) && self.texture.is_some() {
+            return;
+        }
+        let area = m.display_area();
+        let image = area_to_color_image(&area);
+        let tex = self
+            .texture
+            .get_or_insert_with(|| ctx.load_texture("display", image.clone(), Default::default()));
+        tex.set(image, Default::default());
+        self.uploaded_vblank = v;
     }
 }
 
@@ -187,6 +198,7 @@ impl eframe::App for Debugger {
         if refresh_inspect {
             self.refresh_inspect();
         }
+        self.upload_display(ctx);
 
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             if ui.button("Run").clicked() {
@@ -225,12 +237,12 @@ impl eframe::App for Debugger {
 
         egui::SidePanel::left("regs")
             .resizable(true)
+            .default_width(clock::INSPECT_PANEL_MIN_WIDTH)
+            .min_width(clock::INSPECT_PANEL_MIN_WIDTH)
             .show(ctx, |ui| {
                 ui.heading("CPU");
                 if let Some(s) = self.inspect.as_ref() {
-                    ui.monospace(format!("PC {:08X}", s.pc));
-                    ui.monospace(format!("GPUSTAT {:08X}", s.gpustat));
-                    ui.monospace(format!("vblank {}", s.vblank));
+                    ui.monospace(&s.text.status);
                     match self.pace {
                         Some(p) => {
                             let color = if p.behind() {
@@ -262,9 +274,7 @@ impl eframe::App for Debugger {
                             ui.monospace("fps   —");
                         }
                     }
-                    for i in 0..32u8 {
-                        ui.monospace(format!("r{i:02} {:08X}", s.gprs[i as usize]));
-                    }
+                    ui.monospace(&s.text.gprs);
                 } else if let Some(e) = &self.error {
                     ui.colored_label(egui::Color32::RED, e);
                 }
@@ -284,16 +294,6 @@ impl eframe::App for Debugger {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Display area");
             if let Some(m) = self.machine.as_ref() {
-                let v = m.vblank_count();
-                if clock::display_needs_present(self.uploaded_vblank, v) || self.texture.is_none() {
-                    let area = m.display_area();
-                    let image = area_to_color_image(&area);
-                    let tex = self.texture.get_or_insert_with(|| {
-                        ctx.load_texture("display", image.clone(), Default::default())
-                    });
-                    tex.set(image, Default::default());
-                    self.uploaded_vblank = v;
-                }
                 let (_, _, area_w, area_h, _) = m.display_origin();
                 let avail = ui.available_size();
                 let aspect = area_w.max(1) as f32 / area_h.max(1) as f32;

@@ -120,9 +120,10 @@ pub fn display_needs_present(uploaded_vblank: u64, guest_vblank: u64) -> bool {
     guest_vblank != uploaded_vblank
 }
 
-/// GPR / I/O log rebuild while `Pace::Run` (behind) starves the next
+/// GPR snapshot rebuild while `Pace::Run` (behind) starves the next
 /// `run_until_cycle` slice. Spyro title is ~99% headless; that inspect
-/// paint is the windowed drop.
+/// paint is the windowed drop. The SidePanel stays mounted; only the
+/// snapshot text is stale until Wait.
 pub fn inspect_needs_paint(pace: Pace) -> bool {
     !matches!(pace, Pace::Run)
 }
@@ -132,6 +133,30 @@ pub fn inspect_needs_paint(pace: Pace) -> bool {
 /// snapshot only when not catching up, or once if none exists yet.
 pub fn inspect_should_refresh(pace: Pace, has_snapshot: bool) -> bool {
     !has_snapshot || inspect_needs_paint(pace)
+}
+
+/// Floor for the CPU SidePanel. Below this, a Display-area upload that
+/// steals a frame looks like the panel vanished.
+pub const INSPECT_PANEL_MIN_WIDTH: f32 = 140.0;
+
+/// CPU panel text. Status and GPRs are two Labels so live pace can sit
+/// between them; a Label per GPR was 32 widgets per present.
+pub struct InspectText {
+    pub status: String,
+    pub gprs: String,
+}
+
+pub fn format_inspect(pc: u32, gpustat: u32, vblank: u64, gprs: &[u32; 32]) -> InspectText {
+    use std::fmt::Write;
+    let mut status = String::with_capacity(48);
+    let _ = writeln!(status, "PC {pc:08X}");
+    let _ = writeln!(status, "GPUSTAT {gpustat:08X}");
+    let _ = writeln!(status, "vblank {vblank}");
+    let mut regs = String::with_capacity(16 * 32);
+    for (i, r) in gprs.iter().enumerate() {
+        let _ = writeln!(regs, "r{i:02} {r:08X}");
+    }
+    InspectText { status, gprs: regs }
 }
 
 /// Run the guest until it is at/ahead of wall or `budget` of host time in
@@ -245,7 +270,7 @@ mod tests {
     fn inspect_ui_is_skipped_while_behind() {
         assert!(
             !inspect_needs_paint(Pace::Run),
-            "32 GPR labels + log must not rebuild on a catch-up slice"
+            "GPR snapshot must not rebuild on a catch-up slice"
         );
         assert!(inspect_needs_paint(Pace::Wait(Duration::from_millis(16))));
         assert!(
@@ -260,6 +285,31 @@ mod tests {
             Pace::Wait(Duration::from_millis(16)),
             true
         ));
+    }
+
+    #[test]
+    fn inspect_text_is_one_block_with_every_gpr() {
+        let mut gprs = [0u32; 32];
+        gprs[1] = 0xDEAD_BEEF;
+        let s = format_inspect(0x8001_2348, 0x1480_2000, 3234, &gprs);
+        assert!(
+            s.status.starts_with("PC 80012348\n"),
+            "PC must lead so the SidePanel width is stable before GPRs"
+        );
+        assert!(s.status.contains("GPUSTAT 14802000\n"));
+        assert!(s.status.contains("vblank 3234\n"));
+        assert_eq!(s.status.lines().count(), 3);
+        assert!(s.gprs.contains("r01 DEADBEEF\n"));
+        assert!(s.gprs.contains("r31 00000000"));
+        assert_eq!(
+            s.gprs.lines().count(),
+            32,
+            "one Label for r00..r31, not 32 widgets"
+        );
+        assert!(
+            INSPECT_PANEL_MIN_WIDTH >= 140.0,
+            "a collapsed SidePanel is the blink when Display uploads"
+        );
     }
 
     #[test]
