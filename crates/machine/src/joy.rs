@@ -55,10 +55,9 @@ pub fn map_ds4_switches(b: &HostButtons) -> u16 {
     sw
 }
 
-/// SPX: Kernel waits ~100 cycles after TX, then acks old IRQ7, then waits
-/// for the new one. /ACK in that window is ignored. Timeout is 100µs
-/// (~3387 cycles) from the last SCK. Fire in between.
-const ACK_DELAY: u32 = 250;
+/// SPX: kernel ignores /ACK in the first 100 clk after last SCK, then
+/// times out at 100µs (~3387 clk). Pulse after the ignore window.
+const ACK_AFTER_SCK: u32 = 150;
 /// SPX: /ACK LOW duration is circa 100 clock cycles.
 const ACK_HOLD: u32 = 100;
 
@@ -79,6 +78,11 @@ pub struct Joy {
     slot1: Option<u16>,
     /// 0 = address byte; 1..4 = digital Read; after last, back to 0.
     xfer: u8,
+    /// Cycles remaining in the current 8-bit shift.
+    tx_left: u32,
+    pending_rx: Option<u8>,
+    /// /ACK after this byte's last SCK (not after the last digital Read byte).
+    ack_after: bool,
     ack_in: u32,
     ack_low: u32,
     irq_stat: bool,
@@ -97,6 +101,9 @@ impl Joy {
             rx: VecDeque::with_capacity(8),
             slot1: None,
             xfer: 0,
+            tx_left: 0,
+            pending_rx: None,
+            ack_after: false,
             ack_in: 0,
             ack_low: 0,
             irq_stat: false,
@@ -109,12 +116,16 @@ impl Joy {
 
     pub fn reset(&mut self) {
         let slot1 = self.slot1;
+        let mode = self.mode;
+        let baud = self.baud;
         let last_ctrl = self.last_ctrl;
         let last_tx = self.last_tx;
         let tx_count = self.tx_count;
         let ack_armed = self.ack_armed;
         *self = Self::new();
         self.slot1 = slot1;
+        self.mode = mode;
+        self.baud = baud;
         self.last_ctrl = last_ctrl;
         self.last_tx = last_tx;
         self.tx_count = tx_count;
@@ -126,6 +137,9 @@ impl Joy {
         self.slot1 = switches;
         if switches.is_none() {
             self.xfer = 0;
+            self.tx_left = 0;
+            self.pending_rx = None;
+            self.ack_after = false;
             self.ack_in = 0;
             self.ack_low = 0;
         }
@@ -147,18 +161,53 @@ impl Joy {
         self.ack_armed
     }
 
+    fn byte_cycles(&self) -> u32 {
+        let factor = match self.mode & 3 {
+            2 => 16,
+            3 => 64,
+            _ => 1,
+        };
+        let bits = match (self.mode >> 2) & 3 {
+            0 => 5,
+            1 => 6,
+            2 => 7,
+            _ => 8,
+        };
+        bits * u32::from(self.baud).max(1) * factor
+    }
+
     pub fn tick(&mut self, mut cycles: u32, irq: &mut Irq) {
-        if self.ack_in > 0 {
+        if self.ack_low == 0 {
+            irq.set_level(IRQ_PAD, false);
+        }
+        if self.tx_left > 0 {
+            if cycles < self.tx_left {
+                self.tx_left -= cycles;
+                cycles = 0;
+            } else {
+                cycles -= self.tx_left;
+                self.tx_left = 0;
+                if let Some(b) = self.pending_rx.take() {
+                    self.push_rx(b);
+                }
+                if self.ack_after {
+                    self.ack_in = ACK_AFTER_SCK;
+                    self.ack_after = false;
+                }
+            }
+        }
+        if self.ack_in > 0 && cycles > 0 {
             if cycles < self.ack_in {
                 self.ack_in -= cycles;
-                return;
-            }
-            cycles -= self.ack_in;
-            self.ack_in = 0;
-            self.ack_low = ACK_HOLD;
-            self.irq_stat = true;
-            if self.ctrl & CTRL_ACK_IRQ != 0 {
-                irq.set_level(IRQ_PAD, true);
+                cycles = 0;
+            } else {
+                cycles -= self.ack_in;
+                self.ack_in = 0;
+                self.ack_low = ACK_HOLD;
+                self.irq_stat = true;
+                if self.ctrl & CTRL_ACK_IRQ != 0 {
+                    irq.set_level(IRQ_PAD, true);
+                }
             }
         }
         if self.ack_low > 0 {
@@ -171,7 +220,10 @@ impl Joy {
     }
 
     pub fn stat(&self) -> u16 {
-        let mut s = 0x0005; // TX ready 1 and 2
+        let mut s = 0x0001; // TX Ready Flag 1 (started)
+        if self.tx_left == 0 {
+            s |= 1 << 2; // TX Ready Flag 2 (finished)
+        }
         if !self.rx.is_empty() {
             s |= 1 << 1;
         }
@@ -248,56 +300,71 @@ impl Joy {
         self.ctrl & CTRL_SELECT != 0 && self.ctrl & CTRL_SLOT == 0
     }
 
+    fn finish_byte(&mut self) {
+        self.tx_left = 0;
+        if let Some(b) = self.pending_rx.take() {
+            self.push_rx(b);
+        }
+        if self.ack_after {
+            self.ack_in = ACK_AFTER_SCK;
+            self.ack_after = false;
+        }
+    }
+
+    fn begin_byte(&mut self, reply: u8, ack: bool) {
+        self.pending_rx = Some(reply);
+        self.tx_left = self.byte_cycles();
+        self.ack_after = ack;
+        if ack {
+            self.ack_low = 0;
+            self.ack_armed = self.ack_armed.saturating_add(1);
+        }
+    }
+
     fn write_tx(&mut self, value: u8) {
         self.last_tx = value;
         self.tx_count = self.tx_count.saturating_add(1);
         if self.ctrl & 0x7 == 0 {
             return;
         }
+        if self.tx_left > 0 {
+            self.finish_byte();
+        }
         let pad = self.slot1.filter(|_| self.slot1_selected());
         let Some(switches) = pad else {
-            self.push_rx(0xFF);
+            self.begin_byte(0xFF, false);
             self.xfer = 0;
             return;
         };
         match self.xfer {
             0 => {
-                self.push_rx(0xFF);
-                if value == 0x01 {
+                let ack = value == 0x01;
+                if ack {
                     self.xfer = 1;
-                    self.schedule_ack();
                 }
+                self.begin_byte(0xFF, ack);
             }
             1 => {
-                self.push_rx(0x41);
                 self.xfer = 2;
-                self.schedule_ack();
+                self.begin_byte(0x41, true);
             }
             2 => {
-                self.push_rx(0x5A);
                 self.xfer = 3;
-                self.schedule_ack();
+                self.begin_byte(0x5A, true);
             }
             3 => {
-                self.push_rx(switches as u8);
                 self.xfer = 4;
-                self.schedule_ack();
+                self.begin_byte(switches as u8, true);
             }
             4 => {
-                self.push_rx((switches >> 8) as u8);
                 self.xfer = 0;
+                self.begin_byte((switches >> 8) as u8, false);
             }
             _ => {
-                self.push_rx(0xFF);
                 self.xfer = 0;
+                self.begin_byte(0xFF, false);
             }
         }
-    }
-
-    fn schedule_ack(&mut self) {
-        self.ack_in = ACK_DELAY;
-        self.ack_low = 0;
-        self.ack_armed = self.ack_armed.saturating_add(1);
     }
 
     fn write_ctrl(&mut self, value: u16) {
@@ -316,6 +383,9 @@ impl Joy {
         self.ctrl = value & !(CTRL_ACK | CTRL_RESET);
         if was && !self.slot1_selected() {
             self.xfer = 0;
+            self.tx_left = 0;
+            self.pending_rx = None;
+            self.ack_after = false;
             self.ack_in = 0;
             self.ack_low = 0;
         }
@@ -328,7 +398,20 @@ mod tests {
     use crate::irq::{Irq, IRQ_PAD};
 
     fn select_slot1(joy: &mut Joy) {
+        // BIOS PadRead: 8-bit MUL1, ~250 kHz (BAUD 0088h).
+        joy.write16(0x1F80_1048, 0x000D);
+        joy.write16(0x1F80_104E, 0x0088);
         joy.write16(0x1F80_104A, 0x1003);
+    }
+
+    /// 8 bits × reload 0088h × MUL1. Last SCK is this many cycles after TX.
+    fn byte_cycles() -> u32 {
+        8 * 0x88
+    }
+
+    /// SPX: ignore /ACK in the first 100 clk after last SCK; timeout is 100µs.
+    fn ack_after_sck() -> u32 {
+        byte_cycles() + 150
     }
 
     #[test]
@@ -337,10 +420,12 @@ mod tests {
         let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF));
         // Reset | ACK IRQ | TXEN | /JOYn in one write (PSY-Q PadRead).
+        joy.write16(0x1F80_1048, 0x000D);
+        joy.write16(0x1F80_104E, 0x0088);
         joy.write16(0x1F80_104A, 0x1043);
-        let rx = tx_rx(&mut joy, 0x01);
-        assert_eq!(rx, 0xFF, "High-Z on address byte");
-        joy.tick(250, &mut irq);
+        joy.write8(0x1F80_1040, 0x01);
+        joy.tick(ack_after_sck(), &mut irq);
+        assert_eq!(joy.read8(0x1F80_1040), 0xFF, "High-Z on address byte");
         assert_ne!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
@@ -348,8 +433,9 @@ mod tests {
         );
     }
 
-    fn tx_rx(joy: &mut Joy, tx: u8) -> u8 {
+    fn tx_rx(joy: &mut Joy, irq: &mut Irq, tx: u8) -> u8 {
         joy.write8(0x1F80_1040, tx);
+        joy.tick(byte_cycles(), irq);
         joy.read8(0x1F80_1040)
     }
 
@@ -358,8 +444,8 @@ mod tests {
         let mut joy = Joy::new();
         let mut irq = Irq::new();
         select_slot1(&mut joy);
-        let rx = tx_rx(&mut joy, 0x01);
-        joy.tick(200, &mut irq);
+        let rx = tx_rx(&mut joy, &mut irq, 0x01);
+        joy.tick(ack_after_sck(), &mut irq);
         assert_eq!(rx, 0xFF);
         assert_eq!(irq.read16(0x1F80_1070) & (1 << IRQ_PAD), 0);
     }
@@ -367,40 +453,41 @@ mod tests {
     #[test]
     fn rx_fifo_holds_a_full_digital_read() {
         let mut joy = Joy::new();
+        let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF));
         select_slot1(&mut joy);
-        joy.write8(0x1F80_1040, 0x01);
-        joy.write8(0x1F80_1040, 0x42);
-        joy.write8(0x1F80_1040, 0x00);
-        joy.write8(0x1F80_1040, 0x00);
-        joy.write8(0x1F80_1040, 0x00);
-        let got: [u8; 5] = std::array::from_fn(|_| joy.read8(0x1F80_1040));
+        let mut got = [0u8; 5];
+        for (i, tx) in [0x01, 0x42, 0x00, 0x00, 0x00].into_iter().enumerate() {
+            got[i] = tx_rx(&mut joy, &mut irq, tx);
+        }
         assert_eq!(got, [0xFF, 0x41, 0x5A, 0xFF, 0xFF]);
     }
 
     #[test]
     fn connected_digital_read_is_41_5a_and_active_low_switches() {
         let mut joy = Joy::new();
+        let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF));
         select_slot1(&mut joy);
-        let b0 = tx_rx(&mut joy, 0x01);
-        let b1 = tx_rx(&mut joy, 0x42);
-        let b2 = tx_rx(&mut joy, 0x00);
-        let b3 = tx_rx(&mut joy, 0x00);
-        let b4 = tx_rx(&mut joy, 0x00);
+        let b0 = tx_rx(&mut joy, &mut irq, 0x01);
+        let b1 = tx_rx(&mut joy, &mut irq, 0x42);
+        let b2 = tx_rx(&mut joy, &mut irq, 0x00);
+        let b3 = tx_rx(&mut joy, &mut irq, 0x00);
+        let b4 = tx_rx(&mut joy, &mut irq, 0x00);
         assert_eq!([b0, b1, b2, b3, b4], [0xFF, 0x41, 0x5A, 0xFF, 0xFF]);
     }
 
     #[test]
     fn connected_cross_clears_only_bit14() {
         let mut joy = Joy::new();
+        let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF & !(1 << 14)));
         select_slot1(&mut joy);
-        let _ = tx_rx(&mut joy, 0x01);
-        let _ = tx_rx(&mut joy, 0x42);
-        let _ = tx_rx(&mut joy, 0x00);
-        let swlo = tx_rx(&mut joy, 0x00);
-        let swhi = tx_rx(&mut joy, 0x00);
+        let _ = tx_rx(&mut joy, &mut irq, 0x01);
+        let _ = tx_rx(&mut joy, &mut irq, 0x42);
+        let _ = tx_rx(&mut joy, &mut irq, 0x00);
+        let swlo = tx_rx(&mut joy, &mut irq, 0x00);
+        let swhi = tx_rx(&mut joy, &mut irq, 0x00);
         let sw = u16::from(swlo) | (u16::from(swhi) << 8);
         assert_eq!(sw & (1 << 14), 0, ">< Cross pressed is active-low bit14");
         assert_eq!(
@@ -411,29 +498,76 @@ mod tests {
     }
 
     #[test]
-    fn ack_does_not_raise_irq7_on_the_tx_cycle() {
+    fn ack_follows_last_sck_past_the_kernel_ignore_window() {
         let mut joy = Joy::new();
         let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF));
         select_slot1(&mut joy);
-        let _ = tx_rx(&mut joy, 0x01);
+        joy.write8(0x1F80_1040, 0x01);
         assert_eq!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
             "I_STAT.7 must not rise in the same cycle as TX"
         );
+        assert_eq!(
+            joy.stat() & (1 << 2),
+            0,
+            "TX Ready Flag 2 is clear while the byte is shifting"
+        );
+        assert_eq!(
+            joy.stat() & (1 << 1),
+            0,
+            "RX FIFO stays empty until last SCK"
+        );
+        joy.tick(250, &mut irq);
+        assert_eq!(
+            irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
+            0,
+            "/ACK before last SCK is the pulse the kernel acks as old IRQ7"
+        );
+        joy.tick(byte_cycles() - 250, &mut irq);
+        assert_eq!(joy.read8(0x1F80_1040), 0xFF, "High-Z lands at last SCK");
+        assert_ne!(joy.stat() & (1 << 2), 0, "TX Ready Flag 2 after last SCK");
         joy.tick(100, &mut irq);
         assert_eq!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
-            "Kernel waits ~100 cycles then acks old IRQ7; /ACK in that window is lost"
+            "kernel ignores /ACK in the first 100 clk after last SCK"
         );
-        joy.tick(150, &mut irq);
+        joy.tick(50, &mut irq);
         assert_ne!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
-            "new IRQ7 after the Kernel wait, still inside the 100µs timeout"
+            "new IRQ7 after the ignore window, still inside the 100µs timeout"
         );
+    }
+
+    #[test]
+    fn kernel_padread_sees_start_after_acking_old_irq7() {
+        // SCPH-1001 PadRead after TX: delay, ack I_STAT.7, wait RX, delay,
+        // wait IRQ7. Start is active-low bit 3 → FFF7h.
+        let mut joy = Joy::new();
+        let mut irq = Irq::new();
+        joy.set_slot1(Some(0xFFF7));
+        select_slot1(&mut joy);
+
+        let mut rx = [0u8; 5];
+        for (i, tx) in [0x01u8, 0x42, 0x00, 0x00, 0x00].into_iter().enumerate() {
+            joy.write8(0x1F80_1040, tx);
+            joy.tick(100, &mut irq);
+            irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
+            joy.tick(byte_cycles() - 100, &mut irq);
+            rx[i] = joy.read8(0x1F80_1040);
+            if i < 4 {
+                joy.tick(150, &mut irq);
+                assert_ne!(
+                    irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
+                    0,
+                    "IRQ7 after byte {i} so PadRead does not time out"
+                );
+            }
+        }
+        assert_eq!(rx, [0xFF, 0x41, 0x5A, 0xF7, 0xFF]);
     }
 
     #[test]
@@ -442,20 +576,20 @@ mod tests {
         let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF));
         select_slot1(&mut joy);
-        let _ = tx_rx(&mut joy, 0x01);
-        joy.tick(300, &mut irq);
+        let _ = tx_rx(&mut joy, &mut irq, 0x01);
+        joy.tick(150, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
-        let _ = tx_rx(&mut joy, 0x42);
-        joy.tick(300, &mut irq);
+        let _ = tx_rx(&mut joy, &mut irq, 0x42);
+        joy.tick(150, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
-        let _ = tx_rx(&mut joy, 0x00);
-        joy.tick(300, &mut irq);
+        let _ = tx_rx(&mut joy, &mut irq, 0x00);
+        joy.tick(150, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
-        let _ = tx_rx(&mut joy, 0x00);
-        joy.tick(300, &mut irq);
+        let _ = tx_rx(&mut joy, &mut irq, 0x00);
+        joy.tick(150, &mut irq);
         irq.write16(0x1F80_1070, !(1 << IRQ_PAD));
-        let _ = tx_rx(&mut joy, 0x00);
-        joy.tick(300, &mut irq);
+        let _ = tx_rx(&mut joy, &mut irq, 0x00);
+        joy.tick(150, &mut irq);
         assert_eq!(
             irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
             0,
@@ -563,9 +697,11 @@ mod tests {
         let mut joy = Joy::new();
         let mut irq = Irq::new();
         joy.set_slot1(Some(0xFFFF));
+        joy.write16(0x1F80_1048, 0x000D);
+        joy.write16(0x1F80_104E, 0x0088);
         joy.write16(0x1F80_104A, 0x1003 | (1 << 13));
-        let rx = tx_rx(&mut joy, 0x01);
-        joy.tick(200, &mut irq);
+        let rx = tx_rx(&mut joy, &mut irq, 0x01);
+        joy.tick(ack_after_sck(), &mut irq);
         assert_eq!(rx, 0xFF);
         assert_eq!(irq.read16(0x1F80_1070) & (1 << IRQ_PAD), 0);
     }

@@ -69,7 +69,7 @@ A user-supplied CD-ROM image (CUE/BIN), never part of the repository. Optional: 
 _Avoid_: ROM, ISO as the name for the image
 
 **JOY**:
-SIO0 at `1F801040h`. Slot 1 may be a standard digital pad (ID `5A41h`). Empty ports and slot 2 clock `0xFF` with no `/ACK`. IRQ7 (`I_STAT.7`) follows `/ACK` after the SPX ~100-cycle Kernel wait, not in the TX cycle, and not after the last digital Read byte.
+SIO0 at `1F801040h`. Slot 1 may be a standard digital pad (ID `5A41h`). Empty ports and slot 2 clock `0xFF` with no `/ACK`. A TX byte shifts at JOY_BAUD (8 × reload × factor); RX and TX Ready Flag 2 wait for last SCK. IRQ7 (`I_STAT.7`) follows `/ACK` after last SCK plus the kernel's 100-clk ignore window, not in the TX cycle, and not after the last digital Read byte.
 _Avoid_: SIO1, DualShock analog mode as the first pad
 
 **Pad**:

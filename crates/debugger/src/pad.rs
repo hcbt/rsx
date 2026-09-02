@@ -287,33 +287,36 @@ mod tests {
     fn joy_read_bios() -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut data = vec![0u8; 512 * 1024];
-        let words = [
+        let wait_rx = |rt: u32| -> [u32; 5] {
+            [
+                0x240F_0200,
+                0x25EF_FFFF,
+                0x15E0_FFFE,
+                0x0000_0000,
+                0x9100_0000 | (rt << 16),
+            ]
+        };
+        let mut words = vec![
             0x3C08_1F80u32,
             0x3508_1040,
+            0x2409_000D,
+            0xA509_0008,
+            0x2409_0088,
+            0xA509_000E,
             0x2409_1003,
             0xA509_000A,
             0x2409_0001,
             0xA109_0000,
-            0x0000_0000,
-            0x910A_0000,
-            0x0000_0000,
-            0x2409_0042,
-            0xA109_0000,
-            0x0000_0000,
-            0x910B_0000,
-            0x0000_0000,
-            0xA100_0000,
-            0x0000_0000,
-            0x910C_0000,
-            0x0000_0000,
-            0xA100_0000,
-            0x0000_0000,
-            0x910D_0000,
-            0x0000_0000,
-            0xA100_0000,
-            0x0000_0000,
-            0x910E_0000,
         ];
+        words.extend_from_slice(&wait_rx(10));
+        words.extend_from_slice(&[0x2409_0042, 0xA109_0000]);
+        words.extend_from_slice(&wait_rx(11));
+        words.push(0xA100_0000);
+        words.extend_from_slice(&wait_rx(12));
+        words.push(0xA100_0000);
+        words.extend_from_slice(&wait_rx(13));
+        words.push(0xA100_0000);
+        words.extend_from_slice(&wait_rx(14));
         for (i, w) in words.iter().enumerate() {
             data[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
@@ -340,9 +343,7 @@ mod tests {
         let f = joy_read_bios();
         let mut m = Machine::from_bios_path(f.path()).unwrap();
         inject(&mut m, None);
-        for _ in 0..32 {
-            m.step();
-        }
+        m.run_until_cycle(m.cycles() + 500_000);
         assert_eq!(
             [m.gpr(10), m.gpr(11), m.gpr(12), m.gpr(13), m.gpr(14)],
             [0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
@@ -357,9 +358,7 @@ mod tests {
                 ..HostButtons::default()
             })),
         );
-        for _ in 0..32 {
-            m.step();
-        }
+        m.run_until_cycle(m.cycles() + 500_000);
         assert_eq!(m.gpr(10), 0xFF, "High-Z");
         assert_eq!(m.gpr(11), 0x41, "idlo");
         assert_eq!(m.gpr(12), 0x5A, "idhi");

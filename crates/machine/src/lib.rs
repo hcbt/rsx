@@ -777,20 +777,24 @@ mod tests {
         let bios = bios_with_program(&[
             0x3C08_1F80, // lui t0, 0x1F80
             0x3508_1040, // ori t0, t0, 0x1040
+            0x2409_000D, // addiu t1, zero, 0x000D
+            0xA509_0008, // sh t1, 8(t0)            JOY_MODE
+            0x2409_0088, // addiu t1, zero, 0x0088
+            0xA509_000E, // sh t1, 14(t0)           JOY_BAUD
             0x2409_1003, // addiu t1, zero, 0x1003  TXEN | /JOYn
             0xA509_000A, // sh t1, 10(t0)           JOY_CTRL
             0x2409_0001, // addiu t1, zero, 1
             0xA109_0000, // sb t1, 0(t0)            JOY_TX
+            0x240F_0200, // addiu t7, zero, 512
+            0x25EF_FFFF, // addiu t7, t7, -1
+            0x15E0_FFFE, // bne t7, zero, -2
             0x0000_0000, // nop
             0x950A_0004, // lhu t2, 4(t0)           JOY_STAT
-            0x0000_0000, // nop
+            0x0000_0000, // nop (load delay)
             0x910B_0000, // lbu t3, 0(t0)           JOY_RX
-            0x0000_0000, // nop
         ]);
         let mut m = Machine::from_bios_path(bios.path()).unwrap();
-        for _ in 0..16 {
-            m.step();
-        }
+        m.run_until_cycle(m.cycles() + 100_000);
         assert_eq!(
             m.gpr(10) & (1 << 1),
             1 << 1,
@@ -799,34 +803,47 @@ mod tests {
         assert_eq!(m.gpr(11), 0xFF, "empty port must clock 0xFF into RX");
     }
 
-    fn joy_read_program() -> [u32; 25] {
+    /// Burn cycles past one JOY byte (last SCK at 8×BAUD), then lbu `rt`.
+    fn joy_wait_rx(rt: u32) -> [u32; 5] {
         [
+            0x240F_0200,              // addiu t7, zero, 512
+            0x25EF_FFFF,              // addiu t7, t7, -1
+            0x15E0_FFFE,              // bne t7, zero, -2
+            0x0000_0000,              // nop
+            0x9100_0000 | (rt << 16), // lbu rt, 0(t0)
+        ]
+    }
+
+    fn joy_read_program() -> Vec<u32> {
+        let mut p = vec![
             0x3C08_1F80, // lui t0, 0x1F80
             0x3508_1040, // ori t0, t0, 0x1040
+            0x2409_000D, // addiu t1, zero, 0x000D  8bit MUL1
+            0xA509_0008, // sh t1, 8(t0)            JOY_MODE
+            0x2409_0088, // addiu t1, zero, 0x0088
+            0xA509_000E, // sh t1, 14(t0)           JOY_BAUD
             0x2409_1003, // addiu t1, zero, 0x1003  TXEN | /JOYn | ACK IRQ
             0xA509_000A, // sh t1, 10(t0)           JOY_CTRL
             0x2409_0001, // addiu t1, zero, 1
             0xA109_0000, // sb t1, 0(t0)            TX 01h
-            0x0000_0000, // nop
-            0x910A_0000, // lbu t2, 0(t0)           RX High-Z
-            0x0000_0000, // nop
+        ];
+        p.extend_from_slice(&joy_wait_rx(10)); // t2 High-Z
+        p.extend_from_slice(&[
             0x2409_0042, // addiu t1, zero, 0x42
             0xA109_0000, // sb t1, 0(t0)            TX 42h
-            0x0000_0000, // nop
-            0x910B_0000, // lbu t3, 0(t0)           RX idlo
-            0x0000_0000, // nop
-            0xA100_0000, // sb zero, 0(t0)          TX TAP
-            0x0000_0000, // nop
-            0x910C_0000, // lbu t4, 0(t0)           RX idhi
-            0x0000_0000, // nop
-            0xA100_0000, // sb zero, 0(t0)          TX MOT
-            0x0000_0000, // nop
-            0x910D_0000, // lbu t5, 0(t0)           RX swlo
-            0x0000_0000, // nop
-            0xA100_0000, // sb zero, 0(t0)          TX MOT
-            0x0000_0000, // nop
-            0x910E_0000, // lbu t6, 0(t0)           RX swhi
-        ]
+        ]);
+        p.extend_from_slice(&joy_wait_rx(11)); // t3 idlo
+        p.push(0xA100_0000); // sb zero, 0(t0) TX TAP
+        p.extend_from_slice(&joy_wait_rx(12)); // t4 idhi
+        p.push(0xA100_0000); // TX MOT
+        p.extend_from_slice(&joy_wait_rx(13)); // t5 swlo
+        p.push(0xA100_0000); // TX MOT
+        p.extend_from_slice(&joy_wait_rx(14)); // t6 swhi
+        p
+    }
+
+    fn run_joy_read(m: &mut Machine) {
+        m.run_until_cycle(m.cycles() + 500_000);
     }
 
     #[test]
@@ -834,9 +851,7 @@ mod tests {
         let bios = bios_with_program(&joy_read_program());
         let mut m = Machine::from_bios_path(bios.path()).unwrap();
         m.set_slot1_pad(Some(0xFFFF));
-        for _ in 0..32 {
-            m.step();
-        }
+        run_joy_read(&mut m);
         assert_eq!(m.gpr(10), 0xFF, "High-Z on address byte");
         assert_eq!(m.gpr(11), 0x41, "idlo digital pad");
         assert_eq!(m.gpr(12), 0x5A, "idhi");
@@ -849,9 +864,7 @@ mod tests {
         let bios = bios_with_program(&joy_read_program());
         let mut m = Machine::from_bios_path(bios.path()).unwrap();
         m.set_slot1_pad(Some(0xFFFF & !(1 << 14)));
-        for _ in 0..32 {
-            m.step();
-        }
+        run_joy_read(&mut m);
         let sw = (m.gpr(13) as u16) | ((m.gpr(14) as u16) << 8);
         assert_eq!(sw & (1 << 14), 0);
         assert_eq!(sw | (1 << 14), 0xFFFF);
@@ -866,9 +879,7 @@ mod tests {
             ..HostButtons::default()
         });
         m.set_slot1_pad(Some(sw));
-        for _ in 0..32 {
-            m.step();
-        }
+        run_joy_read(&mut m);
         let switches = m.gpr(13) as u16 | (m.gpr(14) as u16) << 8;
         assert_eq!(switches & (1 << 14), 0);
         assert_eq!(switches | (1 << 14), 0xFFFF);
@@ -879,6 +890,10 @@ mod tests {
         let bios = bios_with_program(&[
             0x3C08_1F80, // lui t0, 0x1F80
             0x3508_1040, // ori t0, t0, 0x1040
+            0x2409_000D, // addiu t1, zero, 0x000D
+            0xA509_0008, // sh t1, 8(t0) MODE
+            0x2409_0088, // addiu t1, zero, 0x0088
+            0xA509_000E, // sh t1, 14(t0) BAUD
             0x2409_1003, // addiu t1, zero, 0x1003
             0xA509_000A, // sh t1, 10(t0)
             0x2409_0001, // addiu t1, zero, 1
@@ -886,7 +901,7 @@ mod tests {
         ]);
         let mut m = Machine::from_bios_path(bios.path()).unwrap();
         m.set_slot1_pad(Some(0xFFFF));
-        for _ in 0..6 {
+        for _ in 0..10 {
             m.step();
         }
         assert_eq!(
@@ -894,11 +909,17 @@ mod tests {
             0,
             "I_STAT.7 still 0 on the TX step"
         );
-        m.run_until_cycle(m.cycles() + 400);
+        m.run_until_cycle(m.cycles() + 250);
+        assert_eq!(
+            m.irq_stat() & (1 << 7),
+            0,
+            "/ACK must not fire before last SCK"
+        );
+        m.run_until_cycle(m.cycles() + 8 * 0x88);
         assert_ne!(
             m.irq_stat() & (1 << 7),
             0,
-            "IRQ7 after the SPX ~100-cycle Kernel wait"
+            "IRQ7 after last SCK plus the 100-clk ignore window"
         );
     }
 
