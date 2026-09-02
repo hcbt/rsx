@@ -665,6 +665,26 @@ mod tests {
     }
 
     #[test]
+    fn cop2_second_command_keeps_its_own_remaining_clocks() {
+        // SPX: CPU holds for the previous command, then the new cop2cmd runs
+        // its own list clocks. The stall for RTPS (15) must not eat NCLIP (8).
+        const RTPS: u32 = 0x4A00_0001;
+        const NCLIP: u32 = 0x4A00_0006;
+        const MFC2_IR1: u32 = 0x4808_4800;
+        let hold = scratch_prog(&[RTPS, NCLIP, MFC2_IR1]);
+        let nops = scratch_prog(&[RTPS, NCLIP, 0]);
+        debug_assert_eq!(hold.len(), nops.len());
+        let loop_off = (hold.len() as u32 - 2) * 4;
+        let loop_pc = 0x1F80_0000 + loop_off;
+        let d = cycles_to_scratch_pc(&hold, loop_pc) as i64
+            - cycles_to_scratch_pc(&nops, loop_pc) as i64;
+        assert!(
+            (6..=8).contains(&d),
+            "RTPS then NCLIP then MFC2 must still hold NCLIP's remaining clocks vs nop (delta={d})"
+        );
+    }
+
+    #[test]
     fn cop2_sqr_then_nops_expire_hold_before_mfc2() {
         const SQR: u32 = 0x4A00_0028;
         const MFC2_IR1: u32 = 0x4808_4800;

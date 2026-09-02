@@ -285,9 +285,13 @@ impl Cpu {
         } else {
             self.data_cycles
         };
-        let total = fetch_c.max(1) + extra;
+        let own = fetch_c.max(1);
+        let total = own + extra;
         self.muldiv_busy = self.muldiv_busy.saturating_sub(total);
-        self.gte_busy = self.gte_busy.saturating_sub(total);
+        // A cop2cmd that stalled on a previous GTE op starts its own command-list
+        // clocks after that stall. Subtract only this instruction's cycles from
+        // the new busy, not the hold for the old command.
+        self.gte_busy = self.gte_busy.saturating_sub(own);
         bus.tick(total);
     }
 
