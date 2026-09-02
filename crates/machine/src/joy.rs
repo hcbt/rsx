@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::irq::{Irq, IRQ_PAD};
 
 /// Host-side DualShock 4 / standard-pad buttons. `true` is pressed.
@@ -72,7 +74,7 @@ pub struct Joy {
     mode: u16,
     ctrl: u16,
     baud: u16,
-    rx: Option<u8>,
+    rx: VecDeque<u8>,
     /// None = disconnected. Some = active-low digital switches.
     slot1: Option<u16>,
     /// 0 = address byte; 1..4 = digital Read; after last, back to 0.
@@ -80,6 +82,10 @@ pub struct Joy {
     ack_in: u32,
     ack_low: u32,
     irq_stat: bool,
+    last_ctrl: u16,
+    last_tx: u8,
+    tx_count: u32,
+    ack_armed: u32,
 }
 
 impl Joy {
@@ -88,19 +94,31 @@ impl Joy {
             mode: 0,
             ctrl: 0,
             baud: 0x0088,
-            rx: None,
+            rx: VecDeque::with_capacity(8),
             slot1: None,
             xfer: 0,
             ack_in: 0,
             ack_low: 0,
             irq_stat: false,
+            last_ctrl: 0,
+            last_tx: 0,
+            tx_count: 0,
+            ack_armed: 0,
         }
     }
 
     pub fn reset(&mut self) {
         let slot1 = self.slot1;
+        let last_ctrl = self.last_ctrl;
+        let last_tx = self.last_tx;
+        let tx_count = self.tx_count;
+        let ack_armed = self.ack_armed;
         *self = Self::new();
         self.slot1 = slot1;
+        self.last_ctrl = last_ctrl;
+        self.last_tx = last_tx;
+        self.tx_count = tx_count;
+        self.ack_armed = ack_armed;
     }
 
     /// Connect a standard digital pad on slot 1, or `None` to unplug.
@@ -111,6 +129,22 @@ impl Joy {
             self.ack_in = 0;
             self.ack_low = 0;
         }
+    }
+
+    pub fn last_ctrl(&self) -> u16 {
+        self.last_ctrl
+    }
+
+    pub fn last_tx(&self) -> u8 {
+        self.last_tx
+    }
+
+    pub fn tx_count(&self) -> u32 {
+        self.tx_count
+    }
+
+    pub fn ack_armed(&self) -> u32 {
+        self.ack_armed
     }
 
     pub fn tick(&mut self, mut cycles: u32, irq: &mut Irq) {
@@ -124,17 +158,21 @@ impl Joy {
             self.ack_low = ACK_HOLD;
             self.irq_stat = true;
             if self.ctrl & CTRL_ACK_IRQ != 0 {
-                irq.raise(IRQ_PAD);
+                irq.set_level(IRQ_PAD, true);
             }
         }
         if self.ack_low > 0 {
+            let low = self.ack_low;
             self.ack_low = self.ack_low.saturating_sub(cycles);
+            if low > 0 && self.ack_low == 0 {
+                irq.set_level(IRQ_PAD, false);
+            }
         }
     }
 
     pub fn stat(&self) -> u16 {
         let mut s = 0x0005; // TX ready 1 and 2
-        if self.rx.is_some() {
+        if !self.rx.is_empty() {
             s |= 1 << 1;
         }
         if self.ack_low > 0 {
@@ -196,7 +234,14 @@ impl Joy {
     }
 
     fn read_rx(&mut self) -> u8 {
-        self.rx.take().unwrap_or(0xFF)
+        self.rx.pop_front().unwrap_or(0xFF)
+    }
+
+    fn push_rx(&mut self, b: u8) {
+        if self.rx.len() >= 8 {
+            self.rx.pop_front();
+        }
+        self.rx.push_back(b);
     }
 
     fn slot1_selected(&self) -> bool {
@@ -204,44 +249,46 @@ impl Joy {
     }
 
     fn write_tx(&mut self, value: u8) {
+        self.last_tx = value;
+        self.tx_count = self.tx_count.saturating_add(1);
         if self.ctrl & 0x7 == 0 {
             return;
         }
         let pad = self.slot1.filter(|_| self.slot1_selected());
         let Some(switches) = pad else {
-            self.rx = Some(0xFF);
+            self.push_rx(0xFF);
             self.xfer = 0;
             return;
         };
         match self.xfer {
             0 => {
-                self.rx = Some(0xFF);
+                self.push_rx(0xFF);
                 if value == 0x01 {
                     self.xfer = 1;
                     self.schedule_ack();
                 }
             }
             1 => {
-                self.rx = Some(0x41);
+                self.push_rx(0x41);
                 self.xfer = 2;
                 self.schedule_ack();
             }
             2 => {
-                self.rx = Some(0x5A);
+                self.push_rx(0x5A);
                 self.xfer = 3;
                 self.schedule_ack();
             }
             3 => {
-                self.rx = Some(switches as u8);
+                self.push_rx(switches as u8);
                 self.xfer = 4;
                 self.schedule_ack();
             }
             4 => {
-                self.rx = Some((switches >> 8) as u8);
+                self.push_rx((switches >> 8) as u8);
                 self.xfer = 0;
             }
             _ => {
-                self.rx = Some(0xFF);
+                self.push_rx(0xFF);
                 self.xfer = 0;
             }
         }
@@ -250,11 +297,16 @@ impl Joy {
     fn schedule_ack(&mut self) {
         self.ack_in = ACK_DELAY;
         self.ack_low = 0;
+        self.ack_armed = self.ack_armed.saturating_add(1);
     }
 
     fn write_ctrl(&mut self, value: u16) {
+        self.last_ctrl = value;
         if value & CTRL_RESET != 0 {
             self.reset();
+            // Bit 6 is a pulse. The other bits in this write are the new CTRL
+            // (PSY-Q PadRead: Reset | TXEN | /JOYn | ACK IRQ in one halfword).
+            self.ctrl = value & !(CTRL_ACK | CTRL_RESET);
             return;
         }
         if value & CTRL_ACK != 0 && self.ack_low == 0 {
@@ -279,6 +331,23 @@ mod tests {
         joy.write16(0x1F80_104A, 0x1003);
     }
 
+    #[test]
+    fn ctrl_reset_pulse_keeps_txen_and_select() {
+        let mut joy = Joy::new();
+        let mut irq = Irq::new();
+        joy.set_slot1(Some(0xFFFF));
+        // Reset | ACK IRQ | TXEN | /JOYn in one write (PSY-Q PadRead).
+        joy.write16(0x1F80_104A, 0x1043);
+        let rx = tx_rx(&mut joy, 0x01);
+        assert_eq!(rx, 0xFF, "High-Z on address byte");
+        joy.tick(250, &mut irq);
+        assert_ne!(
+            irq.read16(0x1F80_1070) & (1 << IRQ_PAD),
+            0,
+            "Reset pulse must not drop TXEN/select before the 01h /ACK"
+        );
+    }
+
     fn tx_rx(joy: &mut Joy, tx: u8) -> u8 {
         joy.write8(0x1F80_1040, tx);
         joy.read8(0x1F80_1040)
@@ -293,6 +362,20 @@ mod tests {
         joy.tick(200, &mut irq);
         assert_eq!(rx, 0xFF);
         assert_eq!(irq.read16(0x1F80_1070) & (1 << IRQ_PAD), 0);
+    }
+
+    #[test]
+    fn rx_fifo_holds_a_full_digital_read() {
+        let mut joy = Joy::new();
+        joy.set_slot1(Some(0xFFFF));
+        select_slot1(&mut joy);
+        joy.write8(0x1F80_1040, 0x01);
+        joy.write8(0x1F80_1040, 0x42);
+        joy.write8(0x1F80_1040, 0x00);
+        joy.write8(0x1F80_1040, 0x00);
+        joy.write8(0x1F80_1040, 0x00);
+        let got: [u8; 5] = std::array::from_fn(|_| joy.read8(0x1F80_1040));
+        assert_eq!(got, [0xFF, 0x41, 0x5A, 0xFF, 0xFF]);
     }
 
     #[test]

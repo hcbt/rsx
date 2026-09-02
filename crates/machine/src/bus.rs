@@ -116,6 +116,10 @@ impl Bus {
         self.joy.set_slot1(switches);
     }
 
+    pub fn joy(&self) -> &crate::joy::Joy {
+        &self.joy
+    }
+
     pub fn irq(&self) -> &Irq {
         &self.irq
     }

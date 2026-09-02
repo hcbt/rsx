@@ -40,7 +40,9 @@ impl HostPad {
     pub fn poll(&mut self) -> Option<u16> {
         if let Some((name, buttons)) = poll_game_controller() {
             self.note_name(&name);
-            return Some(map_ds4_switches(&buttons));
+            let sw = map_ds4_switches(&buttons);
+            self.note_buttons(sw);
+            return Some(sw);
         }
         let gilrs = self.gilrs.as_mut()?;
         while gilrs.next_event().is_some() {}
@@ -62,6 +64,17 @@ impl HostPad {
             eprintln!("{line}");
             self.note = Some(line);
             self.named = Some(name.to_string());
+        }
+    }
+
+    fn note_buttons(&mut self, sw: u16) {
+        if sw == 0xFFFF {
+            return;
+        }
+        let line = format!("host pad buttons {sw:04X}");
+        if self.note.as_deref() != Some(line.as_str()) {
+            eprintln!("{line}");
+            self.note = Some(line);
         }
     }
 }

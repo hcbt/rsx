@@ -98,6 +98,22 @@ impl Machine {
         self.bus.set_slot1_pad(switches);
     }
 
+    pub fn joy_last_ctrl(&self) -> u16 {
+        self.bus.joy().last_ctrl()
+    }
+
+    pub fn joy_last_tx(&self) -> u8 {
+        self.bus.joy().last_tx()
+    }
+
+    pub fn joy_tx_count(&self) -> u32 {
+        self.bus.joy().tx_count()
+    }
+
+    pub fn joy_ack_armed(&self) -> u32 {
+        self.bus.joy().ack_armed()
+    }
+
     pub fn reset(&mut self) {
         self.cpu.reset();
         self.bus.reset();
