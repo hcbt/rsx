@@ -112,6 +112,10 @@ impl Bus {
         self.cdrom.insert(disc);
     }
 
+    pub fn set_slot1_pad(&mut self, switches: Option<u16>) {
+        self.joy.set_slot1(switches);
+    }
+
     pub fn irq(&self) -> &Irq {
         &self.irq
     }
@@ -302,6 +306,7 @@ impl Bus {
             self.drain_writes(n.min(self.write_q.len() as u32));
         }
         self.timers.tick(n, &mut self.irq);
+        self.joy.tick(n, &mut self.irq);
         self.cdrom.tick(n, &mut self.irq);
         let (cl, cr) = self.cdrom.take_analog();
         self.spu.feed_cd(cl, cr);

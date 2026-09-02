@@ -3,6 +3,7 @@ mod capture;
 mod clock;
 mod config;
 mod headless;
+mod pad;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ struct Debugger {
     uploaded_vblank: u64,
     /// Last CPU inspect paint. Kept on screen while `Pace::Run` skips a rebuild.
     inspect: Option<InspectSnapshot>,
+    pad: pad::HostPad,
 }
 
 struct InspectSnapshot {
@@ -57,6 +59,7 @@ impl Debugger {
             pace_was_behind: false,
             uploaded_vblank: u64::MAX,
             inspect: None,
+            pad: pad::HostPad::open(),
         };
         match audio::Output::start() {
             Ok(o) => d.audio = Some(o),
@@ -162,6 +165,9 @@ impl Debugger {
 
 impl eframe::App for Debugger {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(m) = self.machine.as_mut() {
+            pad::inject(m, self.pad.poll());
+        }
         let mut refresh_inspect = true;
         if self.running {
             if let Some(m) = self.machine.as_mut() {

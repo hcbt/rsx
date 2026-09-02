@@ -67,3 +67,11 @@ _Avoid_: drive, ISO as the name for the controller
 **Disc**:
 A user-supplied CD-ROM image (CUE/BIN), never part of the repository. Optional: missing means the drive is empty.
 _Avoid_: ROM, ISO as the name for the image
+
+**JOY**:
+SIO0 at `1F801040h`. Slot 1 may be a standard digital pad (ID `5A41h`). Empty ports and slot 2 clock `0xFF` with no `/ACK`. IRQ7 (`I_STAT.7`) follows `/ACK` after the SPX ~100-cycle Kernel wait, not in the TX cycle, and not after the last digital Read byte.
+_Avoid_: SIO1, DualShock analog mode as the first pad
+
+**Pad**:
+A standard digital controller on JOY slot 1. The Debugger maps a host DualShock 4 (Share→Select, Options→Start, face/shoulders/D-pad, left stick as D-pad) onto its active-low switches and injects that on present. No host pad → slot 1 stays empty. The Machine does not open HID.
+_Avoid_: rumble, analog ID `5A73h`, slot 2, keyboard-as-pad

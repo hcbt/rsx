@@ -17,6 +17,7 @@ mod timers;
 pub use bios::BiosError;
 pub use cdrom::{CdCmdEvent, CdromView};
 pub use disc::DiscError;
+pub use joy::{map_ds4_switches, HostButtons};
 
 use std::path::Path;
 
@@ -90,6 +91,11 @@ impl Machine {
         let disc = crate::disc::load_disc(path.as_ref())?;
         self.bus.insert_disc(disc);
         Ok(())
+    }
+
+    /// Slot 1 standard digital pad. `None` leaves the port empty (`0xFF`, no `/ACK`).
+    pub fn set_slot1_pad(&mut self, switches: Option<u16>) {
+        self.bus.set_slot1_pad(switches);
     }
 
     pub fn reset(&mut self) {
@@ -775,6 +781,109 @@ mod tests {
             "JOY_STAT bit 1 (RX not empty)"
         );
         assert_eq!(m.gpr(11), 0xFF, "empty port must clock 0xFF into RX");
+    }
+
+    fn joy_read_program() -> [u32; 25] {
+        [
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_1040, // ori t0, t0, 0x1040
+            0x2409_1003, // addiu t1, zero, 0x1003  TXEN | /JOYn | ACK IRQ
+            0xA509_000A, // sh t1, 10(t0)           JOY_CTRL
+            0x2409_0001, // addiu t1, zero, 1
+            0xA109_0000, // sb t1, 0(t0)            TX 01h
+            0x0000_0000, // nop
+            0x910A_0000, // lbu t2, 0(t0)           RX High-Z
+            0x0000_0000, // nop
+            0x2409_0042, // addiu t1, zero, 0x42
+            0xA109_0000, // sb t1, 0(t0)            TX 42h
+            0x0000_0000, // nop
+            0x910B_0000, // lbu t3, 0(t0)           RX idlo
+            0x0000_0000, // nop
+            0xA100_0000, // sb zero, 0(t0)          TX TAP
+            0x0000_0000, // nop
+            0x910C_0000, // lbu t4, 0(t0)           RX idhi
+            0x0000_0000, // nop
+            0xA100_0000, // sb zero, 0(t0)          TX MOT
+            0x0000_0000, // nop
+            0x910D_0000, // lbu t5, 0(t0)           RX swlo
+            0x0000_0000, // nop
+            0xA100_0000, // sb zero, 0(t0)          TX MOT
+            0x0000_0000, // nop
+            0x910E_0000, // lbu t6, 0(t0)           RX swhi
+        ]
+    }
+
+    #[test]
+    fn connected_joy_read_is_highz_41_5a_ffff() {
+        let bios = bios_with_program(&joy_read_program());
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        m.set_slot1_pad(Some(0xFFFF));
+        for _ in 0..32 {
+            m.step();
+        }
+        assert_eq!(m.gpr(10), 0xFF, "High-Z on address byte");
+        assert_eq!(m.gpr(11), 0x41, "idlo digital pad");
+        assert_eq!(m.gpr(12), 0x5A, "idhi");
+        assert_eq!(m.gpr(13), 0xFF, "swlo all released");
+        assert_eq!(m.gpr(14), 0xFF, "swhi all released");
+    }
+
+    #[test]
+    fn connected_joy_cross_clears_bit14() {
+        let bios = bios_with_program(&joy_read_program());
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        m.set_slot1_pad(Some(0xFFFF & !(1 << 14)));
+        for _ in 0..32 {
+            m.step();
+        }
+        let sw = (m.gpr(13) as u16) | ((m.gpr(14) as u16) << 8);
+        assert_eq!(sw & (1 << 14), 0);
+        assert_eq!(sw | (1 << 14), 0xFFFF);
+    }
+
+    #[test]
+    fn injected_ds4_cross_is_what_the_guest_reads() {
+        let bios = bios_with_program(&joy_read_program());
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        let sw = map_ds4_switches(&HostButtons {
+            cross: true,
+            ..HostButtons::default()
+        });
+        m.set_slot1_pad(Some(sw));
+        for _ in 0..32 {
+            m.step();
+        }
+        let switches = m.gpr(13) as u16 | (m.gpr(14) as u16) << 8;
+        assert_eq!(switches & (1 << 14), 0);
+        assert_eq!(switches | (1 << 14), 0xFFFF);
+    }
+
+    #[test]
+    fn connected_joy_irq7_after_kernel_wait_not_on_tx() {
+        let bios = bios_with_program(&[
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x3508_1040, // ori t0, t0, 0x1040
+            0x2409_1003, // addiu t1, zero, 0x1003
+            0xA509_000A, // sh t1, 10(t0)
+            0x2409_0001, // addiu t1, zero, 1
+            0xA109_0000, // sb t1, 0(t0) TX 01h
+        ]);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        m.set_slot1_pad(Some(0xFFFF));
+        for _ in 0..6 {
+            m.step();
+        }
+        assert_eq!(
+            m.irq_stat() & (1 << 7),
+            0,
+            "I_STAT.7 still 0 on the TX step"
+        );
+        m.run_until_cycle(m.cycles() + 200);
+        assert_ne!(
+            m.irq_stat() & (1 << 7),
+            0,
+            "IRQ7 after the SPX ~100-cycle Kernel wait"
+        );
     }
 
     #[test]
