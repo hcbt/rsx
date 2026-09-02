@@ -703,9 +703,10 @@ mod tests {
         b.write32(0x1F80_1810, 8 | (8 << 16));
         b.tick(8);
         let busy = b.gpu().draw_remaining();
+        assert_ne!(busy, 64, "occupancy is not 1 clk/pixel");
         assert!(
             busy >= 50,
-            "8×8 rect occupancy must still be outstanding (busy={busy})"
+            "8×8 old-GPU rect occupancy must still be outstanding (busy={busy})"
         );
         let c0 = b.cycles();
         let _ = b.read32(0x1F80_1814);
@@ -730,12 +731,12 @@ mod tests {
         b.write32(0x1F80_1810, 0xE4_0000_00 | 1023 | (511 << 10));
         b.write32(0x1F80_1810, 0x60 << 24 | 0x00F800);
         b.write32(0x1F80_1810, 0);
-        b.write32(0x1F80_1810, 80 | (80 << 16));
+        b.write32(0x1F80_1810, 128 | (80 << 16));
         b.tick(8);
         let busy = b.gpu().draw_remaining();
         assert!(
             busy > 4096,
-            "80×80 occupancy must exceed two scanlines (busy={busy})"
+            "128×80 old-GPU occupancy must exceed two scanlines (busy={busy})"
         );
         let pos = b.cycles() % CYCLES_PER_LINE;
         let to_line = (CYCLES_PER_LINE - pos) as u32;

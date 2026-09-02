@@ -1496,7 +1496,7 @@ fn msf_to_lba(mm: u8, ss: u8, ff: u8) -> u32 {
     let m = bcd(mm);
     let s = bcd(ss);
     let f = bcd(ff);
-    (m * 60 + s) * 75 + f - 150
+    ((m * 60 + s) * 75 + f).saturating_sub(150)
 }
 
 fn to_bcd(v: u32) -> u8 {

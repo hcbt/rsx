@@ -57,7 +57,7 @@ The SCPH-1001 master crystal at 33.8688 MHz. CPU, bus, DMA, GPU (including the C
 _Avoid_: audio buffer as master clock, vsync as the guest clock, event delay as the guest clock
 
 **SPU**:
-The PlayStation sound processor, with its own 512 KiB RAM. It mixes 24 ADPCM voices to 44100 Hz stereo PCM (one pair per 768 master cycles). The Debugger plays that and `--capture-at` writes `audio.wav`. CD-XA and reverb are not implemented.
+The PlayStation sound processor, with its own 512 KiB RAM. It mixes 24 ADPCM voices to 44100 Hz stereo PCM (one pair per 768 master cycles). The Debugger plays that and `--capture-at` writes `audio.wav`. CD-XA (Setmode bit 6, MODE2 audio+realtime) mixes into SPU analog; SPUCNT bit 7 runs the reverb work-area mix.
 _Avoid_: audio, mixer
 
 **CD-ROM**:

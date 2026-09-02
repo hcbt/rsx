@@ -5,35 +5,33 @@ use crate::DisplayArea;
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
 const FIFO_WORDS: usize = 16;
-const TEX_CACHE_BITS: usize = VRAM_W * VRAM_H / 64;
-const TEX_PAGE: usize = 256 * 256;
-const TEX_PAGE_BITS: usize = TEX_PAGE / 64;
 
-/// Sampled-texel cache. Fill does not discard it; GP0(01h) does (SPX).
-/// Dense so a long 3D scene does not grow a HashMap of every unique halfword.
+/// SPX: 2 KB texture cache = 256 lines × 4 halfwords. Fill does not discard it;
+/// GP0(01h) and COPY / TexPage base / 4bpp↔non-4bpp do.
+#[derive(Clone, Copy)]
+struct TexLine {
+    tag: u32,
+    data: [u16; 4],
+}
+
 struct TexCache {
-    data: Vec<u16>,
-    valid: Vec<u64>,
-    page: Vec<u16>,
-    page_valid: Vec<u64>,
-    page_key: u64,
+    lines: [TexLine; 256],
 }
 
 impl TexCache {
     fn new() -> Self {
         Self {
-            data: vec![0; VRAM_W * VRAM_H],
-            valid: vec![0; TEX_CACHE_BITS],
-            page: vec![0; TEX_PAGE],
-            page_valid: vec![0; TEX_PAGE_BITS],
-            page_key: u64::MAX,
+            lines: [TexLine {
+                tag: u32::MAX,
+                data: [0; 4],
+            }; 256],
         }
     }
 
     fn clear(&mut self) {
-        self.valid.fill(0);
-        self.page_valid.fill(0);
-        self.page_key = u64::MAX;
+        for line in &mut self.lines {
+            line.tag = u32::MAX;
+        }
     }
 }
 
@@ -79,7 +77,12 @@ pub struct Gpu {
     range_y2: u32,
     vram_2m: bool,
     tex_cache: TexCache,
-    clut_cache: Option<(u32, u32, [u16; 256])>,
+    clut_low: [u16; 16],
+    clut_high: [u16; 240],
+    clut_low_at: Option<(u32, u32)>,
+    clut_high_at: Option<(u32, u32)>,
+    tex_misses: u32,
+    clut_miss_hw: u32,
     transfer: Option<Transfer>,
     pub gp0_count: u64,
     pub gp1_count: u64,
@@ -120,8 +123,6 @@ pub struct Gpu {
     crt_line: u32,
     fifo: VecDeque<u32>,
     draw_busy: u32,
-    plot_cost: u32,
-    plotting: bool,
     block28: bool,
     scanline: u32,
 }
@@ -182,7 +183,12 @@ impl Gpu {
             range_y2: 0x10 + 240,
             vram_2m: false,
             tex_cache: TexCache::new(),
-            clut_cache: None,
+            clut_low: [0; 16],
+            clut_high: [0; 240],
+            clut_low_at: None,
+            clut_high_at: None,
+            tex_misses: 0,
+            clut_miss_hw: 0,
             transfer: None,
             gp0_count: 0,
             gp1_count: 0,
@@ -220,8 +226,6 @@ impl Gpu {
             crt_line: u32::MAX,
             fifo: VecDeque::with_capacity(FIFO_WORDS),
             draw_busy: 0,
-            plot_cost: 1,
-            plotting: false,
             block28: false,
             scanline: 0,
         };
@@ -454,17 +458,11 @@ impl Gpu {
         }
         if self.gp0_ready() {
             let cmd = self.gp0_cmd.unwrap();
-            // Fill VRAM is a 16-pixel burst, not fragment raster. Raster
-            // primitives take one cycle per written pixel (two if textured).
+            // Occupancy is SPX old-GPU Rendering Timings, not 1/2 clk/pixel.
             let raster = matches!(cmd, 0x20..=0x7F | 0x80);
-            self.plotting = raster;
-            self.plot_cost = if raster && cmd & 4 != 0 && (0x20..=0x7F).contains(&cmd) {
-                2
-            } else {
-                1
-            };
+            self.tex_misses = 0;
+            self.clut_miss_hw = 0;
             self.exec_gp0();
-            self.plotting = false;
             if raster || cmd == 0x02 {
                 self.draw_busy = self.draw_busy.max(1);
                 self.block28 = true;
@@ -506,7 +504,7 @@ impl Gpu {
         match cmd {
             0x01 => {
                 self.tex_cache.clear();
-                self.clut_cache = None;
+                self.discard_clut();
             }
             0x1F => {
                 self.gpu_irq = true;
@@ -521,6 +519,7 @@ impl Gpu {
                 self.vram_copy();
             }
             0xA0 | 0xC0 => {
+                self.tex_cache.clear();
                 let xy = self.gp0_buf[1];
                 let wh = self.gp0_buf[2];
                 let x = xy & 0x3FF;
@@ -542,9 +541,7 @@ impl Gpu {
             }
             0xE1 => {
                 let p = self.gp0_buf[0];
-                self.tex_x = (p & 0xF) as u8;
-                self.tex_y = ((p >> 4) & 1) as u8;
-                self.tex_page = p;
+                self.set_tex_page(p);
                 self.dither = p & (1 << 9) != 0;
                 self.draw_to_display = p & (1 << 10) != 0;
                 self.update_stat();
@@ -713,9 +710,88 @@ impl Gpu {
                 self.write_half(xx as u32, yy as u32, pix);
             }
         }
-        // SPX: Fill is done in 16-pixel units, not one fragment per cycle.
-        let units = ((w as u32) / 16).max(1).saturating_mul((h as u32).max(1));
-        self.draw_busy = self.draw_busy.saturating_add(units);
+        // SPX old GPU Fill: 1.00 clk per 16 pixels + 7.00 clk per scanline.
+        self.occupy_old_fill(w.max(0) as u32, h.max(0) as u32);
+    }
+
+    fn add_busy_quarters(&mut self, q: u32) {
+        self.draw_busy = self.draw_busy.saturating_add(q.div_ceil(4));
+    }
+
+    fn occupy_cache_misses(&mut self) {
+        // Texture miss theoretically 8.00 clk (table ~8.25); CLUT 1.00/halfword.
+        let q = self.tex_misses.saturating_mul(33) + self.clut_miss_hw.saturating_mul(4);
+        self.tex_misses = 0;
+        self.clut_miss_hw = 0;
+        self.add_busy_quarters(q);
+    }
+
+    fn occupy_old_fill(&mut self, w: u32, h: u32) {
+        if h == 0 {
+            return;
+        }
+        let chunks = (w / 16).max(1);
+        self.add_busy_quarters(chunks.saturating_mul(h).saturating_mul(4) + h.saturating_mul(28));
+    }
+
+    fn occupy_old_rect(&mut self, w: u32, h: u32, semi: bool) {
+        if h == 0 {
+            return;
+        }
+        let pair_w = w & !1;
+        // 1.00 any-scanline + 5.00/scanline (old GPU, no semi) + 0.50/pixel-pair.
+        let mut q = h.saturating_mul(4) + h.saturating_mul(20);
+        if semi {
+            q = q.saturating_add(pair_w.saturating_mul(h).saturating_mul(6));
+        } else {
+            q = q.saturating_add(pair_w.saturating_mul(h).saturating_mul(2));
+        }
+        self.add_busy_quarters(q);
+        self.occupy_cache_misses();
+    }
+
+    fn occupy_old_poly(
+        &mut self,
+        pixels: u32,
+        scanlines: u32,
+        textured: bool,
+        gouraud: bool,
+        semi: bool,
+    ) {
+        let mut q = 40u32; // 10.00 precalc
+        if textured {
+            q = q.saturating_add(360);
+        }
+        if gouraud {
+            q = q.saturating_add(600);
+        }
+        q = q.saturating_add(scanlines.saturating_mul(4));
+        q = q.saturating_add(if semi {
+            scanlines.saturating_mul(22)
+        } else {
+            scanlines.saturating_mul(19)
+        });
+        let pix_q = match (semi, textured || gouraud) {
+            (true, true) => 12,
+            (true, false) => 6,
+            (false, true) => 4,
+            (false, false) => 2,
+        };
+        q = q.saturating_add(pixels.saturating_mul(pix_q));
+        self.add_busy_quarters(q);
+    }
+
+    fn occupy_old_line(&mut self, pixels: u32, horizontal: bool, gouraud: bool, semi: bool) {
+        let mut q = 160u32; // 40.00 precalc
+        if gouraud {
+            q = q.saturating_add(240);
+        }
+        let mut per: u32 = if horizontal { 4 } else { 8 };
+        if semi {
+            per = per.saturating_add(8);
+        }
+        q = q.saturating_add(pixels.saturating_mul(per));
+        self.add_busy_quarters(q);
     }
 
     fn polygon(&mut self) {
@@ -752,9 +828,7 @@ impl Gpu {
                     self.clut_y = (clut >> 6) & 0x1FF;
                 }
                 if i == 1 {
-                    self.tex_page = uv >> 16;
-                    self.tex_x = (self.tex_page & 0xF) as u8;
-                    self.tex_y = ((self.tex_page >> 4) & 1) as u8;
+                    self.set_tex_page(uv >> 16);
                     self.dither = self.tex_page & (1 << 9) != 0;
                 }
             }
@@ -801,10 +875,15 @@ impl Gpu {
         let blend = textured && cmd & (1 << 24) == 0;
         let semi = cmd & (1 << 25) != 0;
         let dither = self.dither && (gouraud || blend);
-        self.tri(verts[0], verts[1], verts[2], textured, blend, semi, dither);
+        self.tri(
+            verts[0], verts[1], verts[2], textured, blend, semi, dither, gouraud,
+        );
         if quad {
-            self.tri(verts[1], verts[2], verts[3], textured, blend, semi, dither);
+            self.tri(
+                verts[1], verts[2], verts[3], textured, blend, semi, dither, gouraud,
+            );
         }
+        self.occupy_cache_misses();
     }
 
     fn tri(
@@ -816,6 +895,7 @@ impl Gpu {
         blend: bool,
         semi: bool,
         dither: bool,
+        gouraud: bool,
     ) {
         let minx = a.0.min(b.0).min(c.0).max(self.draw_x1);
         let miny = a.1.min(b.1).min(c.1).max(self.draw_y1);
@@ -890,10 +970,8 @@ impl Gpu {
         let mut row_r = i64::from(row_w0) * ar + i64::from(row_w1) * br + i64::from(row_w2) * cr;
         let mut row_g = i64::from(row_w0) * ag + i64::from(row_w1) * bg + i64::from(row_w2) * cg;
         let mut row_b = i64::from(row_w0) * ab + i64::from(row_w1) * bb + i64::from(row_w2) * cb;
-        let cost = if self.plotting { self.plot_cost } else { 0 };
-        let plotting = self.plotting;
-        self.plotting = false;
         let mut plots = 0u32;
+        let mut scanlines = 0u32;
         for y in miny..=maxy {
             if y < max_vy {
                 let mut w0 = row_w0;
@@ -945,6 +1023,7 @@ impl Gpu {
                         )
                     };
                     plots += self.put_drawn(x, y, color, textured, semi);
+                    scanlines = scanlines.max(1);
                     w0 += dw0dx;
                     w1 += dw1dx;
                     w2 += dw2dx;
@@ -965,8 +1044,8 @@ impl Gpu {
             row_g += dg_dy;
             row_b += db_dy;
         }
-        self.plotting = plotting;
-        self.draw_busy = self.draw_busy.saturating_add(plots.saturating_mul(cost));
+        let yspan = (maxy - miny + 1).max(0) as u32;
+        self.occupy_old_poly(plots, yspan.max(scanlines), textured, gouraud, semi);
     }
 
     fn line(&mut self) {
@@ -982,6 +1061,8 @@ impl Gpu {
             }
             let (x0, y0) = self.vertex_xy(prev);
             let (x1, y1) = self.vertex_xy(word);
+            let horiz = y0 == y1;
+            let pixels = (x0 - x1).unsigned_abs().max((y0 - y1).unsigned_abs()) + 1;
             self.draw_line(
                 x0,
                 y0,
@@ -989,6 +1070,8 @@ impl Gpu {
                 y1,
                 rgb888_to_555(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF),
             );
+            let cmd = self.gp0_buf[0];
+            self.occupy_old_line(pixels, horiz, cmd & (1 << 28) != 0, cmd & (1 << 25) != 0);
             prev = word;
             i += 1;
         }
@@ -1078,6 +1161,7 @@ impl Gpu {
                 self.plot(x + xx, y + yy, color, textured, semi);
             }
         }
+        self.occupy_old_rect(w.max(0) as u32, h.max(0) as u32, semi);
     }
 
     fn vram_copy(&mut self) {
@@ -1096,21 +1180,30 @@ impl Gpu {
                 self.write_half((dx + x) & 0x3FF, (dy + y) & 0x1FF, p);
             }
         }
+        // SPX old GPU VRAM-to-VRAM: 1.50 clk/pixel + 2.50/scanline.
+        self.add_busy_quarters(w.saturating_mul(h).saturating_mul(6) + h.saturating_mul(10));
+    }
+
+    fn discard_clut(&mut self) {
+        self.clut_low_at = None;
+        self.clut_high_at = None;
+    }
+
+    /// SPX: TexPage base X,Y or 4bpp↔non-4bpp flushes the texture cache.
+    fn set_tex_page(&mut self, page: u32) {
+        let old = self.tex_page;
+        let old4 = (old >> 7) & 3 == 0;
+        let new4 = (page >> 7) & 3 == 0;
+        if (old & 0x1F) != (page & 0x1F) || old4 != new4 {
+            self.tex_cache.clear();
+        }
+        self.tex_page = page;
+        self.tex_x = (page & 0xF) as u8;
+        self.tex_y = ((page >> 4) & 1) as u8;
     }
 
     fn sample_tex(&mut self, u: u8, v: u8) -> u16 {
         let page = self.tex_page;
-        let key = u64::from(page)
-            | (u64::from(self.clut_x) << 16)
-            | (u64::from(self.clut_y) << 32)
-            | (u64::from(self.tex_win_mask_x & 0x1F) << 41)
-            | (u64::from(self.tex_win_mask_y & 0x1F) << 46)
-            | (u64::from(self.tex_win_off_x & 0x1F) << 51)
-            | (u64::from(self.tex_win_off_y & 0x1F) << 56);
-        if self.tex_cache.page_key != key {
-            self.tex_cache.page_key = key;
-            self.tex_cache.page_valid.fill(0);
-        }
         // SPX: UV = (UV AND NOT (mask*8)) OR ((offset AND mask)*8)
         let mx = !(self.tex_win_mask_x << 3) & 0xFF;
         let my = !(self.tex_win_mask_y << 3) & 0xFF;
@@ -1118,16 +1211,10 @@ impl Gpu {
         let oy = ((self.tex_win_off_y & self.tex_win_mask_y) << 3) & 0xFF;
         let uu = (u32::from(u) & mx) | ox;
         let vv = (u32::from(v) & my) | oy;
-        let i = (vv as usize) * 256 + uu as usize;
-        let bit = 1u64 << (i & 63);
-        let slot = i >> 6;
-        if self.tex_cache.page_valid[slot] & bit != 0 {
-            return self.tex_cache.page[i];
-        }
         let tx_base = (page & 0xF) * 64;
         let ty_base = ((page >> 4) & 1) * 256;
         let mode = (page >> 7) & 3;
-        let p = match mode {
+        match mode {
             0 => {
                 let texel = self.cached_half(tx_base + uu / 4, ty_base + vv);
                 let index = (texel >> ((uu & 3) * 4)) & 0xF;
@@ -1138,11 +1225,8 @@ impl Gpu {
                 let index = (texel >> ((uu & 1) * 8)) & 0xFF;
                 self.cached_clut(u32::from(index), true)
             }
-            _ => self.read_half(tx_base + uu, ty_base + vv),
-        };
-        self.tex_cache.page[i] = p;
-        self.tex_cache.page_valid[slot] |= bit;
-        p
+            _ => self.cached_half(tx_base + uu, ty_base + vv),
+        }
     }
 
     fn vertex_xy(&self, word: u32) -> (i32, i32) {
@@ -1155,12 +1239,7 @@ impl Gpu {
         if x < self.draw_x1 || x > self.draw_x2 || y < self.draw_y1 || y > self.draw_y2 {
             return;
         }
-        let n = self.put_drawn(x, y, color, textured, semi);
-        if self.plotting {
-            self.draw_busy = self
-                .draw_busy
-                .saturating_add(n.saturating_mul(self.plot_cost));
-        }
+        self.put_drawn(x, y, color, textured, semi);
     }
 
     /// Triangle interior is already clipped. Count occupancy at the caller.
@@ -1198,36 +1277,55 @@ impl Gpu {
         if self.vram_2m && y >= 512 {
             return 0x7FFF;
         }
-        let xi = (x as usize) & (VRAM_W - 1);
-        let yi = (y as usize) & (VRAM_H - 1);
-        let i = yi * VRAM_W + xi;
-        let bit = 1u64 << (i & 63);
-        let slot = i >> 6;
-        if self.tex_cache.valid[slot] & bit != 0 {
-            return self.tex_cache.data[i];
+        let x = x & 0x3FF;
+        let y = y & 0x1FF;
+        let fourbpp = (self.tex_page >> 7) & 3 == 0;
+        let line = if fourbpp {
+            (((x & 0x0C) >> 2) | ((y & 0x3F) << 2)) as usize
+        } else {
+            (((x & 0x1C) >> 2) | ((y & 0x1F) << 3)) as usize
+        };
+        let tag = (x & !3) | (y << 10);
+        let slot = (x & 3) as usize;
+        if self.tex_cache.lines[line].tag == tag {
+            return self.tex_cache.lines[line].data[slot];
         }
-        let p = self.vram[i];
-        self.tex_cache.data[i] = p;
-        self.tex_cache.valid[slot] |= bit;
-        p
+        let base = x & !3;
+        let mut data = [0u16; 4];
+        for i in 0..4 {
+            data[i] = self.read_half(base + i as u32, y);
+        }
+        self.tex_cache.lines[line] = TexLine { tag, data };
+        self.tex_misses = self.tex_misses.saturating_add(1);
+        data[slot]
     }
 
     fn cached_clut(&mut self, index: u32, eight: bool) -> u16 {
-        // SPX: CLUT cache is 256 halfwords (one 8-bit palette, or sixteen 4-bit).
+        // SPX: 512 B CLUT cache, two lines (16 + 240 halfwords).
         let key = (self.clut_x, self.clut_y);
-        let idx = index as usize & if eight { 255 } else { 15 };
-        if let Some((cx, cy, pal)) = self.clut_cache {
-            if (cx, cy) == key {
-                return pal[idx];
+        if eight && index >= 16 {
+            if self.clut_high_at != Some(key) {
+                for i in 0..16 {
+                    self.clut_low[i] = self.read_half(self.clut_x + i as u32, self.clut_y);
+                }
+                for i in 0..240 {
+                    self.clut_high[i] = self.read_half(self.clut_x + 16 + i as u32, self.clut_y);
+                }
+                self.clut_low_at = Some(key);
+                self.clut_high_at = Some(key);
+                self.clut_miss_hw = self.clut_miss_hw.saturating_add(256);
             }
+            return self.clut_high[index as usize - 16];
         }
-        let mut pal = [0u16; 256];
-        for i in 0..256 {
-            pal[i] = self.read_half(self.clut_x + i as u32, self.clut_y);
+        let idx = index as usize & 15;
+        if self.clut_low_at != Some(key) {
+            for i in 0..16 {
+                self.clut_low[i] = self.read_half(self.clut_x + i as u32, self.clut_y);
+            }
+            self.clut_low_at = Some(key);
+            self.clut_miss_hw = self.clut_miss_hw.saturating_add(16);
         }
-        let v = pal[idx];
-        self.clut_cache = Some((key.0, key.1, pal));
-        v
+        self.clut_low[idx]
     }
 
     fn read_half(&self, x: u32, y: u32) -> u16 {
@@ -1247,9 +1345,6 @@ impl Gpu {
         let y = (y as usize) & (VRAM_H - 1);
         if self.mask_check && self.vram[y * VRAM_W + x] & 0x8000 != 0 {
             return;
-        }
-        if self.plotting {
-            self.draw_busy = self.draw_busy.saturating_add(self.plot_cost);
         }
         self.vram[y * VRAM_W + x] = v;
     }
@@ -1621,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_stays_busy_one_cycle_per_pixel() {
+    fn fill_stays_busy_old_gpu_fill_timings() {
         let mut gpu = Gpu::new();
         gpu.gp0(0xE3_0000_00);
         gpu.gp0(0xE4_0000_00 | 1023 | (511 << 10));
@@ -1632,10 +1727,43 @@ mod tests {
         assert!(gpu.busy(), "16×16 fill must not finish in the issue cycles");
         let stat = gpu.stat();
         assert_eq!(stat & (1 << 26), 0, "GPUSTAT.26 clear while drawing");
+        // SPX old GPU: 1.00 clk/16px + 7.00 clk/scanline → 16×16 = 128.
         gpu.tick(16, 0, false);
         assert!(
+            gpu.busy(),
+            "Fill is not 1 clk/pixel; 16 cycles is not enough for 16×16"
+        );
+        gpu.tick(200, 0, false);
+        assert!(
             !gpu.busy(),
-            "Fill VRAM is one cycle per 16-pixel unit (16×16 = 16 cycles)"
+            "old-GPU 16×16 fill finishes within 128+issue cycles"
+        );
+    }
+
+    #[test]
+    fn untextured_8x8_rect_is_old_gpu_occupancy_not_one_clk_per_pixel() {
+        let mut gpu = Gpu::new();
+        gpu.gp0(0xE3_0000_00);
+        gpu.gp0(0xE4_0000_00 | 1023 | (511 << 10));
+        gpu.gp0(0x60 << 24 | 0x00F800);
+        gpu.gp0(0);
+        gpu.gp0(8 | (8 << 16));
+        gpu.tick(3, 0, false); // drain 60h, xy, size (E3/E4 skip the FIFO)
+        let busy = gpu.draw_remaining();
+        assert_ne!(
+            busy, 64,
+            "must not use the old 1 clk/written-pixel occupancy"
+        );
+        // SPX old GPU rect: 1.00 any-scanline + 5.00/scanline + 0.50/pixel
+        // (pixel-pairs) → 8 + 40 + 32 = 80.
+        assert_eq!(
+            busy, 80,
+            "8×8 untextured rect old-GPU occupancy (got {busy})"
+        );
+        assert_eq!(
+            gpu.stat() & (1 << 26),
+            0,
+            "GPUSTAT.26 stays 0 while draw remaining > 0"
         );
     }
 
@@ -1730,9 +1858,16 @@ mod tests {
         gpu.gp0(0);
         gpu.gp0(8 | (8 << 16));
         gpu.tick(3, 0, false);
+        let busy = gpu.draw_remaining();
+        assert_eq!(busy, 80, "old-GPU 8×8 rect occupancy");
         assert!(gpu.busy(), "8×8 rect must not finish in the issue cycles");
         gpu.tick(8 * 8, 0, false);
-        assert!(!gpu.busy(), "untextured rect is one cycle per pixel");
+        assert!(
+            gpu.busy(),
+            "old-GPU occupancy is 80 clk, not 64 (1 clk/pixel)"
+        );
+        gpu.tick(16, 0, false);
+        assert!(!gpu.busy(), "8×8 untextured rect finishes at 80 clk");
     }
 
     #[test]
@@ -1757,17 +1892,15 @@ mod tests {
         gpu.gp0(0); // uv 0,0 clut 0
         gpu.gp0(8 | (8 << 16));
         gpu.tick(4, 0, false);
+        let busy = gpu.draw_remaining();
+        assert_ne!(busy, 128, "must not use 2 clk/written-pixel occupancy");
         assert!(
-            gpu.busy(),
-            "textured 8×8 must not finish in the issue cycles"
+            busy > 80,
+            "textured 8×8 includes old-GPU rect time plus cache-miss extras (busy={busy})"
         );
-        gpu.tick(8 * 8, 0, false);
-        assert!(
-            gpu.busy(),
-            "textured commands cost two cycles per written pixel"
-        );
-        gpu.tick(8 * 8 + 8, 0, false);
-        assert!(!gpu.busy());
+        assert_eq!(gpu.stat() & (1 << 26), 0, "GPUSTAT.26 while remaining > 0");
+        gpu.tick(busy, 0, false);
+        assert!(!gpu.busy(), "occupancy must run to completion");
     }
 
     #[test]
@@ -2590,6 +2723,186 @@ mod tests {
         assert_eq!(
             p, 0x03E0,
             "8-bit index 17 must sample CLUT[17], not CLUT[17&15]=CLUT[1] (got {p:#06X})"
+        );
+    }
+
+    fn e1_4bpp(gpu: &mut Gpu, page_x: u32) {
+        gpu.gp0(0xE1 << 24 | (page_x & 0xF));
+    }
+
+    fn e1_8bpp(gpu: &mut Gpu, page_x: u32) {
+        gpu.gp0(0xE1 << 24 | (page_x & 0xF) | (1 << 7));
+    }
+
+    fn draw_4bpp_uv(gpu: &mut Gpu, dest_x: i32, dest_y: i32, u: u8, v: u8, clut_y: u32) {
+        gpu.gp0(0x65 << 24 | 0x808080);
+        gpu.gp0(xy(dest_x, dest_y));
+        gpu.gp0(u32::from(u) | (u32::from(v) << 8) | ((clut_y << 6) << 16));
+        gpu.gp0(1 | (1 << 16));
+        settle(gpu);
+    }
+
+    fn fill_vram(gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32, rgb24: u32) {
+        gpu.gp0(0x02 << 24 | (rgb24 & 0xFF_FFFF));
+        gpu.gp0((x & 0x3F0) | (y << 16));
+        gpu.gp0((w & 0x3FF) | (h << 16));
+        settle(gpu);
+    }
+
+    #[test]
+    fn texture_cache_line_0_and_20h_cannot_be_cached_together() {
+        // SPX: 4bpp Line = X AND 0Ch, Y AND 3Fh — (0,0) and (20h,0) share a line.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001); // 4bpp index 1 at (0,0)
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        draw_4bpp_uv(&mut gpu, 8, 8, 0, 0, 480);
+        assert_eq!(peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF, 0x001F);
+        // UV 80h samples halfword X=20h on 4bpp. Same cache line as (0,0).
+        draw_4bpp_uv(&mut gpu, 9, 8, 0x80, 0, 480);
+        fill_vram(&mut gpu, 0, 0, 16, 1, 0);
+        draw_4bpp_uv(&mut gpu, 16, 16, 0, 0, 480);
+        assert_eq!(
+            peek(&mut gpu, 16, 16, 1, 1).pixels[0] & 0x7FFF,
+            0,
+            "drawing UV 80h must evict (0,0); Fill then a redraw samples new VRAM, not the old index"
+        );
+    }
+
+    #[test]
+    fn gp0_a0h_and_c0h_flush_texture_cache() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F;
+        clut[2] = 0x03E0;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        draw_4bpp_uv(&mut gpu, 8, 8, 0, 0, 480);
+        assert_eq!(peek(&mut gpu, 8, 8, 1, 1).pixels[0] & 0x7FFF, 0x001F);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0002); // index 2, no GP0(01h)
+        settle(&mut gpu);
+        draw_4bpp_uv(&mut gpu, 10, 10, 0, 0, 480);
+        assert_eq!(
+            peek(&mut gpu, 10, 10, 1, 1).pixels[0] & 0x7FFF,
+            0x03E0,
+            "GP0(A0h) flushes texture cache; next draw sees the uploaded texel"
+        );
+
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        draw_4bpp_uv(&mut gpu, 8, 8, 0, 0, 480);
+        gpu.gp0(0xC0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        settle(&mut gpu);
+        fill_vram(&mut gpu, 0, 0, 16, 1, 0);
+        draw_4bpp_uv(&mut gpu, 12, 12, 0, 0, 480);
+        assert_eq!(
+            peek(&mut gpu, 12, 12, 1, 1).pixels[0] & 0x7FFF,
+            0,
+            "GP0(C0h) flushes texture cache; Fill then a draw samples new VRAM"
+        );
+    }
+
+    #[test]
+    fn texpage_base_and_4bpp_mode_flush_texture_cache() {
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        let mut clut = [0u16; 16];
+        clut[1] = 0x001F;
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        draw_4bpp_uv(&mut gpu, 8, 8, 0, 0, 480);
+        e1_4bpp(&mut gpu, 1); // base X change
+        e1_4bpp(&mut gpu, 0);
+        fill_vram(&mut gpu, 0, 0, 16, 1, 0);
+        draw_4bpp_uv(&mut gpu, 18, 18, 0, 0, 480);
+        assert_eq!(
+            peek(&mut gpu, 18, 18, 1, 1).pixels[0] & 0x7FFF,
+            0,
+            "GP0(E1h) TexPage base X change flushes texture cache"
+        );
+
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        draw_4bpp_uv(&mut gpu, 8, 8, 0, 0, 480);
+        e1_8bpp(&mut gpu, 0); // 4bpp ↔ 8bpp
+        e1_4bpp(&mut gpu, 0);
+        fill_vram(&mut gpu, 0, 0, 16, 1, 0);
+        draw_4bpp_uv(&mut gpu, 20, 20, 0, 0, 480);
+        assert_eq!(
+            peek(&mut gpu, 20, 20, 1, 1).pixels[0] & 0x7FFF,
+            0,
+            "4bpp↔non-4bpp TexPage change flushes texture cache"
+        );
+
+        // Textured-prim texpage word (polygon vertex 1) must flush the same way.
+        let mut gpu = Gpu::new();
+        clip(&mut gpu, 0, 0, 1023, 511);
+        offset(&mut gpu, 0, 0);
+        upload_clut(&mut gpu, 0, 480, clut);
+        gpu.gp0(0xA0 << 24);
+        gpu.gp0(0);
+        gpu.gp0(2 | (1 << 16));
+        gpu.gp0(0x0000_0001);
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        draw_4bpp_uv(&mut gpu, 8, 8, 0, 0, 480);
+        gpu.gp0(0x24 << 24 | 0x808080);
+        gpu.gp0(xy(0, 0));
+        gpu.gp0((480u32 << 6) << 16);
+        gpu.gp0(xy(1, 0));
+        gpu.gp0(1u32 << 16); // texpage base X = 1
+        gpu.gp0(xy(0, 1));
+        gpu.gp0(0);
+        settle(&mut gpu);
+        e1_4bpp(&mut gpu, 0);
+        fill_vram(&mut gpu, 0, 0, 16, 1, 0);
+        draw_4bpp_uv(&mut gpu, 22, 22, 0, 0, 480);
+        assert_eq!(
+            peek(&mut gpu, 22, 22, 1, 1).pixels[0] & 0x7FFF,
+            0,
+            "textured-prim texpage base change flushes texture cache"
         );
     }
 

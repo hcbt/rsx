@@ -27,6 +27,7 @@ pub struct Cpu {
     icache: Vec<ICacheLine>,
     data_cycles: u32,
     muldiv_busy: u32,
+    gte_busy: u32,
     last_exception: Option<(u8, u32, u32)>,
     pub exception_log: Vec<(u8, u32, u32)>,
     /// First CPU store of Crash title trans.y (NTSC-U 0x800566B4+0x84) that is not 0.
@@ -61,6 +62,7 @@ impl Cpu {
             nsf_13b30: 0,
             data_cycles: 0,
             muldiv_busy: 0,
+            gte_busy: 0,
             icache: (0..ICACHE_LINES)
                 .map(|_| ICacheLine {
                     tag: 0,
@@ -258,7 +260,7 @@ impl Cpu {
                 }
             }
             self.exception(bus, cop0::EXC_INT, 0);
-            bus.tick(fetch_c.max(1));
+            self.finish_step(bus, fetch_c);
             return;
         }
 
@@ -274,6 +276,10 @@ impl Cpu {
                 self.gpr[reg as usize] = val;
             }
         }
+        self.finish_step(bus, fetch_c);
+    }
+
+    fn finish_step(&mut self, bus: &mut Bus, fetch_c: u32) {
         let extra = if fetch_c <= 1 {
             self.data_cycles.saturating_sub(1)
         } else {
@@ -281,6 +287,7 @@ impl Cpu {
         };
         let total = fetch_c.max(1) + extra;
         self.muldiv_busy = self.muldiv_busy.saturating_sub(total);
+        self.gte_busy = self.gte_busy.saturating_sub(total);
         bus.tick(total);
     }
 
@@ -606,12 +613,26 @@ impl Cpu {
             // user mode without CU2
         }
         if instr & (1 << 25) != 0 {
+            // SPX: cop2cmd while a previous command is in flight holds the CPU.
+            self.data_cycles = self.data_cycles.max(self.gte_busy);
+            self.gte_busy = 0;
             self.gte.command(instr);
+            self.gte_busy = self.gte_busy.max(Gte::command_cycles(instr));
             return;
         }
         match rs {
-            0x00 => self.delay_load(rt, self.gte.read_data(rd)),
-            0x02 => self.delay_load(rt, self.gte.read_control(rd)),
+            0x00 => {
+                self.data_cycles = self.data_cycles.max(self.gte_busy);
+                self.gte_busy = 0;
+                self.delay_load(rt, self.gte.read_data(rd));
+            }
+            0x02 => {
+                self.data_cycles = self.data_cycles.max(self.gte_busy);
+                self.gte_busy = 0;
+                self.delay_load(rt, self.gte.read_control(rd));
+            }
+            // MTC2 / CTC2 do not hold (SPX GTE Pipeline Timings; Overview hold
+            // is reads and commands).
             0x04 => self.gte.write_data(rd, self.gpr(rt)),
             0x06 => self.gte.write_control(rd, self.gpr(rt)),
             _ => self.exception(bus, cop0::EXC_RI, 2),

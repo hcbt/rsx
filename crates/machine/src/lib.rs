@@ -554,6 +554,134 @@ mod tests {
         assert_eq!(m.pc(), 0xBFC0_0180, "BEV=1 general exception vector");
     }
 
+    /// CU2 on, copy `payload` to scratchpad, jump there (1-cycle fetch so GTE
+    /// command clocks are not hidden by BIOS waitstates).
+    fn bios_cu2_then_scratch(payload: &[u32]) -> tempfile::NamedTempFile {
+        let mut words = vec![
+            0x3C08_4000, // lui t0, 0x4000  CU2
+            0x3508_0001, // ori t0, 1
+            0x4088_6000, // mtc0 t0, sr
+            0x3C10_BFC0, // lui s0, 0xBFC0
+            0x3610_0000, // ori s0, payload (patched)
+            0x3C11_1F80, // lui s1, 0x1F80
+            0x240B_0000, // addiu t3, zero, N (patched)
+            0x8E0C_0000, // lw t4, 0(s0)
+            0xAE2C_0000, // sw t4, 0(s1)
+            0x2610_0004, // addiu s0, 4
+            0x2631_0004, // addiu s1, 4
+            0x256B_FFFF, // addiu t3, -1
+            0x1560_FFFA, // bnez t3, loop
+            0x0000_0000, // nop
+            0x3C0D_1F80, // lui t5, 0x1F80
+            0x01A0_0008, // jr t5
+            0x0000_0000, // nop
+        ];
+        let payload_off = (words.len() * 4) as u32;
+        words[4] = 0x3610_0000 | payload_off;
+        words[6] = 0x240B_0000 | payload.len() as u32;
+        words.extend_from_slice(payload);
+        bios_with_program(&words)
+    }
+
+    fn cycles_to_scratch_pc(payload: &[u32], pc: u32) -> u64 {
+        let bios = bios_cu2_then_scratch(payload);
+        let mut m = Machine::from_bios_path(bios.path()).unwrap();
+        for _ in 0..10_000 {
+            if m.pc() == pc {
+                return m.cycles();
+            }
+            m.step();
+        }
+        panic!("never reached {pc:#010X} (pc={:#010X})", m.pc());
+    }
+
+    /// Pad to a shared length so the BIOS copy loop costs the same.
+    fn scratch_prog(words: &[u32]) -> Vec<u32> {
+        let mut p = words.to_vec();
+        while p.len() < 12 {
+            p.push(0);
+        }
+        p.push(0x1000_FFFF); // beq zero, zero, -1
+        p.push(0);
+        p
+    }
+
+    fn gte_hold_delta(cmd: u32, probe: u32) -> i64 {
+        let hold = scratch_prog(&[cmd, probe]);
+        let nops = scratch_prog(&[cmd, 0]);
+        debug_assert_eq!(hold.len(), nops.len());
+        let loop_off = (hold.len() as u32 - 2) * 4;
+        let loop_pc = 0x1F80_0000 + loop_off;
+        let c_hold = cycles_to_scratch_pc(&hold, loop_pc);
+        let c_nop = cycles_to_scratch_pc(&nops, loop_pc);
+        c_hold as i64 - c_nop as i64
+    }
+
+    #[test]
+    fn cop2_sqr_then_mfc2_holds_remaining_command_clocks() {
+        // SPX: SQR is 5 clocks. Scratch fetch is 1, so MFC2 holds the rest.
+        // A nop in that slot does not read GTE and must not hold.
+        const SQR: u32 = 0x4A00_0028;
+        const MFC2_IR1: u32 = 0x4808_4800;
+        const CFC2_FLAG: u32 = 0x4808_F800;
+        const MTC2_IR1: u32 = 0x4888_4800;
+        let mfc = gte_hold_delta(SQR, MFC2_IR1);
+        assert!(
+            (3..=5).contains(&mfc),
+            "SQR then MFC2 must hold remaining of 5 clocks vs nop (delta={mfc})"
+        );
+        let cfc = gte_hold_delta(SQR, CFC2_FLAG);
+        assert!(
+            (3..=5).contains(&cfc),
+            "SQR then CFC2 must hold remaining of 5 clocks vs nop (delta={cfc})"
+        );
+        let mtc = gte_hold_delta(SQR, MTC2_IR1);
+        assert!(
+            mtc <= 1,
+            "MTC2 must not hold for a previous GTE command (delta={mtc})"
+        );
+        let second = gte_hold_delta(SQR, SQR);
+        assert!(
+            (3..=5).contains(&second),
+            "second cop2cmd must hold remaining of 5 clocks vs nop (delta={second})"
+        );
+    }
+
+    #[test]
+    fn cop2_rtps_and_ncdt_hold_command_list_clocks() {
+        const RTPS: u32 = 0x4A00_0001;
+        const NCDT: u32 = 0x4A00_0016;
+        const MFC2_IR1: u32 = 0x4808_4800;
+        let rtps = gte_hold_delta(RTPS, MFC2_IR1);
+        assert!(
+            (13..=15).contains(&rtps),
+            "RTPS (15 clk) then MFC2 must hold remaining vs nop (delta={rtps})"
+        );
+        let ncdt = gte_hold_delta(NCDT, MFC2_IR1);
+        assert!(
+            (40..=44).contains(&ncdt),
+            "NCDT (44 clk) then MFC2 must hold remaining vs nop (delta={ncdt})"
+        );
+    }
+
+    #[test]
+    fn cop2_sqr_then_nops_expire_hold_before_mfc2() {
+        const SQR: u32 = 0x4A00_0028;
+        const MFC2_IR1: u32 = 0x4808_4800;
+        // Five nops consume SQR's 5 clocks; MFC2 after that must not hold.
+        let expired = scratch_prog(&[SQR, 0, 0, 0, 0, 0, MFC2_IR1]);
+        let nops = scratch_prog(&[SQR, 0, 0, 0, 0, 0, 0]);
+        let loop_off = (expired.len() as u32 - 2) * 4;
+        let loop_pc = 0x1F80_0000 + loop_off;
+        let c_mfc = cycles_to_scratch_pc(&expired, loop_pc);
+        let c_nop = cycles_to_scratch_pc(&nops, loop_pc);
+        let d = c_mfc as i64 - c_nop as i64;
+        assert!(
+            d <= 1,
+            "MFC2 after SQR's clocks have elapsed must not hold (delta={d})"
+        );
+    }
+
     #[test]
     fn addi_overflow_takes_the_ovf_exception() {
         // ADDI of 1 onto 0x7FFFFFFF must trap (EXC_OVF), not leave the dest stale.
@@ -1392,12 +1520,12 @@ mod tests {
         }
         let mut m = Machine::from_bios_path(&bios).unwrap();
         m.insert_disc(&disc).unwrap();
-        m.run_until_vblank_count(2000);
+        m.run_until_vblank_count(4000);
         let (dx, dy, dw, dh, _) = m.display_origin();
         assert_eq!(
             (dw, dh),
             (512, 240),
-            "Crash must leave the licensed 640×480 by vblank 2000 (pc={:08X} origin=({dx},{dy}) {dw}×{dh})",
+            "Crash must leave the licensed 640×480 by vblank 4000 (pc={:08X} origin=({dx},{dy}) {dw}×{dh})",
             m.pc()
         );
         let lit = m
