@@ -8,4 +8,9 @@ devenv shell -- cargo run -p rsx --release -- --bios SCPH1001.BIN
 devenv shell -- cargo run -p rsx --release -- --bios SCPH1001.BIN --disc game.cue
 ```
 
-`--bios` / `--disc` can also be set as `bios` / `disc` in `rsx.toml`.
+`--bios` / `--disc` can also be set as `bios` / `disc` in `rsx.toml`:
+
+```toml
+bios = "SCPH1001.BIN"
+disc = "game.cue"
+```
