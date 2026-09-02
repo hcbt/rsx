@@ -1,6 +1,6 @@
 # rsx
 
-SCPH-1001 NTSC-U PlayStation emulator. You supply the BIOS (`SCPH1001.BIN`); it is not in the repo. A disc is optional (CUE/BIN).
+PlayStation 1 emulator. You supply the BIOS (`SCPH1001.BIN`); it is not in the repo. A disc is optional (CUE/BIN).
 
 ```
 devenv allow
